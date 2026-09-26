@@ -8,7 +8,7 @@
 
 - Python、FastAPI、Pydantic、pytest；采用分层但轻量的组件接口，便于离线测试与未来增加输入类型。
 - 稠密向量：本地 `BAAI/bge-small-zh-v1.5`，512 维；文档与问题使用同一模型和归一化策略。模型下载由运行环境负责，测试通过替身避免下载。
-- 存储：Docker Compose 启动 Milvus Standalone（版本至少 2.5.11）；稠密字段使用 `HNSW_PQ`、`COSINE`，索引参数显式配置（初值 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`；512 可被 64 整除，较小码本适合首版少量语料）；全文字段由 Milvus 内置 BM25 函数生成稀疏向量，使用 `SPARSE_INVERTED_INDEX` 和 `BM25` 度量。启动时验证集合 schema／索引兼容性，不自动删除已有集合；若小规模数据不足以训练 PQ 或当前部署不支持索引，明确报错并说明最小数据要求，不静默降级。
+- 存储：Docker Compose 启动 Milvus Standalone（版本至少 2.5.11）；稠密字段使用 `HNSW_PQ`、`COSINE`，索引参数显式配置（初值 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`；512 可被 64 整除）；全文字段由 Milvus 内置 BM25 函数生成稀疏向量，使用 `SPARSE_INVERTED_INDEX` 和 `BM25` 度量。启动时验证集合 schema／索引兼容性，不自动删除已有集合；若部署不支持该索引或实际建索引报错，明确返回错误，不静默改用另一种索引。Milvus 对未达到每段索引门槛的小语料可能内部使用暴力扫描；物理索引构建以 `indexed_rows` 验收，不将索引配置等同于已建成。
 - 中文全文检索使用 Milvus `chinese` 分析器（jieba 分词）；在集成测试中用医学术语、药名和中文短句检查分词／召回，不假定默认分析器适用。
 - 重排：本地 `BAAI/bge-reranker-v2-m3`，配置候选上限和答案证据数；模型失败不绕过证据门槛。
 - 生成：DeepSeek `deepseek-flash` 与阿里云百炼 Qwen `qwen3.8-flash` 作为当前默认值，模型 ID、base URL 和 API Key 独立配置，运行时按 provider 显式选择。后续模型变化通过配置处理，不声称永久“最新”。不在仓库保存密钥。

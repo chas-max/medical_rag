@@ -28,19 +28,20 @@ def test_real_dense_and_chinese_bm25_indices():
     try:
         store.ensure_schema()
         store.ensure_schema()  # verify startup accepts its own persisted schema
-        doc = Document("testdoc", "test-source", "guide.txt", "hash", 512, "recursive", "test")
+        count = 2048  # Exceeds the default per-segment index threshold (1,024).
+        doc = Document("testdoc", "test-source", "guide.txt", "hash", count, "recursive", "test")
         terms = {0: "高血压患者需要定期测量血压。", 1: "阿司匹林用药需参考适应证和禁忌证。",
                  2: "糖尿病随访应关注血糖指标。"}
         chunks = [Chunk(f"block{i}", "testdoc", "test-source", terms.get(i,
                         f"测试医学术语语料第{i}段，关注诊断指标和健康随访。"), "guide.txt", "", None, i)
-                  for i in range(512)]
+                  for i in range(count)]
         vectors = []
-        for i in range(512):
+        for i in range(count):
             rng = random.Random(i)
             values = [rng.random() for _ in range(512)]
             norm = math.sqrt(sum(value * value for value in values))
             vectors.append([value / norm for value in values])
-        assert len({tuple(vector) for vector in vectors}) == 512
+        assert len({tuple(vector) for vector in vectors}) == count
         assert store.replace(doc, chunks, vectors) is False
         client.flush(collection)
         client.load_collection(collection)
@@ -50,13 +51,14 @@ def test_real_dense_and_chinese_bm25_indices():
         assert dense_index["index_type"] == "HNSW_PQ" and dense_index["metric_type"] == "COSINE"
         assert sparse_index["index_type"] == "SPARSE_INVERTED_INDEX" and sparse_index["metric_type"] == "BM25"
         assert dense_index["state"] == sparse_index["state"] == "Finished"
+        assert dense_index["indexed_rows"] >= 1024
         for term, block_id in (("高血压", "block0"), ("阿司匹林", "block1"), ("糖尿病", "block2")):
             assert any(item.chunk.id == block_id for item in store.search_bm25(term, 10))
         assert any(item.chunk.id == "block0" for item in store.search_dense(vectors[0], 10))
         assert store.list_documents()[0].filename == "guide.txt"
-        updated = Document("testdoc2", "test-source", "guide.txt", "hash2", 512, "recursive", "test")
-        updated_chunks = [Chunk(f"newblock{i}", "testdoc2", "test-source", f"新版医学语料第{i}段，关注健康随访。",
-                                "guide.txt", "", None, i) for i in range(512)]
+        updated = Document("testdoc2", "test-source", "guide.txt", "hash2", 1, "recursive", "test")
+        updated_chunks = [Chunk("newblock0", "testdoc2", "test-source", "新版医学语料，关注健康随访。",
+                                "guide.txt", "", None, 0)]
         original_delete = client.delete
         failed = False
 
@@ -69,8 +71,8 @@ def test_real_dense_and_chinese_bm25_indices():
 
         with patch.object(client, "delete", side_effect=delete_once):
             with pytest.raises(RuntimeError, match="injected delete failure"):
-                store.replace(updated, updated_chunks, vectors)
-        assert store.replace(updated, updated_chunks, vectors) is False
+                store.replace(updated, updated_chunks, vectors[:1])
+        assert store.replace(updated, updated_chunks, vectors[:1]) is False
         assert {row["id"] for row in store._source_rows("test-source")} == {chunk.id for chunk in updated_chunks}
     finally:
         if collection.startswith("rag_it_") and client.has_collection(collection):

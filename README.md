@@ -48,7 +48,7 @@ python -m pytest tests/test_milvus_integration.py -q
 Remove-Item Env:RUN_MILVUS_INTEGRATION
 ```
 
-集成测试只创建、删除以 `rag_it_` 开头的临时集合；不会删除业务集合。默认测试不调用收费的生成 API。由于 PQ 对数据量有要求，少量样本在真实 Milvus 上可能无法训练索引；服务会报告错误，不静默更换索引。`HNSW_PQ` 参数为 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`，默认检索融合 RRF `k=60`、重排阈值 0.5；阈值需用业务评测集校准。
+集成测试只创建、删除以 `rag_it_` 开头的临时集合；不会删除业务集合。默认测试不调用收费的生成 API。Milvus 对小于默认每段 1,024 行的语料可能以暴力扫描检索，即使集合已配置 `HNSW_PQ`；因此物理索引是否建成须查看 `describe_index().indexed_rows`，可选集成测试使用 2,048 行并检查此指标。[Milvus 性能 FAQ](https://milvus.io/docs/v2.6.x/performance_faq.md)。配置不兼容会明确报错，但小语料的内部扫描不等于切换了集合的索引类型。`HNSW_PQ` 参数为 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`，默认检索融合 RRF `k=60`、重排阈值 0.5；阈值需用业务评测集校准。
 
 ## 范围与扩展
 
