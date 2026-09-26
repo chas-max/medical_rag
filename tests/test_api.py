@@ -62,3 +62,10 @@ def test_default_top_k_uses_configuration(monkeypatch):
 
     response = TestClient(create_app(service=SearchService())).post("/search", json={"question": "高血压"})
     assert response.json()["data"]["used_top_k"] == 3
+
+
+def test_unknown_route_also_uses_error_envelope():
+    response = TestClient(create_app(service=FakeService())).get("/nonexistent")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "HTTP_ERROR"
+    assert response.json()["success"] is False

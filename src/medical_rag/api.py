@@ -8,6 +8,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from .config import Settings
 from .types import ApiError
@@ -66,6 +67,10 @@ def create_app(service: object | None = None) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, error: RequestValidationError):
         return _failure("VALIDATION_ERROR", "请求参数不符合要求", 422)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def handle_http_error(request: Request, error: StarletteHTTPException):
+        return _failure("HTTP_ERROR", str(error.detail), error.status_code)
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, error: Exception):
