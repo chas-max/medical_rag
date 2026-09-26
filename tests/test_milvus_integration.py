@@ -4,6 +4,7 @@ import os
 import math
 import random
 import sys
+import time
 from pathlib import Path
 from unittest.mock import patch
 from uuid import uuid4
@@ -14,6 +15,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from medical_rag.store import MilvusStore
 from medical_rag.types import Chunk, Document
+
+
+def _wait_for_index(client, collection: str, index_name: str, timeout: float = 120) -> dict:
+    deadline = time.monotonic() + timeout
+    while True:
+        index = client.describe_index(collection, index_name)
+        if index["state"] == "Finished":
+            return index
+        if index["state"] == "Failed":
+            raise AssertionError(f"Milvus index {index_name} failed: {index}")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise AssertionError(f"Timed out waiting for Milvus index {index_name}: {index}")
+        time.sleep(min(0.5, remaining))
+
+
+def test_wait_for_index_rechecks_until_index_is_finished(monkeypatch):
+    states = iter(("InProgress", "InProgress", "Finished"))
+    calls = []
+
+    class Client:
+        def describe_index(self, collection_name, index_name):
+            calls.append((collection_name, index_name))
+            return {"state": next(states)}
+
+    monkeypatch.setattr("time.sleep", lambda _: None)
+    result = _wait_for_index(Client(), "collection", "dense_index", timeout=1)
+
+    assert result["state"] == "Finished"
+    assert calls == [("collection", "dense_index")] * 3
 
 
 @pytest.mark.integration
@@ -46,8 +77,8 @@ def test_real_dense_and_chinese_bm25_indices():
         client.flush(collection)
         client.load_collection(collection)
         assert store.replace(doc, chunks, vectors) is True
-        dense_index = client.describe_index(collection, "dense_index")
-        sparse_index = client.describe_index(collection, "sparse_index")
+        dense_index = _wait_for_index(client, collection, "dense_index")
+        sparse_index = _wait_for_index(client, collection, "sparse_index")
         assert dense_index["index_type"] == "HNSW_PQ" and dense_index["metric_type"] == "COSINE"
         assert sparse_index["index_type"] == "SPARSE_INVERTED_INDEX" and sparse_index["metric_type"] == "BM25"
         assert dense_index["state"] == sparse_index["state"] == "Finished"

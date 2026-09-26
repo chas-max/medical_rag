@@ -20,6 +20,8 @@ uvicorn medical_rag.api:app --app-dir src --reload
 
 在 `.env` 中分别填写 `DEEPSEEK_API_KEY` / `QWEN_API_KEY`，只用某一家时另一项可空；不要提交 `.env`。默认模型 ID 为 `deepseek-flash`、`qwen3.8-flash`，可在环境变量中更换。`MILVUS_URI` 默认 `http://localhost:19530`。先等待 `standalone` 健康后再启动后端。当前只支持文字 PDF；扫描版会返回 422，不做 OCR。
 
+Compose 默认通过 DaoCloud Docker Hub 镜像代理拉取 Milvus 和 MinIO，以适配 Docker Hub 不可达的网络；镜像地址可在 `.env` 中用 `MILVUS_IMAGE` / `MINIO_IMAGE` 覆盖。生产部署建议换成组织认可并固定摘要的镜像仓库。
+
 访问 `http://127.0.0.1:8000/docs`。示例请求（另开一个 PowerShell）：
 
 ```powershell
