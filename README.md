@@ -50,6 +50,26 @@ Remove-Item Env:RUN_MILVUS_INTEGRATION
 
 集成测试只创建、删除以 `rag_it_` 开头的临时集合；不会删除业务集合。默认测试不调用收费的生成 API。Milvus 对小于默认每段 1,024 行的语料可能以暴力扫描检索，即使集合已配置 `HNSW_PQ`；因此物理索引是否建成须查看 `describe_index().indexed_rows`，可选集成测试使用 2,048 行并检查此指标。[Milvus 性能 FAQ](https://milvus.io/docs/v2.6.x/performance_faq.md)。配置不兼容会明确报错，但小语料的内部扫描不等于切换了集合的索引类型。`HNSW_PQ` 参数为 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`，默认检索融合 RRF `k=60`、重排阈值 0.5；阈值需用业务评测集校准。
 
+## 离线评估
+
+先入库公开资料，从 `/search` 返回的 `data[].chunk.id` 找到候选块，人工核对原文并标注每个问题的**全部已知相关块**。UTF-8 JSONL 文件每行一题；`id` 可省略，`relevant_chunk_ids` 必须是非空、不重复的块 ID 数组：
+
+```json
+{"id":"followup-1","question":"高血压患者如何随访？","relevant_chunk_ids":["人工核对后的真实块ID"]}
+```
+
+把示例 ID 换成入库后的实际 ID。更新或替换文档后块 ID 可能变化，须重新核对题集。确认 Milvus 已启动，且 `.env` 中配置了所选答案和评审 provider 的 API Key，再显式运行：
+
+```powershell
+python -m medical_rag.evaluate --dataset .\my-eval.jsonl --output .\my-report.json --top-k 5 --answer-provider deepseek --judge-provider qwen
+```
+
+命令只在完整校验题集后初始化模型和 Milvus；模型请求逐题顺序执行，可能产生**两种模型的计费**（同一 provider 也可能自评，存在偏差）。无需新 HTTP 接口。结果文件存在时会覆盖；不得让 `--output` 与题集同路径。建议把题集和报告放在仓库外，报告包含原问题、检索全文、模型回答和评分理由，不要放入患者隐私信息，也不要提交密钥或报告。
+
+报告 JSON 的 `cases` 保留每题检索块、命中块、答案、每块上下文相关度、三项模型评审分数和安全错误码；`summary` 包含宏平均 `precision`、`recall`、`f1`、`map`、`mrr`、三项语义指标、有效题数、拒答率及评审失败数。各检索指标均基于现有门槛过滤后的最终有序结果：Precision@k = 命中数 / 实际返回数（空结果为 0），Recall@k = 命中数 / 标注相关块总数，F1 为两者调和平均；AP@k = 每个命中名次的 Precision 之和 / `min(标注相关块数,k)`，MAP@k 为逐题 AP 的平均；RR@k = 1 / 首个命中名次，MRR@k 为逐题 RR 的平均。排名只考虑前 k 个唯一块。若标注不完整，Recall、MAP 等数字会误导。
+
+faithfulness（忠实度）评回答是否受到本次证据支持；上下文相关度先对每条返回证据评分再逐题平均；答案相关性评回答是否回应问题。三者均由选定模型给出 0–1 分及理由，不能证明医学事实正确。拒答时三项均为 `null`；评审出错仅影响对应维度，错误不冒充 0 分，汇总只平均有效分。单题检索／生成失败也在报告中标记，不泄露外部服务的原始错误信息。默认测试不用付费 API；真实模型评分与真实 Milvus 仍需在你的环境自行验证。
+
 ## 范围与扩展
 
 解析器、向量化器、存储、检索器、生成器相互独立；URL、图片/OCR 和展示前端作为后续任务。当前没有鉴权和多租户隔离，不要直接暴露到公网。实际部署前需要加入鉴权、限流、文件安全扫描、指标监控与备份策略。

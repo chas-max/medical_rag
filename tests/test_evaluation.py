@@ -136,3 +136,20 @@ def test_answer_and_search_failure_do_not_hide_other_cases():
     assert report["summary"]["retrieval_valid_count"] == 1
     assert report["summary"]["mrr"] == 0.5
     assert "secret" not in json.dumps(report)
+
+
+def test_answer_failure_preserves_retrieval_without_judging():
+    service, judge = Service(), Judge()
+
+    def broken_answer(*args):
+        raise RuntimeError("secret provider message")
+
+    service.generator.answer = broken_answer
+    report = evaluate_cases([{"id": "1", "question": "q", "relevant_chunk_ids": ["a"]}],
+                            service, judge, 2, "qwen", "deepseek")
+    case = report["cases"][0]
+    assert case["retrieval"]["recall"] == 1
+    assert case["error"] == "ANSWER_FAILED"
+    assert case["faithfulness"] is None
+    assert not judge.calls
+    assert "secret" not in json.dumps(report)
