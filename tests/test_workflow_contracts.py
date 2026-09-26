@@ -19,8 +19,8 @@ class StubNode:
     type: str
     title: str
     category: str = "input"
-    inputs: dict[str, object] = field(default_factory=dict)
-    outputs: dict[str, object] = field(
+    inputs: dict[str, str] = field(default_factory=dict)
+    outputs: dict[str, str] = field(
         default_factory=lambda: {"question": "string"}
     )
     config_schema: dict[str, object] = field(default_factory=dict)
@@ -82,16 +82,14 @@ def test_registry_metadata_deep_copies_nested_node_metadata() -> None:
     node = StubNode(
         "query.input",
         "问题输入",
-        inputs={"request": {"type": "object"}},
-        outputs={"question": {"type": "string"}},
+        inputs={"request": "object"},
+        outputs={"question": "string"},
         config_schema={"nested": {"limits": [1, 2]}},
     )
     registry = NodeRegistry()
     registry.register(node)
 
     metadata = registry.metadata()
-    metadata[0]["inputs"]["request"]["type"] = "changed"
-    metadata[0]["outputs"]["question"]["type"] = "changed"
     metadata[0]["config_schema"]["nested"]["limits"].append(3)
 
     assert registry.metadata() == [
@@ -99,8 +97,8 @@ def test_registry_metadata_deep_copies_nested_node_metadata() -> None:
             "type": "query.input",
             "title": "问题输入",
             "category": "input",
-            "inputs": {"request": {"type": "object"}},
-            "outputs": {"question": {"type": "string"}},
+            "inputs": {"request": "object"},
+            "outputs": {"question": "string"},
             "config_schema": {"nested": {"limits": [1, 2]}},
         }
     ]
