@@ -16,7 +16,7 @@ services:
       retries: 3
 
   minio:
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    image: ${MINIO_IMAGE:-docker.m.daocloud.io/minio/minio:RELEASE.2024-12-18T13-15-44Z}
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -30,7 +30,7 @@ services:
       retries: 3
 
   standalone:
-    image: milvusdb/milvus:v2.6.24
+    image: ${MILVUS_IMAGE:-docker.m.daocloud.io/milvusdb/milvus:v2.6.24}
     command: ["milvus", "run", "standalone"]
     security_opt:
       - seccomp:unconfined
