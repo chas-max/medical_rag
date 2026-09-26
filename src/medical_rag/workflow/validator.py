@@ -67,6 +67,23 @@ def validate_workflow(
             )
             continue
         registered_nodes[node_id] = registered
+        for key, value in node.config.items():
+            schema = registered.config_schema.get(key)
+            if not isinstance(schema, dict):
+                issues.append(ValidationIssue("INVALID_CONFIG", f"Unknown config field: {key}", node_id=node_id))
+                continue
+            expected = schema.get("type")
+            valid_type = {
+                "integer": lambda item: isinstance(item, int) and not isinstance(item, bool),
+                "number": lambda item: isinstance(item, (int, float)) and not isinstance(item, bool),
+                "boolean": lambda item: isinstance(item, bool),
+                "string": lambda item: isinstance(item, str),
+            }.get(expected, lambda item: False)
+            if (not valid_type(value)
+                    or ("minimum" in schema and value < schema["minimum"])
+                    or ("maximum" in schema and value > schema["maximum"])
+                    or ("enum" in schema and value not in schema["enum"])):
+                issues.append(ValidationIssue("INVALID_CONFIG", f"Invalid config field: {key}", node_id=node_id))
         if registered.category == "input":
             input_node_ids.append(node_id)
         if registered.category == "output":
@@ -191,5 +208,26 @@ def validate_workflow(
                 ready.append(target_id)
     if ordered != len(nodes_by_id):
         issues.append(ValidationIssue("CYCLE", "Workflow contains a cycle"))
+
+    # A published answer graph must never allow generation before an evidence
+    # gate or expose a draft without passing through citation validation.
+    if any(node.type == "answer.output" and "answer" in registered_nodes[node_id].inputs
+           for node_id, node in nodes_by_id.items() if node_id in registered_nodes):
+        gates = {node_id for node_id, node in nodes_by_id.items() if node.type == "evidence.gate"}
+        citations = {node_id for node_id, node in nodes_by_id.items() if node.type == "citation.validate"}
+        generators = {node_id for node_id, node in nodes_by_id.items() if node.type == "generation.llm"}
+        answers = {node_id for node_id, node in nodes_by_id.items() if node.type == "answer.output"}
+
+        if (not gates or not citations or not generators
+                or any(edge.target in generators and edge.target_port == "evidence" and edge.source not in gates
+                       for edge in definition.edges)
+                or any(edge.target in answers and edge.target_port == "answer" and edge.source not in citations
+                       for edge in definition.edges)
+                or any(edge.target in citations and edge.target_port == "draft" and edge.source not in generators
+                       for edge in definition.edges)
+                or any(edge.target in gates and edge.target_port == "evidence"
+                       and (edge.source not in nodes_by_id or nodes_by_id[edge.source].type != "retrieval.rerank")
+                       for edge in definition.edges)):
+            issues.append(ValidationIssue("UNSAFE_ANSWER_FLOW", "问答必须经过证据门控和引用校验"))
 
     return issues

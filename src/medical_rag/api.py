@@ -9,9 +9,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
 from .types import ApiError
+from .workflow.definition import WorkflowDefinition, WorkflowRunRequest
 
 
 class SearchRequest(BaseModel):
@@ -92,7 +94,7 @@ def create_app(service: object | None = None) -> FastAPI:
         content = await file.read(settings.max_upload_bytes + 1)
         if len(content) > settings.max_upload_bytes:
             raise ApiError("FILE_TOO_LARGE", "文件超过上传大小限制", 413)
-        return _success(_service().ingest(filename, content, source_id))
+        return _success(await run_in_threadpool(_service().ingest, filename, content, source_id))
 
     @app.post("/search")
     def search(payload: SearchRequest):
@@ -101,6 +103,42 @@ def create_app(service: object | None = None) -> FastAPI:
     @app.post("/answers")
     def answer(payload: AnswerRequest):
         return _success(_service().answer(payload.question, payload.provider, payload.top_k or settings.top_k))
+
+    @app.get("/nodes")
+    def nodes():
+        return _success(_service().nodes())
+
+    @app.get("/workflows")
+    def workflows():
+        return _success(_service().workflows())
+
+    @app.post("/workflows")
+    def create_workflow(definition: WorkflowDefinition):
+        return _success(_service().save_workflow(definition))
+
+    @app.get("/workflows/{workflow_id}")
+    def workflow(workflow_id: str):
+        return _success(_service().workflow(workflow_id))
+
+    @app.put("/workflows/{workflow_id}")
+    def update_workflow(workflow_id: str, definition: WorkflowDefinition):
+        if definition.id != workflow_id:
+            raise ApiError("INVALID_WORKFLOW", "工作流 ID 与路径不一致", 422)
+        return _success(_service().save_workflow(definition))
+
+    @app.post("/workflows/{workflow_id}/validate")
+    def validate_workflow(workflow_id: str, definition: WorkflowDefinition):
+        if definition.id != workflow_id:
+            raise ApiError("INVALID_WORKFLOW", "工作流 ID 与路径不一致", 422)
+        return _success(_service().validate_workflow(definition))
+
+    @app.post("/workflows/{workflow_id}/runs")
+    async def run_workflow(workflow_id: str, payload: WorkflowRunRequest):
+        return _success(await _service().run_workflow(workflow_id, payload.inputs))
+
+    @app.get("/runs/{run_id}")
+    def get_run(run_id: str):
+        return _success(_service().get_run(run_id))
 
     return app
 
