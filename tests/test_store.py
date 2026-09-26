@@ -183,3 +183,36 @@ def test_existing_collection_with_wrong_dense_metric_is_rejected():
     client.describe_index = wrong_metric
     with pytest.raises(RuntimeError, match="不兼容"):
         store.ensure_schema()
+
+
+def test_existing_collection_with_short_source_field_is_rejected():
+    client = RecordingClient()
+    store = MilvusStore(client)
+    store.ensure_schema()
+    original = client.describe_collection
+
+    def short_source(name):
+        schema = original(name)
+        next(field for field in schema["fields"] if field["name"] == "source_id")["params"]["max_length"] = 16
+        return schema
+
+    client.describe_collection = short_source
+    with pytest.raises(RuntimeError, match="不兼容"):
+        store.ensure_schema()
+
+
+def test_existing_collection_with_wrong_pq_parameters_is_rejected():
+    client = RecordingClient()
+    store = MilvusStore(client)
+    store.ensure_schema()
+    original = client.describe_index
+
+    def wrong_m(collection_name, index_name):
+        result = original(collection_name, index_name)
+        if index_name == "dense_index":
+            result["M"] = 32
+        return result
+
+    client.describe_index = wrong_m
+    with pytest.raises(RuntimeError, match="不兼容"):
+        store.ensure_schema()

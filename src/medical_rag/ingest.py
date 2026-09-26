@@ -67,6 +67,7 @@ def parse_document(filename: str, data: bytes) -> ParsedDocument:
                     flush()
                     level = len(heading.group(1))
                     sections = sections[: level - 1] + [heading.group(2).strip()]
+                    current.append(heading.group(2).strip())
                 else:
                     current.append(line)
             flush()
@@ -144,6 +145,7 @@ def chunk_document(
         for part in _recursive(content, max_chars, overlap):
             ordinal = len(chunks)
             chunk_id = hashlib.sha256(f"{document_id}:{ordinal}:{part}".encode()).hexdigest()
+            section = group[0].section.encode("utf-8")[:1024].decode("utf-8", errors="ignore")
             chunks.append(Chunk(chunk_id, document_id, doc.filename, part, doc.filename,
-                                group[0].section, group[0].page, ordinal))
+                                section, group[0].page, ordinal))
     return strategy, reason, chunks

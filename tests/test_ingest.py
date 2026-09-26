@@ -57,3 +57,14 @@ def test_scanned_pdf_without_text_is_rejected():
     pdf.new_page()
     with pytest.raises(ValueError, match="文字"):
         parse_document("scan.pdf", pdf.tobytes())
+
+
+def test_overlong_markdown_heading_is_chunked_as_content_with_bounded_metadata():
+    heading = "标题起点" + "医" * 400 + "标题终点"
+    parsed = parse_document("long.md", f"# {heading}\n\n相关正文。".encode())
+    strategy, _, chunks = chunk_document(parsed, TopicEmbedder(), max_chars=200, overlap=20)
+    assert strategy == "markdown"
+    assert len(chunks) > 2
+    assert chunks[0].text.startswith("标题起点")
+    assert any("标题终点" in chunk.text for chunk in chunks)
+    assert all(len(chunk.section.encode("utf-8")) <= 1024 for chunk in chunks)

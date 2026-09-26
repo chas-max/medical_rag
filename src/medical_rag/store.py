@@ -25,6 +25,25 @@ class MilvusStore:
             required = set(FIELDS) | {"dense", "sparse"}
             if not required.issubset(fields):
                 raise RuntimeError("已有 Milvus 集合 schema 与当前系统不兼容")
+            varchar_lengths = {"id": 64, "document_id": 64, "source_id": 512,
+                               "filename": 512, "sha256": 64, "section": 1024,
+                               "strategy": 32, "reason": 512, "text": 65535}
+            try:
+                compatible = (not existing.get("auto_id", False)
+                              and not existing.get("enable_dynamic_field", False)
+                              and fields["id"].get("is_primary") is True)
+                compatible = compatible and all(
+                    int(fields[name]["type"]) == int(DataType.VARCHAR)
+                    and int(fields[name]["params"]["max_length"]) >= length
+                    for name, length in varchar_lengths.items())
+                compatible = compatible and all(int(fields[name]["type"]) == int(DataType.INT64)
+                                                for name in ("page", "ordinal", "chunk_count"))
+                compatible = compatible and int(fields["dense"]["type"]) == int(DataType.FLOAT_VECTOR)
+                compatible = compatible and int(fields["sparse"]["type"]) == int(DataType.SPARSE_FLOAT_VECTOR)
+            except (KeyError, TypeError, ValueError):
+                compatible = False
+            if not compatible:
+                raise RuntimeError("已有 Milvus 集合字段定义不兼容")
             if fields["dense"].get("params", {}).get("dim") not in (512, "512"):
                 raise RuntimeError("已有 Milvus 集合向量维度不兼容")
             analyzer = fields["text"].get("params", {}).get("analyzer_params", {})
@@ -32,6 +51,7 @@ class MilvusStore:
                 analyzer = json.loads(analyzer)
             functions = existing.get("functions", [])
             if (analyzer.get("type") != "chinese"
+                    or fields["text"].get("params", {}).get("enable_analyzer") not in (True, "true", "True")
                     or not any(int(fn["type"]) == int(FunctionType.BM25)
                                and fn["input_field_names"] == ["text"]
                                and fn["output_field_names"] == ["sparse"] for fn in functions)):
@@ -43,7 +63,11 @@ class MilvusStore:
                     or dense_index.get("field_name") != "dense"
                     or sparse_index.get("index_type") != "SPARSE_INVERTED_INDEX"
                     or sparse_index.get("metric_type") != "BM25"
-                    or sparse_index.get("field_name") != "sparse"):
+                    or sparse_index.get("field_name") != "sparse"
+                    or dense_index.get("state") == "Failed"
+                    or sparse_index.get("state") == "Failed"
+                    or any(int(dense_index.get(name, -1)) != expected for name, expected in
+                           (("M", 16), ("efConstruction", 200), ("m", 64), ("nbits", 4)))):
                 raise RuntimeError("已有 Milvus 索引与 HNSW_PQ/BM25 要求不兼容")
             self.client.load_collection(self.collection)
             return

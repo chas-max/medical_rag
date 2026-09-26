@@ -1,6 +1,8 @@
 """Opt-in real Milvus round trip. Never touches an existing collection."""
 
 import os
+import math
+import random
 import sys
 from pathlib import Path
 from unittest.mock import patch
@@ -27,16 +29,30 @@ def test_real_dense_and_chinese_bm25_indices():
         store.ensure_schema()
         store.ensure_schema()  # verify startup accepts its own persisted schema
         doc = Document("testdoc", "test-source", "guide.txt", "hash", 512, "recursive", "test")
-        chunks = [Chunk(f"block{i}", "testdoc", "test-source", "高血压患者需要定期测量血压。" if i == 0
-                        else f"测试医学术语语料第{i}段，关注诊断指标和健康随访。", "guide.txt", "", None, i)
+        terms = {0: "高血压患者需要定期测量血压。", 1: "阿司匹林用药需参考适应证和禁忌证。",
+                 2: "糖尿病随访应关注血糖指标。"}
+        chunks = [Chunk(f"block{i}", "testdoc", "test-source", terms.get(i,
+                        f"测试医学术语语料第{i}段，关注诊断指标和健康随访。"), "guide.txt", "", None, i)
                   for i in range(512)]
-        vectors = [[float((i + offset) % 17) / 17 for offset in range(512)] for i in range(512)]
+        vectors = []
+        for i in range(512):
+            rng = random.Random(i)
+            values = [rng.random() for _ in range(512)]
+            norm = math.sqrt(sum(value * value for value in values))
+            vectors.append([value / norm for value in values])
+        assert len({tuple(vector) for vector in vectors}) == 512
         assert store.replace(doc, chunks, vectors) is False
         client.flush(collection)
         client.load_collection(collection)
         assert store.replace(doc, chunks, vectors) is True
-        assert any(item.chunk.id == "block0" for item in store.search_bm25("高血压", 10))
-        assert store.search_dense(vectors[0], 10)
+        dense_index = client.describe_index(collection, "dense_index")
+        sparse_index = client.describe_index(collection, "sparse_index")
+        assert dense_index["index_type"] == "HNSW_PQ" and dense_index["metric_type"] == "COSINE"
+        assert sparse_index["index_type"] == "SPARSE_INVERTED_INDEX" and sparse_index["metric_type"] == "BM25"
+        assert dense_index["state"] == sparse_index["state"] == "Finished"
+        for term, block_id in (("高血压", "block0"), ("阿司匹林", "block1"), ("糖尿病", "block2")):
+            assert any(item.chunk.id == block_id for item in store.search_bm25(term, 10))
+        assert any(item.chunk.id == "block0" for item in store.search_dense(vectors[0], 10))
         assert store.list_documents()[0].filename == "guide.txt"
         updated = Document("testdoc2", "test-source", "guide.txt", "hash2", 512, "recursive", "test")
         updated_chunks = [Chunk(f"newblock{i}", "testdoc2", "test-source", f"新版医学语料第{i}段，关注健康随访。",
