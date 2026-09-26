@@ -1,12 +1,14 @@
 """FastAPI entry point and consistent public response envelope."""
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.concurrency import run_in_threadpool
@@ -33,7 +35,7 @@ def _failure(code: str, message: str, status: int) -> JSONResponse:
     return JSONResponse(status_code=status, content={"success": False, "data": None, "error": {"code": code, "message": message}})
 
 
-def create_app(service: object | None = None) -> FastAPI:
+def create_app(service: object | None = None, frontend_dist: Path | None = None) -> FastAPI:
     settings = Settings()
     active_service = service
 
@@ -139,6 +141,22 @@ def create_app(service: object | None = None) -> FastAPI:
     @app.get("/runs/{run_id}")
     def get_run(run_id: str):
         return _success(_service().get_run(run_id))
+
+    dist = frontend_dist or Path(__file__).resolve().parents[2] / "frontend" / "dist"
+    if (dist / "index.html").is_file():
+        assets = dist / "assets"
+        if assets.is_dir():
+            app.mount("/ui/assets", StaticFiles(directory=assets), name="frontend-assets")
+
+        @app.get("/ui")
+        def frontend_home():
+            return RedirectResponse("/ui/chat")
+
+        @app.get("/ui/{path:path}")
+        def frontend_page(path: str):
+            if "." in path.rsplit("/", 1)[-1]:
+                raise ApiError("NOT_FOUND", "前端资源不存在", 404)
+            return FileResponse(dist / "index.html")
 
     return app
 
