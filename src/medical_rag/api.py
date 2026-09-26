@@ -1,5 +1,6 @@
 """FastAPI entry point and consistent public response envelope."""
 
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
@@ -30,13 +31,33 @@ def _failure(code: str, message: str, status: int) -> JSONResponse:
 
 
 def create_app(service: object | None = None) -> FastAPI:
-    app = FastAPI(title="公开医疗资料检索问答", version="0.1.0")
     settings = Settings()
+    active_service = service
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        nonlocal active_service
+        if active_service is None:
+            from pymilvus import MilvusClient
+
+            from .embeddings import BgeEmbedder, BgeReranker
+            from .generation import GroundedGenerator, OpenAITransport
+            from .service import RagService
+            from .store import MilvusStore
+
+            client = MilvusClient(uri=settings.milvus_uri, token=settings.milvus_token or None)
+            store = MilvusStore(client, settings.collection_name)
+            store.ensure_schema()
+            active_service = RagService(settings, store, BgeEmbedder(), BgeReranker(),
+                                        GroundedGenerator(OpenAITransport(settings)))
+        yield
+
+    app = FastAPI(title="公开医疗资料检索问答", version="0.1.0", lifespan=lifespan)
 
     def _service():
-        if service is None:
+        if active_service is None:
             raise ApiError("NOT_READY", "服务尚未初始化", 503)
-        return service
+        return active_service
 
     @app.exception_handler(ApiError)
     async def handle_api_error(request: Request, error: ApiError):
@@ -45,6 +66,14 @@ def create_app(service: object | None = None) -> FastAPI:
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, error: RequestValidationError):
         return _failure("VALIDATION_ERROR", "请求参数不符合要求", 422)
+
+    @app.exception_handler(ValueError)
+    async def handle_value_error(request: Request, error: ValueError):
+        return _failure("VALIDATION_ERROR", str(error), 422)
+
+    @app.exception_handler(Exception)
+    async def handle_unexpected_error(request: Request, error: Exception):
+        return _failure("DEPENDENCY_ERROR", "检索或模型服务不可用", 503)
 
     @app.get("/health")
     def health():
