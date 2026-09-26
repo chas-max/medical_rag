@@ -236,14 +236,6 @@ class WorkflowEngine:
         return descendants
 
     @staticmethod
-    def _safe_node_error(error: dict[str, str] | None) -> dict[str, str]:
-        if error is None:
-            return {"code": "NODE_EXECUTION_ERROR", "message": "节点执行失败"}
-        code = error.get("code")
-        message = error.get("message")
-        return {
-            "code": code if isinstance(code, str) and code else "NODE_EXECUTION_ERROR",
-            "message": message
-            if isinstance(message, str) and message
-            else "节点执行失败",
-        }
+    def _safe_node_error(_error: dict[str, str] | None) -> dict[str, str]:
+        """Return generic trace data instead of exposing node-supplied strings."""
+        return {"code": "NODE_EXECUTION_ERROR", "message": "节点执行失败"}

@@ -399,7 +399,10 @@ async def test_engine_stops_after_failed_node() -> None:
     assert called == ["fail"]
     assert [trace.node_id for trace in result.trace] == ["query", "failure"]
     assert result.trace[-1].status == "failed"
-    assert result.trace[-1].error == {"code": "FAILED", "message": "safe"}
+    assert result.trace[-1].error == {
+        "code": "NODE_EXECUTION_ERROR",
+        "message": "节点执行失败",
+    }
 
 
 @pytest.mark.asyncio
@@ -437,6 +440,35 @@ async def test_engine_converts_api_and_unexpected_errors_to_safe_trace_data() ->
         assert result.status == "failed"
         assert result.trace_by_node(node_id).error == expected
         assert "secret-value" not in repr(result.trace)
+
+
+@pytest.mark.asyncio
+async def test_engine_does_not_expose_untrusted_node_result_error_strings() -> None:
+    secret = "api_key=sk-node-secret"
+    traceback = f"Traceback (most recent call last):\nRuntimeError: {secret}"
+    registry = make_registry(
+        FunctionalNode(
+            "node.error",
+            "Node Error",
+            "output",
+            function=lambda inputs, context: NodeResult(
+                outputs={},
+                status="failed",
+                error={"code": secret, "message": traceback},
+            ),
+        )
+    )
+    definition = make_definition([{"id": "node", "type": "node.error"}], [])
+
+    result = await WorkflowEngine(registry).run(definition, {})
+
+    assert result.status == "failed"
+    assert result.trace_by_node("node").error == {
+        "code": "NODE_EXECUTION_ERROR",
+        "message": "节点执行失败",
+    }
+    assert secret not in repr(result.trace)
+    assert "Traceback" not in repr(result.trace)
 
 
 @pytest.mark.asyncio
