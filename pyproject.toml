@@ -13,7 +13,7 @@ dependencies = [
     "python-multipart>=0.0.9",
     "pydantic-settings>=2.0",
     "pypdf>=5.0",
-    "pymilvus>=2.5.11",
+    "pymilvus>=2.5.11,<2.7",
     "sentence-transformers>=3.0",
     "openai>=1.60",
 ]
