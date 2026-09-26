@@ -75,3 +75,15 @@ def test_provider_models_are_selected_independently():
     transport.complete("deepseek", "system", "user")
     transport.complete("qwen", "system", "user")
     assert called == ["deepseek-flash", "qwen3.8-flash"]
+
+
+def test_draft_is_not_public_until_separate_citation_validation():
+    transport = Transport(json.dumps({"claims": [{"text": "应规律随访", "citations": [
+        {"chunk_id": "block1", "excerpt": "规律随访"}]}]}))
+    generator = GroundedGenerator(transport)
+    draft = generator.draft("如何管理？", [evidence()], "qwen")
+    assert isinstance(draft, str)
+    assert "claims" in draft
+    result = generator.validate(draft, [evidence()])
+    assert result["abstained"] is False
+    assert result["citations"][0]["chunk_id"] == "block1"
