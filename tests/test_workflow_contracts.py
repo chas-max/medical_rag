@@ -1,14 +1,16 @@
-from dataclasses import dataclass
+import json
+from dataclasses import dataclass, field
 
 import pytest
 from pydantic import ValidationError
 
 from medical_rag.workflow.contracts import (
     ExecutionContext,
+    Node,
     NodeResult,
     NodeTrace,
 )
-from medical_rag.workflow.definition import WorkflowDefinition
+from medical_rag.workflow.definition import WorkflowDefinition, WorkflowNode
 from medical_rag.workflow.registry import NodeRegistry
 
 
@@ -17,14 +19,19 @@ class StubNode:
     type: str
     title: str
     category: str = "input"
-    inputs: dict[str, str] = None
-    outputs: dict[str, str] = None
-    config_schema: dict[str, object] = None
+    inputs: dict[str, object] = field(default_factory=dict)
+    outputs: dict[str, object] = field(
+        default_factory=lambda: {"question": "string"}
+    )
+    config_schema: dict[str, object] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        self.inputs = {} if self.inputs is None else self.inputs
-        self.outputs = {"question": "string"} if self.outputs is None else self.outputs
-        self.config_schema = {} if self.config_schema is None else self.config_schema
+    async def execute(
+        self,
+        inputs: dict[str, object],
+        config: dict[str, object],
+        context: ExecutionContext,
+    ) -> NodeResult:
+        return NodeResult(outputs={}, status="success")
 
 
 def test_registry_exposes_stable_node_metadata() -> None:
@@ -61,6 +68,42 @@ def test_registry_rejects_duplicate_types_and_unknown_types() -> None:
         registry.register(node)
     with pytest.raises(KeyError, match="missing"):
         registry.get("missing")
+
+
+def test_stub_node_conforms_to_node_protocol() -> None:
+    node: Node = StubNode("query.input", "问题输入")
+
+    assert node.inputs == {}
+    assert node.outputs == {"question": "string"}
+    assert node.config_schema == {}
+
+
+def test_registry_metadata_deep_copies_nested_node_metadata() -> None:
+    node = StubNode(
+        "query.input",
+        "问题输入",
+        inputs={"request": {"type": "object"}},
+        outputs={"question": {"type": "string"}},
+        config_schema={"nested": {"limits": [1, 2]}},
+    )
+    registry = NodeRegistry()
+    registry.register(node)
+
+    metadata = registry.metadata()
+    metadata[0]["inputs"]["request"]["type"] = "changed"
+    metadata[0]["outputs"]["question"]["type"] = "changed"
+    metadata[0]["config_schema"]["nested"]["limits"].append(3)
+
+    assert registry.metadata() == [
+        {
+            "type": "query.input",
+            "title": "问题输入",
+            "category": "input",
+            "inputs": {"request": {"type": "object"}},
+            "outputs": {"question": {"type": "string"}},
+            "config_schema": {"nested": {"limits": [1, 2]}},
+        }
+    ]
 
 
 def test_workflow_rejects_duplicate_node_ids_and_unknown_status() -> None:
@@ -127,6 +170,37 @@ def test_workflow_rejects_duplicate_edge_ids_and_preserves_position_and_config()
     )
     assert definition.nodes[0].position == {"x": 12.5, "y": -4}
     assert definition.nodes[0].config == {"nested": [True, None, {"limit": 3}]}
+
+
+def test_workflow_node_rejects_non_json_config_and_serializes_nested_values() -> None:
+    with pytest.raises(ValidationError):
+        WorkflowNode.model_validate(
+            {"id": "input", "type": "query.input", "config": {"bad": object()}}
+        )
+
+    node = WorkflowNode.model_validate(
+        {
+            "id": "input",
+            "type": "query.input",
+            "config": {
+                "text": "question",
+                "enabled": True,
+                "limit": 3,
+                "ratio": 0.5,
+                "nothing": None,
+                "nested": [{"name": "value"}, [1, False]],
+            },
+        }
+    )
+
+    assert json.loads(node.model_dump_json())["config"] == {
+        "text": "question",
+        "enabled": True,
+        "limit": 3,
+        "ratio": 0.5,
+        "nothing": None,
+        "nested": [{"name": "value"}, [1, False]],
+    }
 
 
 def test_node_result_records_safe_status_and_outputs() -> None:

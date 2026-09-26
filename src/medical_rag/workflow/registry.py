@@ -1,5 +1,7 @@
 """Registry for workflow node implementations and palette metadata."""
 
+from copy import deepcopy
+
 from .contracts import Node
 
 
@@ -23,9 +25,9 @@ class NodeRegistry:
                 "type": node.type,
                 "title": node.title,
                 "category": node.category,
-                "inputs": dict(node.inputs),
-                "outputs": dict(node.outputs),
-                "config_schema": dict(node.config_schema),
+                "inputs": deepcopy(node.inputs),
+                "outputs": deepcopy(node.outputs),
+                "config_schema": deepcopy(node.config_schema),
             }
             for node in sorted(self._nodes.values(), key=lambda registered: registered.type)
         ]

@@ -2,7 +2,7 @@
 
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 WorkflowStatus = Literal["draft", "validated", "published"]
 
@@ -15,7 +15,7 @@ class WorkflowNode(BaseModel):
     id: str
     type: str
     position: dict[str, float] = Field(default_factory=dict)
-    config: dict[str, object] = Field(default_factory=dict)
+    config: dict[str, JsonValue] = Field(default_factory=dict)
 
 
 class WorkflowEdge(BaseModel):
