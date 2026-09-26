@@ -51,3 +51,14 @@ def test_unknown_provider_is_rejected():
     )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_default_top_k_uses_configuration(monkeypatch):
+    monkeypatch.setenv("TOP_K", "3")
+
+    class SearchService(FakeService):
+        def search(self, question, top_k):
+            return {"used_top_k": top_k}
+
+    response = TestClient(create_app(service=SearchService())).post("/search", json={"question": "高血压"})
+    assert response.json()["data"]["used_top_k"] == 3

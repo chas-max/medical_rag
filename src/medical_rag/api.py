@@ -15,7 +15,7 @@ from .types import ApiError
 
 class SearchRequest(BaseModel):
     question: str = Field(min_length=1)
-    top_k: int = Field(default=5, ge=1, le=20)
+    top_k: int | None = Field(default=None, ge=1, le=20)
 
 
 class AnswerRequest(SearchRequest):
@@ -67,10 +67,6 @@ def create_app(service: object | None = None) -> FastAPI:
     async def handle_validation_error(request: Request, error: RequestValidationError):
         return _failure("VALIDATION_ERROR", "请求参数不符合要求", 422)
 
-    @app.exception_handler(ValueError)
-    async def handle_value_error(request: Request, error: ValueError):
-        return _failure("VALIDATION_ERROR", str(error), 422)
-
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, error: Exception):
         return _failure("DEPENDENCY_ERROR", "检索或模型服务不可用", 503)
@@ -95,11 +91,11 @@ def create_app(service: object | None = None) -> FastAPI:
 
     @app.post("/search")
     def search(payload: SearchRequest):
-        return _success(_service().search(payload.question, payload.top_k))
+        return _success(_service().search(payload.question, payload.top_k or settings.top_k))
 
     @app.post("/answers")
     def answer(payload: AnswerRequest):
-        return _success(_service().answer(payload.question, payload.provider, payload.top_k))
+        return _success(_service().answer(payload.question, payload.provider, payload.top_k or settings.top_k))
 
     return app
 

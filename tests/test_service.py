@@ -94,3 +94,32 @@ def test_empty_pdf_returns_structured_validation_error():
     response = TestClient(create_app(service=service)).post("/documents", files={"file": ("scan.pdf", b"invalid")})
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "INVALID_DOCUMENT"
+
+
+def test_embedding_failure_is_dependency_error_not_invalid_document():
+    class BrokenEmbedder:
+        def encode(self, texts):
+            raise ValueError("向量输出必须为 512 维")
+
+    service = RagService(Settings(), MemoryStore(), BrokenEmbedder(), Reranker(), GroundedGenerator(Transport()))
+    client = TestClient(create_app(service=service), raise_server_exceptions=False)
+    response = client.post("/documents", files={"file": ("guide.txt", "高血压管理。".encode())})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "DEPENDENCY_ERROR"
+
+
+def test_whitespace_question_is_validation_error():
+    service = RagService(Settings(), MemoryStore(), Embedder(), Reranker(), GroundedGenerator(Transport()))
+    response = TestClient(create_app(service=service)).post("/search", json={"question": "   "})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_QUERY"
+
+
+def test_source_identifier_is_limited_by_utf8_bytes():
+    service = RagService(Settings(), MemoryStore(), Embedder(), Reranker(), GroundedGenerator(Transport()))
+    response = TestClient(create_app(service=service)).post(
+        "/documents", data={"source_id": "医" * 200},
+        files={"file": ("guide.txt", "高血压管理。".encode())},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "INVALID_SOURCE"
