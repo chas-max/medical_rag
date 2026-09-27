@@ -2,12 +2,15 @@ import asyncio
 import json
 from pathlib import Path
 
+import pytest
+
 from medical_rag.config import Settings
 from medical_rag.generation import GroundedGenerator
 from medical_rag.types import Chunk, Evidence
 from medical_rag.workflow.bootstrap import build_registry
 from medical_rag.workflow.contracts import ExecutionContext
 from medical_rag.workflow.engine import WorkflowEngine
+from medical_rag.workflow.nodes.input import query_input
 from medical_rag.workflow.repository import WorkflowRepository
 from medical_rag.workflow.validator import validate_workflow
 
@@ -60,6 +63,13 @@ def setup():
     return store, transport, registry
 
 
+def test_query_input_defaults_to_qwen_and_rejects_deepseek():
+    context = ExecutionContext("run", "medical-answer", {})
+    assert query_input({"question": "高血压"}, {}, context)["provider"] == "qwen"
+    with pytest.raises(ValueError, match="不支持的生成模型厂商"):
+        query_input({"question": "高血压", "provider": "deepseek"}, {}, context)
+
+
 def test_default_graphs_are_valid():
     _, _, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
@@ -91,7 +101,7 @@ def test_no_evidence_skips_model_and_returns_abstention():
     _, transport, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
     result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
-        "question": "未知", "provider": "deepseek", "top_k": 5}))
+        "question": "未知", "provider": "qwen", "top_k": 5}))
     assert result.output["abstained"] is True
     assert result.output["answer"].startswith("现有资料不足")
     assert result.trace_by_node("llm").status == "skipped"

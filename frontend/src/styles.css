@@ -1244,3 +1244,15 @@ a {
 .trace-panel {
   height: 160px;
 }
+.answer-list { margin: 0; padding-left: 1.4em; color: #294637; line-height: 1.85; font-size: 14px; }
+.answer-list li + li { margin-top: 10px; }
+.citation-ref { border: 0; background: none; color: #276a4e; cursor: pointer; padding: 2px 4px; font: inherit; font-weight: 700; }
+.citation-ref:focus-visible { outline: 2px solid #276a4e; border-radius: 4px; }
+.advanced-settings { margin-bottom: 8px; font-size: 12px; color: #527862; }
+.advanced-settings summary { cursor: pointer; width: fit-content; padding: 6px 0; }
+.advanced-settings .settings-bar { padding-top: 8px; flex-wrap: wrap; }
+.notice.error { color: #9a4435; background: #fff1ec; border-color: #f0d6cc; }
+@media (max-width: 700px) {
+  .advanced-settings .settings-bar { gap: 10px; }
+  .citation-ref { min-width: 28px; min-height: 28px; }
+}

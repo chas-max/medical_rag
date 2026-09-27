@@ -258,7 +258,7 @@ function Editor() {
     try {
       const result = await runWorkflow(original.id, {
         question: testQuestion,
-        provider: "deepseek",
+        provider: "qwen",
         top_k: 5,
       });
       setRun(result);

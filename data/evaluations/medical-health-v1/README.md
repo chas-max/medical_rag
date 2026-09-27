@@ -39,7 +39,7 @@ python data/evaluations/medical-health-v1/tools/remap_chunk_ids.py --dataset dat
 以下模型/API 调用可能计费，只有显式运行才发生：
 
 ```powershell
-python -m medical_rag.evaluate --dataset .\medical-health-runtime.jsonl --manifest data/evaluations/medical-health-v1/manifest.json --output .\rag-report.json --top-k 5 --answer-provider deepseek --judge-provider qwen
+python -m medical_rag.evaluate --dataset .\medical-health-runtime.jsonl --manifest data/evaluations/medical-health-v1/manifest.json --output .\rag-report.json --top-k 5 --answer-provider qwen --judge-provider qwen
 python data/evaluations/medical-health-v1/tools/export_for_judge.py --report .\rag-report.json --dataset data/evaluations/medical-health-v1/questions.jsonl --output .\judge-input.jsonl
 ```
 

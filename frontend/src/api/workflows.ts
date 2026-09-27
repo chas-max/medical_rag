@@ -42,6 +42,7 @@ export interface Workflow {
 
 export interface Citation {
   id?: string;
+  chunk_id?: string;
   source?: string;
   filename?: string;
   page?: number | null;

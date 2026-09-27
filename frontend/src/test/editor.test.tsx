@@ -160,6 +160,6 @@ it("shows validation issues and failed run traces without exposing a draft as ex
   expect(await screen.findByText("模型服务不可用")).toBeInTheDocument();
   expect(api.runWorkflow).toHaveBeenCalledWith(
     "medical-answer",
-    expect.objectContaining({ question: "高血压患者如何管理？" }),
+    expect.objectContaining({ question: "高血压患者如何管理？", provider: "qwen" }),
   );
 });

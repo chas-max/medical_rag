@@ -10,8 +10,8 @@ def query_input(inputs: dict, config: dict, context: ExecutionContext) -> dict:
     top_k = inputs.get("top_k", 5)
     if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 20:
         raise ValueError("top_k 必须在 1 到 20 之间")
-    provider = inputs.get("provider", "deepseek")
-    if provider not in ("deepseek", "qwen"):
+    provider = inputs.get("provider", "qwen")
+    if provider != "qwen":
         raise ValueError("不支持的生成模型厂商")
     return {"question": question.strip(), "top_k": top_k, "provider": provider}
 

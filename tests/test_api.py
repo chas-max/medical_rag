@@ -53,6 +53,22 @@ def test_unknown_provider_is_rejected():
     assert response.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
+def test_default_answer_uses_qwen_and_deepseek_is_rejected():
+    calls = []
+
+    class CaptureService(FakeService):
+        def answer(self, question, provider, top_k):
+            calls.append(provider)
+            return super().answer(question, provider, top_k)
+
+    api = TestClient(create_app(service=CaptureService()))
+    assert api.post("/answers", json={"question": "高血压"}).status_code == 200
+    assert calls == ["qwen"]
+    rejected = api.post("/answers", json={"question": "高血压", "provider": "deepseek"})
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
 def test_default_top_k_uses_configuration(monkeypatch):
     monkeypatch.setenv("TOP_K", "3")
 

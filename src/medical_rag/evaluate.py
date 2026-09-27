@@ -13,8 +13,8 @@ from .evaluation_tools import validate_release
 
 
 def _live_dependencies(settings: Settings, answer_provider: str, judge_provider: str) -> tuple:
-    if not getattr(settings, f"{answer_provider}_api_key") or not getattr(settings, f"{judge_provider}_api_key"):
-        raise ValueError("所选答案模型和评审模型均须配置 API Key")
+    if not settings.qwen_api_key:
+        raise ValueError("Qwen API Key 未配置")
     from pymilvus import MilvusClient
 
     from .embeddings import BgeEmbedder, BgeReranker
@@ -28,8 +28,7 @@ def _live_dependencies(settings: Settings, answer_provider: str, judge_provider:
     store.ensure_schema()
     service = RagService(settings, store, BgeEmbedder(), BgeReranker(),
                          GroundedGenerator(OpenAITransport(settings)))
-    judge = EvaluationJudge(OpenAITransport(settings), judge_provider,
-                            getattr(settings, f"{judge_provider}_model"))
+    judge = EvaluationJudge(OpenAITransport(settings), judge_provider, settings.qwen_model)
     return service, judge
 
 
@@ -40,8 +39,8 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
     parser.add_argument("--manifest", type=Path, help="版本化题库的发布清单；默认读取数据集同目录的 manifest.json")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--top-k", type=int, default=5)
-    parser.add_argument("--answer-provider", choices=("deepseek", "qwen"), default="deepseek")
-    parser.add_argument("--judge-provider", choices=("deepseek", "qwen"), default="qwen")
+    parser.add_argument("--answer-provider", choices=("qwen",), default="qwen")
+    parser.add_argument("--judge-provider", choices=("qwen",), default="qwen")
     try:
         args = parser.parse_args(argv)
     except SystemExit as exc:

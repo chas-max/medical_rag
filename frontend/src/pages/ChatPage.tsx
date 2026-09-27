@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
+import AnswerContent from "../components/AnswerContent";
 import {
   getHealth,
   getWorkflows,
@@ -31,20 +32,32 @@ export default function ChatPage() {
   const [conversations, setConversations] =
     useState<Conversation[]>(initialConversations);
   const [current, setCurrent] = useState<string | null>(null);
+  const currentRef = useRef<string | null>(null);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [workflowId, setWorkflowId] = useState("medical-answer");
-  const [provider, setProvider] = useState("deepseek");
   const [topK, setTopK] = useState(5);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const [healthy, setHealthy] = useState<boolean | null>(null);
   const [question, setQuestion] = useState("");
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [failureNotices, setFailureNotices] = useState<Record<string, string>>({});
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(
     null,
   );
   const fileRef = useRef<HTMLInputElement>(null);
   const endRef = useRef<HTMLDivElement>(null);
   const active = conversations.find((item) => item.id === current);
+  const failureNotice = current ? failureNotices[current] : undefined;
+
+  function clearFailure(id: string) {
+    setFailureNotices((previous) => {
+      if (!(id in previous)) return previous;
+      const next = { ...previous };
+      delete next[id];
+      return next;
+    });
+  }
 
   useEffect(() => {
     getWorkflows()
@@ -71,7 +84,9 @@ export default function ChatPage() {
   async function send(value = question) {
     const text = value.trim();
     if (!text || busy) return;
-    const id = current || crypto.randomUUID();
+    const id = currentRef.current || crypto.randomUUID();
+    clearFailure(id);
+    currentRef.current = id;
     setCurrent(id);
     setConversations((previous) => {
       const exists = previous.some((item) => item.id === id);
@@ -99,21 +114,29 @@ export default function ChatPage() {
     try {
       const result = await runWorkflow(workflowId, {
         question: text,
-        provider,
+        provider: "qwen",
         top_k: topK,
       });
-      const failure = result.trace.find(
-        (item) => item.status === "failed",
-      )?.error;
+      if (result.status === "failed") {
+        const failure = result.trace.find((item) => item.status === "failed")?.error;
+        setFailureNotices((previous) => ({
+          ...previous,
+          [id]: failure?.message || "回答失败，请检查服务后重试",
+        }));
+        return;
+      }
+      if (!result.output.abstained && !result.output.answer?.trim()) {
+        setFailureNotices((previous) => ({
+          ...previous,
+          [id]: "该工作流没有产生回答",
+        }));
+        return;
+      }
       const message: Message = {
         role: "assistant",
-        content:
-          result.status === "failed"
-            ? failure?.message || "执行失败，请检查工作流和服务状态"
-            : result.output.answer || "该工作流没有产生回答",
+        content: result.output.answer || "该工作流没有产生回答",
         citations: result.output.citations || [],
         abstained: result.output.abstained,
-        runId: result.run_id,
       };
       setConversations((previous) =>
         previous.map((item) =>
@@ -123,7 +146,10 @@ export default function ChatPage() {
         ),
       );
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : "请求失败");
+      setFailureNotices((previous) => ({
+        ...previous,
+        [id]: error instanceof Error ? error.message : "请求失败",
+      }));
     } finally {
       setBusy(false);
     }
@@ -150,6 +176,7 @@ export default function ChatPage() {
         <button
           className="new-chat"
           onClick={() => {
+            currentRef.current = null;
             setCurrent(null);
             setQuestion("");
             setNotice("");
@@ -164,7 +191,10 @@ export default function ChatPage() {
             <button
               key={item.id}
               className={`conversation ${current === item.id ? "selected" : ""}`}
-              onClick={() => setCurrent(item.id)}
+              onClick={() => {
+                currentRef.current = item.id;
+                setCurrent(item.id);
+              }}
             >
               ☰ <span>{item.title}</span>
             </button>
@@ -232,26 +262,25 @@ export default function ChatPage() {
                         <span className="abstain">证据不足</span>
                       )}
                     </div>
-                    <div className="message-text">{message.content}</div>
-                    {!!message.citations?.length && (
+                    {message.role === "assistant" ? (
+                      <AnswerContent content={message.content} citations={message.citations || []}
+                        abstained={!!message.abstained} onCitationClick={setSelectedCitation} />
+                    ) : <div className="message-text">{message.content}</div>}
+                    {message.role === "assistant" && !message.abstained && !!message.citations?.length && (
                       <div className="citations">
                         <span className="small-label">引用资料</span>
-                        {message.citations.map((citation, i) => (
+                        {message.citations.map((citation, index) => (
                           <button
-                            key={i}
+                            key={index}
+                            type="button"
                             onClick={() => setSelectedCitation(citation)}
+                            aria-label={`来源 ${index + 1}：${citation.filename || citation.source || "资料"}`}
                           >
-                            ◫ &nbsp;
-                            {citation.filename || citation.source || "资料"}
-                            {citation.page ? ` · 第 ${citation.page} 页` : ""} ↗
+                            [{index + 1}] {citation.filename || citation.source || "资料"}
+                            {citation.page ? ` · 第 ${citation.page} 页` : ""}
                           </button>
                         ))}
                       </div>
-                    )}
-                    {message.runId && (
-                      <span className="run-id">
-                        运行记录 #{message.runId.slice(0, 8)}
-                      </span>
                     )}
                   </div>
                 </article>
@@ -275,7 +304,16 @@ export default function ChatPage() {
                 </button>
               </div>
             )}
-            <div className="settings-bar">
+            {failureNotice && (
+              <div className="notice error" role="alert">
+                {failureNotice}
+                <button onClick={() => current && clearFailure(current)} aria-label="关闭错误提示">×</button>
+              </div>
+            )}
+            <details className="advanced-settings">
+              <summary onClick={() => setAdvancedOpen((open) => !open)}>高级设置</summary>
+              {advancedOpen && (
+              <div className="settings-bar">
               <label>
                 工作流{" "}
                 <select
@@ -295,17 +333,6 @@ export default function ChatPage() {
                 </select>
               </label>
               <label>
-                模型{" "}
-                <select
-                  aria-label="模型"
-                  value={provider}
-                  onChange={(event) => setProvider(event.target.value)}
-                >
-                  <option value="deepseek">DeepSeek</option>
-                  <option value="qwen">Qwen</option>
-                </select>
-              </label>
-              <label>
                 证据数{" "}
                 <select
                   aria-label="证据数"
@@ -321,7 +348,9 @@ export default function ChatPage() {
               </label>
               <span className="settings-spacer" />
               <Link to={`/workflows/${workflowId}`}>编辑此工作流 ↗</Link>
-            </div>
+              </div>
+              )}
+            </details>
             <div className="composer">
               <textarea
                 aria-label="输入医疗资料问题"

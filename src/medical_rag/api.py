@@ -24,7 +24,7 @@ class SearchRequest(BaseModel):
 
 
 class AnswerRequest(SearchRequest):
-    provider: Literal["deepseek", "qwen"] = "deepseek"
+    provider: Literal["qwen"] = "qwen"
 
 
 def _success(value: object) -> dict:

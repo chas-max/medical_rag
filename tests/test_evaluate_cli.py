@@ -29,6 +29,38 @@ class Service:
         return []
 
 
+def test_cli_defaults_both_providers_to_qwen(tmp_path):
+    dataset = tmp_path / "dataset.jsonl"
+    output = tmp_path / "report.json"
+    dataset.write_text('{"question":"问题","relevant_chunk_ids":["id"]}', encoding="utf-8")
+    providers = []
+
+    def factory(settings, answer_provider, judge_provider):
+        providers.append((answer_provider, judge_provider))
+        return Service(), Judge()
+
+    assert main(["--dataset", str(dataset), "--output", str(output)], factory=factory) == 0
+    assert providers == [("qwen", "qwen")]
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["config"]["answer_provider"] == "qwen"
+    assert report["config"]["judge_provider"] == "qwen"
+
+
+def test_cli_rejects_each_legacy_provider_before_initialization(tmp_path):
+    dataset = tmp_path / "dataset.jsonl"
+    dataset.write_text('{"question":"问题","relevant_chunk_ids":["id"]}', encoding="utf-8")
+    calls = []
+
+    def factory(*args):
+        calls.append(args)
+        return Service(), Judge()
+
+    prefix = ["--dataset", str(dataset), "--output", str(tmp_path / "report.json")]
+    assert main(prefix + ["--answer-provider", "deepseek"], factory=factory) == 2
+    assert main(prefix + ["--judge-provider", "deepseek"], factory=factory) == 2
+    assert calls == []
+
+
 def test_cli_validates_before_factory(tmp_path):
     source = tmp_path / "bad.jsonl"
     source.write_text("{}", encoding="utf-8")

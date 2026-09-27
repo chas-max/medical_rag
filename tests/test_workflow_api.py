@@ -6,6 +6,7 @@ from medical_rag.api import create_app
 from medical_rag.config import Settings
 from medical_rag.generation import GroundedGenerator
 from medical_rag.service import RagService
+from medical_rag.types import ApiError
 
 from test_service import Embedder, MemoryStore, Reranker, Transport
 
@@ -29,13 +30,46 @@ def test_workflow_api_lists_nodes_and_published_workflows(tmp_path):
 def test_workflow_run_and_lookup_use_envelope(tmp_path):
     api, service = client(tmp_path)
     response = api.post("/workflows/medical-answer/runs", json={"inputs": {
-        "question": "高血压", "provider": "deepseek", "top_k": 5}})
+        "question": "高血压", "provider": "qwen", "top_k": 5}})
     assert response.status_code == 200
     run = response.json()["data"]
     assert run["output"]["abstained"] is True
     assert run["trace"]
     assert api.get(f"/runs/{run['run_id']}").json()["data"]["run_id"] == run["run_id"]
     assert api.get("/runs/missing").status_code == 404
+
+
+def test_workflow_defaults_to_qwen_and_rejects_deepseek(tmp_path):
+    api, _ = client(tmp_path)
+    accepted = api.post("/workflows/medical-answer/runs", json={"inputs": {"question": "高血压"}})
+    assert accepted.status_code == 200
+    rejected = api.post("/workflows/medical-answer/runs", json={"inputs": {
+        "question": "高血压", "provider": "deepseek"}})
+    assert rejected.status_code == 422
+    assert rejected.json()["error"]["code"] == "INVALID_PROVIDER"
+
+
+def test_model_rate_limit_stays_safe_in_both_answer_routes(tmp_path):
+    class LimitedTransport:
+        def complete(self, provider, system, user):
+            raise ApiError("MODEL_RATE_LIMITED", "生成模型请求过于频繁，请稍后重试", 429)
+
+    service = RagService(Settings(), MemoryStore(), Embedder(), Reranker(),
+                         GroundedGenerator(LimitedTransport()), workflow_root=tmp_path)
+    api = TestClient(create_app(service=service))
+    uploaded = api.post("/documents", files={"file": (
+        "guide.md", "# 高血压\n\n高血压患者应规律随访。".encode())})
+    assert uploaded.status_code == 200
+    answered = api.post("/answers", json={"question": "高血压", "provider": "qwen"})
+    assert answered.status_code == 429
+    assert answered.json()["error"]["code"] == "MODEL_RATE_LIMITED"
+    run = api.post("/workflows/medical-answer/runs", json={"inputs": {
+        "question": "高血压", "provider": "qwen", "top_k": 5}})
+    assert run.status_code == 200
+    assert run.json()["data"]["status"] == "failed"
+    failure = next(item["error"] for item in run.json()["data"]["trace"]
+                   if item["status"] == "failed")
+    assert failure == {"code": "MODEL_RATE_LIMITED", "message": "生成模型请求过于频繁，请稍后重试"}
 
 
 def test_invalid_workflow_and_inputs_have_stable_errors(tmp_path):
