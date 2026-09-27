@@ -64,3 +64,27 @@ def test_validate_quotas_checks_declared_counts():
     validate_quotas(rows, manifest)
     with pytest.raises(ValueError):
         validate_quotas(rows, {"expected_count": 3})
+
+
+def test_validate_quotas_checks_all_declared_dimensions():
+    rows = [rich_row()]
+    manifest = {"question_count": 1, "quotas": {
+        "category": {"高血压": 1}, "question_type": {"procedure": 1},
+        "difficulty": {"medium": 1}, "answerability": {"answerable": 1},
+    }}
+    validate_quotas(rows, manifest)
+    for dimension, value in (("category", "其他"), ("question_type", "fact"),
+                             ("difficulty", "easy"), ("answerability", "insufficient_evidence")):
+        bad = {"question_count": 1, "quotas": dict(manifest["quotas"])}
+        bad["quotas"][dimension] = {value: 1}
+        with pytest.raises(ValueError):
+            validate_quotas(rows, bad)
+
+
+def test_legacy_empty_relevant_reports_actual_line_number(tmp_path):
+    from medical_rag.evaluation import load_dataset
+    path = tmp_path / "legacy.jsonl"
+    path.write_text('{"question":"ok","relevant_chunk_ids":["a"]}\n'
+                    '{"question":"bad","relevant_chunk_ids":[]}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="第 2 行"):
+        load_dataset(path)

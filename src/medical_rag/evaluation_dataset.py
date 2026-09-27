@@ -91,12 +91,19 @@ def load_evaluation_dataset(path: Path, *, expected_count: int | None = None) ->
 
 def validate_quotas(cases: list[dict], manifest: dict) -> None:
     """Validate optional release quotas declared by a manifest."""
-    expected = manifest.get("expected_count")
+    expected = manifest.get("question_count", manifest.get("expected_count"))
     if expected is not None and len(cases) != expected:
         raise ValueError(f"题目数量应为 {expected}，实际为 {len(cases)}")
-    expected_answers = manifest.get("answerability_counts")
-    if expected_answers:
-        actual = {key: sum(item.get("answerability") == key for item in cases)
-                  for key in expected_answers}
-        if actual != expected_answers:
-            raise ValueError(f"answerability 配额不符：{actual} != {expected_answers}")
+    quotas = manifest.get("quotas", {})
+    legacy_answers = manifest.get("answerability_counts")
+    if legacy_answers:
+        quotas = {**quotas, "answerability": legacy_answers}
+    for dimension, expected_values in quotas.items():
+        if dimension not in {"category", "question_type", "difficulty", "answerability"}:
+            continue
+        if not isinstance(expected_values, dict):
+            raise ValueError(f"{dimension} 配额格式无效")
+        actual = {key: sum(item.get(dimension) == key for item in cases)
+                  for key in expected_values}
+        if actual != expected_values:
+            raise ValueError(f"{dimension} 配额不符：{actual} != {expected_values}")

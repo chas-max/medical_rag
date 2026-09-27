@@ -1,17 +1,28 @@
 """Offline dataset validation and end-to-end RAG evaluation reports."""
 
 from pathlib import Path
+import json
 
 from .evaluation_metrics import mean_or_none, retrieval_scores
-from .evaluation_dataset import load_evaluation_dataset
+from .evaluation_dataset import validate_evaluation_row
 
 
 def load_dataset(path: Path) -> list[dict]:
     """Read and validate every JSONL row before permitting any model calls."""
-    cases = load_evaluation_dataset(path)
-    for case in cases:
-        if "answerability" not in case and not case["relevant_chunk_ids"]:
-            raise ValueError("第 1 行题目或相关块 ID 无效")
+    cases, ids = [], set()
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            raw = json.loads(line)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"第 {line_number} 行不是有效 JSON") from exc
+        rich = isinstance(raw, dict) and "answerability" in raw
+        case = validate_evaluation_row(raw, line_number, allow_empty_relevant=rich)
+        if case["id"] in ids:
+            raise ValueError(f"第 {line_number} 行 ID 重复")
+        ids.add(case["id"])
+        cases.append(case)
+    if not cases:
+        raise ValueError("题集为空")
     return cases
 
 
