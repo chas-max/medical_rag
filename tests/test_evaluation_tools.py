@@ -143,6 +143,22 @@ def test_validate_release_fails_closed_for_missing_source_hash_metadata(tmp_path
         validate_release(dataset, manifest, registry)
 
 
+def test_validate_release_rejects_dataset_and_rubric_hash_mismatch(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    rubric = tmp_path / "rubric.md"
+    rubric.write_text("裁判协议", encoding="utf-8")
+    registry = write_registry(tmp_path)
+    write_json(manifest, {"question_count": 1, "dataset_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="题库哈希"):
+        validate_release(dataset, manifest, registry)
+    write_json(manifest, {"question_count": 1, "dataset_sha256": source_sha256(dataset),
+                          "rubric_sha256": "0" * 64})
+    with pytest.raises(ValueError, match="rubric 哈希"):
+        validate_release(dataset, manifest, registry)
+
+
 def test_remap_rejects_malformed_chunk_inventory(tmp_path):
     dataset = tmp_path / "questions.jsonl"
     dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
@@ -182,8 +198,11 @@ def test_export_judge_cases_omits_provider_errors_and_secrets(tmp_path):
     payload = json.loads(output_path.read_text(encoding="utf-8").strip())
     assert payload["candidate_answer"] == "候选答案"
     assert payload["evidence_excerpts"] == ["证据"]
+    assert payload["question_type"] == "procedure"
+    assert payload["difficulty"] == "medium"
     assert "SECRET" not in output_path.read_text(encoding="utf-8")
     assert set(payload) == {
         "id", "question", "reference_answer", "key_points", "evidence_excerpts",
-        "candidate_answer", "answerability", "rubric_version", "scores",
+        "candidate_answer", "answerability", "question_type", "difficulty",
+        "rubric_version", "scores",
     }

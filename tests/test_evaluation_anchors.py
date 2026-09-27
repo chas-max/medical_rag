@@ -70,3 +70,14 @@ def test_match_anchor_uses_token_overlap_and_enforces_threshold():
     assert result["method"] == "token_overlap"
     with pytest.raises(ValueError):
         match_anchor({"source_id": "guide", "quote": "完全不同的内容"}, chunks, min_score=0.9)
+
+
+def test_match_anchor_restricts_candidates_to_page_or_heading():
+    pdf = [{"source_id": "guide", "chunk_id": f"p{page}", "page": page,
+            "section": "", "text": "每年随访四次。"} for page in (1, 2)]
+    assert match_anchor({"source_id": "guide", "locator": {"page": 2},
+                         "quote": "每年随访四次。"}, pdf)["chunk_id"] == "p2"
+    markdown = [{"source_id": "guide", "chunk_id": name, "page": None,
+                 "section": name, "text": "食物多样。"} for name in ("饮食", "运动")]
+    assert match_anchor({"source_id": "guide", "locator": {"heading": "饮食"},
+                         "quote": "食物多样。"}, markdown)["chunk_id"] == "饮食"

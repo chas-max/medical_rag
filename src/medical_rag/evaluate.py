@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .config import Settings
 from .evaluation import evaluate_cases, load_dataset
+from .evaluation_dataset import validate_quotas
 
 
 def _live_dependencies(settings: Settings, answer_provider: str, judge_provider: str) -> tuple:
@@ -34,6 +35,7 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
     """Validate inputs before constructing paid or networked dependencies."""
     parser = argparse.ArgumentParser(description="运行离线 RAG 检索与答案评估")
     parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--manifest", type=Path, help="版本化题库的发布清单；默认读取数据集同目录的 manifest.json")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--answer-provider", choices=("deepseek", "qwen"), default="deepseek")
@@ -50,6 +52,18 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
         return 2
     try:
         cases = load_dataset(args.dataset)
+        manifest_path = args.manifest
+        if manifest_path is None and (args.dataset.parent / "manifest.json").is_file():
+            manifest_path = args.dataset.parent / "manifest.json"
+        manifest = None
+        if manifest_path is not None:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise ValueError("manifest 格式无效")
+            validate_quotas(cases, manifest)
+            if any(case.get("answerability") == "answerable" and not case["relevant_chunk_ids"]
+                   for case in cases):
+                raise ValueError("可回答题须先映射到相关 chunk")
     except (OSError, UnicodeError, ValueError):
         print("题集读取或校验失败：请检查 JSONL 格式和字段", file=sys.stderr)
         return 2
@@ -61,6 +75,16 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
         return 1
     try:
         report = evaluate_cases(cases, service, judge, args.top_k, args.answer_provider, args.judge_provider)
+        if manifest is not None:
+            report["dataset_version"] = manifest.get("dataset_version")
+            report["rubric_version"] = manifest.get("rubric_version")
+            report["config"]["dataset_version"] = manifest.get("dataset_version")
+            report["config"]["rubric_version"] = manifest.get("rubric_version")
+            counts = {}
+            for case in cases:
+                answerability = case["answerability"]
+                counts[answerability] = counts.get(answerability, 0) + 1
+            report["summary"]["answerability_counts"] = counts
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False) + "\n",
                                encoding="utf-8")
     except Exception:

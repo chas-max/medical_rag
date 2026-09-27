@@ -76,6 +76,8 @@ Remove-Item Env:RUN_MILVUS_INTEGRATION
 
 ## 离线评估
 
+项目另有固定的[公开医疗健康知识 500 题评测集](data/evaluations/medical-health-v1/README.md)，覆盖七份公开语料，包含原文锚点、精确配额、20 道证据不足题和跨 ChatGPT／Claude Code／Qoder 的统一裁判协议。先用目录中的校验工具确认来源哈希，再以实际入库块清单映射生成 runtime 题集，最后显式传入 `--manifest` 运行评估；不要直接用未映射的源题集执行计分。原文锚点与块 ID 分离，重建索引后必须重新映射。题库答案分须待外部三平台裁判各自评分后汇总；本地三项语义评分不能冒充最终答案分。
+
 先入库公开资料，从 `/search` 返回的 `data[].chunk.id` 找到候选块，人工核对原文并标注每个问题的**全部已知相关块**。UTF-8 JSONL 文件每行一题；`id` 可省略，`relevant_chunk_ids` 必须是非空、不重复的块 ID 数组：
 
 ```json

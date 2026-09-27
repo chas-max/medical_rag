@@ -71,6 +71,16 @@ def match_anchor(anchor: dict[str, Any], chunks: list[dict[str, Any]], *, min_sc
     candidates = [chunk for chunk in chunks if chunk.get("source_id") == source_id]
     if not candidates:
         raise ValueError("no chunks match anchor source_id")
+    locator = anchor.get("locator") or {}
+    if "page" in locator:
+        candidates = [chunk for chunk in candidates if chunk.get("page") == locator["page"]]
+    if "heading" in locator:
+        heading = normalize_source_text(str(locator["heading"]))
+        candidates = [chunk for chunk in candidates
+                      if normalize_source_text(str(chunk.get("section", ""))) == heading
+                      or normalize_source_text(str(chunk.get("section", ""))).endswith(" / " + heading)]
+    if not candidates:
+        raise ValueError("no chunks match anchor locator")
 
     containment = [chunk for chunk in candidates if quote and quote in normalize_source_text(str(chunk.get("text", chunk.get("content", ""))))]
     if containment:

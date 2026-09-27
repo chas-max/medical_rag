@@ -117,6 +117,19 @@ def validate_release(dataset_path: Path, manifest_path: Path, registry_path: Pat
     registry = _read_json(registry_path)
     if not isinstance(manifest, dict):
         raise ValueError("manifest 格式无效")
+    for field, path, label in (
+        ("dataset_sha256", dataset_path, "题库哈希"),
+        ("source_registry_sha256", registry_path, "source registry 哈希"),
+        ("rubric_sha256", manifest_path.parent / "rubric.md", "rubric 哈希"),
+    ):
+        expected_digest = manifest.get(field)
+        if expected_digest is None:
+            continue
+        if (not isinstance(expected_digest, str)
+                or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_digest)
+                or not path.is_file()
+                or source_sha256(path).lower() != expected_digest.lower()):
+            raise ValueError(f"{label} 不匹配")
     source_ids, hashes = _check_registry_hashes(registry, manifest, registry_path=registry_path)
     expected = manifest.get("question_count", manifest.get("expected_count"))
     cases = load_evaluation_dataset(dataset_path, expected_count=expected)
@@ -277,6 +290,8 @@ def export_judge_cases(report_path: Path, dataset_path: Path, output_path: Path)
             "evidence_excerpts": excerpts,
             "candidate_answer": candidate if isinstance(candidate, str) else None,
             "answerability": source["answerability"],
+            "question_type": source["question_type"],
+            "difficulty": source["difficulty"],
             "rubric_version": rubric_version,
             "scores": scores,
         })

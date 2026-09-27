@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "dataset_version": "medical-health-v1.0",
+  "rubric_version": "medical-health-v1.0",
+  "question_count": 500,
+  "created_at": "2026-09-27",
+  "validation_tool_version": "1.0",
+  "quotas": {
+    "category": {
+      "基本公共卫生与随访": 110,
+      "基层高血压诊疗": 100,
+      "成人高血压食养": 75,
+      "成人糖尿病食养": 75,
+      "公民健康素养": 70,
+      "中国居民膳食指南八准则": 50,
+      "跨主题综合场景": 20
+    },
+    "question_type": {
+      "fact": 140,
+      "procedure": 120,
+      "numeric": 70,
+      "scenario": 100,
+      "comparison": 40,
+      "multi_evidence": 30
+    },
+    "difficulty": {"easy": 180, "medium": 230, "hard": 90},
+    "answerability": {"answerable": 480, "insufficient_evidence": 20}
+  },
+  "dataset_sha256": "c2189fe941ff2992fded5fc7f9ab14aa9abf2c49887185a7cf06aadf3410b065",
+  "rubric_sha256": "04e2856b40b7d3f55e3b0da14e5a0b9b47e31f80b80fbb9d1b7444e49ff1dc31",
+  "source_registry_sha256": "0510de1691b20fefb2211c0cbbf39ce5c14cb8e20a729285aed69922ba4fbf9c",
+  "change_summary": "首次固定公开医疗健康语料500题与跨平台裁判协议。"
+}
