@@ -8,6 +8,8 @@ from pathlib import Path
 from .config import Settings
 from .evaluation import evaluate_cases, load_dataset
 from .evaluation_dataset import validate_quotas
+from .evaluation_anchors import source_sha256
+from .evaluation_tools import validate_release
 
 
 def _live_dependencies(settings: Settings, answer_provider: str, judge_provider: str) -> tuple:
@@ -61,6 +63,16 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
             if not isinstance(manifest, dict):
                 raise ValueError("manifest 格式无效")
             validate_quotas(cases, manifest)
+            release_path = manifest_path.parent / "questions.jsonl"
+            registry_path = manifest_path.parent / "source-registry.json"
+            validate_release(release_path, manifest_path, registry_path)
+            release_cases = load_dataset(release_path)
+            if len(cases) != len(release_cases) or any(
+                {key: value for key, value in runtime.items() if key != "relevant_chunk_ids"}
+                != {key: value for key, value in original.items() if key != "relevant_chunk_ids"}
+                for runtime, original in zip(cases, release_cases)
+            ):
+                raise ValueError("运行时题集与经校验的发布题库内容不一致")
             if any(case.get("answerability") == "answerable" and not case["relevant_chunk_ids"]
                    for case in cases):
                 raise ValueError("可回答题须先映射到相关 chunk")
@@ -76,6 +88,9 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
     try:
         report = evaluate_cases(cases, service, judge, args.top_k, args.answer_provider, args.judge_provider)
         if manifest is not None:
+            report["release_dataset_sha256"] = source_sha256(release_path)
+            report["runtime_dataset_sha256"] = source_sha256(args.dataset)
+            report["source_registry_sha256"] = source_sha256(registry_path)
             report["dataset_version"] = manifest.get("dataset_version")
             report["rubric_version"] = manifest.get("rubric_version")
             report["config"]["dataset_version"] = manifest.get("dataset_version")

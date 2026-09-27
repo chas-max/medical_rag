@@ -15,7 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from .evaluation_anchors import match_anchor, normalize_source_text, source_sha256
+from .evaluation_anchors import make_anchor_id, match_anchor, normalize_source_text, source_sha256
+from .evaluation_authoring import _comparable, _source_sections
 from .evaluation_dataset import load_evaluation_dataset, validate_quotas
 
 
@@ -131,6 +132,13 @@ def validate_release(dataset_path: Path, manifest_path: Path, registry_path: Pat
                 or source_sha256(path).lower() != expected_digest.lower()):
             raise ValueError(f"{label} 不匹配")
     source_ids, hashes = _check_registry_hashes(registry, manifest, registry_path=registry_path)
+    source_sections = {}
+    for entry in _registry_entries(registry):
+        path = Path(entry.get("path", entry.get("filename", entry.get("file"))))
+        if not path.is_absolute():
+            path = registry_path.parent / path
+        if path.suffix.lower() in {".pdf", ".md"}:
+            source_sections[entry["source_id"]] = dict(_source_sections(path))
     expected = manifest.get("question_count", manifest.get("expected_count"))
     cases = load_evaluation_dataset(dataset_path, expected_count=expected)
     validate_quotas(cases, manifest)
@@ -145,6 +153,15 @@ def validate_release(dataset_path: Path, manifest_path: Path, registry_path: Pat
             source_id = ref["source_id"]
             if source_id not in source_ids:
                 raise ValueError(f"题目 {case['id']} 引用了未知来源: {source_id}")
+            if source_id in source_sections:
+                locator = ref["locator"]
+                location = locator.get("page", locator.get("heading"))
+                text = source_sections[source_id].get(location)
+                if text is None or _comparable(ref["quote"]) not in _comparable(text):
+                    raise ValueError(f"题目 {case['id']} 的来源摘录与定位不匹配")
+                heading_path = [location] if isinstance(location, str) else [f"page-{location}"]
+                if ref["anchor_id"] != make_anchor_id(source_id, heading_path, ref["quote"]):
+                    raise ValueError(f"题目 {case['id']} 的稳定锚点不匹配")
             referenced.add(source_id)
     quota_counts = {}
     for dimension in ("category", "question_type", "difficulty", "answerability"):
@@ -180,13 +197,17 @@ def _load_chunks(path: Path) -> list[dict[str, Any]]:
         if ("page" not in chunk or "section" not in chunk
                 or (chunk["page"] is not None and
                     (isinstance(chunk["page"], bool) or not isinstance(chunk["page"], int)
-                     or chunk["page"] < 1))
+                     or chunk["page"] < 0))
                 or not isinstance(chunk["section"], str)):
             raise ValueError(f"第 {index} 个 chunk 缺少 page/section")
+        digest = chunk.get("sha256")
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest):
+            raise ValueError(f"第 {index} 个 chunk 缺少有效 sha256")
         if chunk_id in seen:
             raise ValueError(f"chunk_id 重复: {chunk_id}")
         seen.add(chunk_id)
-        normalized.append({**chunk, "chunk_id": chunk_id, "id": chunk_id, "text": text})
+        normalized.append({**chunk, "chunk_id": chunk_id, "id": chunk_id, "text": text,
+                           "page": chunk["page"] or None})
     return normalized
 
 
@@ -198,13 +219,16 @@ def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, ou
     if output_path.exists() or sidecar.exists():
         raise ValueError("输出文件已存在，请选择新路径")
     registry = _read_json(registry_path)
-    source_ids, _ = _check_registry_hashes(registry, registry_path=registry_path)
+    source_ids, source_hashes = _check_registry_hashes(registry, registry_path=registry_path)
     cases = load_evaluation_dataset(dataset_path)
     chunks = _load_chunks(chunks_path)
     chunk_sources = {chunk["source_id"] for chunk in chunks}
     if not chunk_sources <= source_ids:
         unknown = sorted(chunk_sources - source_ids)
         raise ValueError(f"chunk inventory 包含未知来源: {', '.join(unknown)}")
+    for chunk in chunks:
+        if chunk["sha256"].lower() != source_hashes[chunk["source_id"]].lower():
+            raise ValueError(f"chunk {chunk['chunk_id']} 的 sha256 与注册来源不符")
     runtime_rows: list[dict[str, Any]] = []
     mapping_report: list[dict[str, Any]] = []
     try:
@@ -220,12 +244,12 @@ def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, ou
                                            "warnings": ["insufficient_evidence"]})
                     continue
                 result = match_anchor(ref, chunks)
-                chunk_id = str(result["chunk_id"])
-                if chunk_id not in resolved:
-                    resolved.append(chunk_id)
-                mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
-                                       "chunk_id": chunk_id, "method": result["method"],
-                                       "score": result["score"], "warnings": []})
+                for chunk_id in result.get("chunk_ids", [result.get("chunk_id")]):
+                    if chunk_id not in resolved:
+                        resolved.append(chunk_id)
+                    mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
+                                           "chunk_id": chunk_id, "method": result["method"],
+                                           "score": result["score"], "warnings": []})
             row["relevant_chunk_ids"] = resolved
             runtime_rows.append(row)
     except (KeyError, TypeError, ValueError) as exc:
@@ -287,6 +311,7 @@ def export_judge_cases(report_path: Path, dataset_path: Path, output_path: Path)
             "question": source["question"],
             "reference_answer": source["reference_answer"],
             "key_points": source["key_points"],
+            "source_excerpts": [ref["quote"] for ref in source["source_refs"]],
             "evidence_excerpts": excerpts,
             "candidate_answer": candidate if isinstance(candidate, str) else None,
             "answerability": source["answerability"],

@@ -59,15 +59,15 @@ def make_anchor_id(source_id: str, heading_path: list[str], quote: str) -> str:
     return f"{source_id}#{'/'.join(canonical_heading)}#{digest}"
 
 
-def _tokens(text: str) -> set[str]:
-    # Keep CJK characters individually and group Latin/digit runs for deterministic overlap.
-    return set(re.findall(r"[\u3400-\u9fff]|[A-Za-z0-9]+", normalize_source_text(text).lower()))
+def _comparable(text: str) -> str:
+    # PDF extraction can insert layout whitespace inside words, but cannot reorder them.
+    return "".join(normalize_source_text(text).split())
 
 
-def match_anchor(anchor: dict[str, Any], chunks: list[dict[str, Any]], *, min_score: float = 0.92) -> dict[str, Any]:
-    """Resolve an anchor to exactly one chunk, failing on ambiguity or weak evidence."""
+def match_anchor(anchor: dict[str, Any], chunks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Resolve exact ordered quote text to every containing chunk at its source locator."""
     source_id = anchor.get("source_id")
-    quote = normalize_source_text(str(anchor.get("quote", "")))
+    quote = _comparable(str(anchor.get("quote", "")))
     candidates = [chunk for chunk in chunks if chunk.get("source_id") == source_id]
     if not candidates:
         raise ValueError("no chunks match anchor source_id")
@@ -82,24 +82,13 @@ def match_anchor(anchor: dict[str, Any], chunks: list[dict[str, Any]], *, min_sc
     if not candidates:
         raise ValueError("no chunks match anchor locator")
 
-    containment = [chunk for chunk in candidates if quote and quote in normalize_source_text(str(chunk.get("text", chunk.get("content", ""))))]
-    if containment:
-        if len(containment) != 1:
-            raise ValueError("ambiguous anchor: multiple containment matches")
-        return {"chunk_id": containment[0]["chunk_id"], "score": 1.0, "method": "containment"}
-
-    quote_tokens = _tokens(quote)
-    if not quote_tokens:
+    if not quote:
         raise ValueError("anchor quote is empty")
-    scored = []
-    for chunk in candidates:
-        chunk_tokens = _tokens(str(chunk.get("text", chunk.get("content", ""))))
-        score = len(quote_tokens & chunk_tokens) / len(quote_tokens)
-        scored.append((score, str(chunk["chunk_id"]), chunk))
-    best_score = max(item[0] for item in scored)
-    best = [item for item in scored if item[0] == best_score]
-    if len(best) != 1:
-        raise ValueError("ambiguous anchor: equal best token-overlap matches")
-    if best_score < min_score:
-        raise ValueError(f"anchor match score {best_score:.3f} below minimum {min_score:.3f}")
-    return {"chunk_id": best[0][2]["chunk_id"], "score": best_score, "method": "token_overlap"}
+    containment = [chunk for chunk in candidates
+                   if quote in _comparable(str(chunk.get("text", chunk.get("content", ""))))]
+    if not containment:
+        raise ValueError("no exact ordered quote match at anchor locator")
+    if len(containment) == 1:
+        return {"chunk_id": containment[0]["chunk_id"], "score": 1.0, "method": "containment"}
+    return {"chunk_ids": [str(chunk["chunk_id"]) for chunk in containment],
+            "score": 1.0, "method": "containment_multi"}

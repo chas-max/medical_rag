@@ -27,7 +27,7 @@
     "answerability": {"answerable": 480, "insufficient_evidence": 20}
   },
   "dataset_sha256": "c2189fe941ff2992fded5fc7f9ab14aa9abf2c49887185a7cf06aadf3410b065",
-  "rubric_sha256": "04e2856b40b7d3f55e3b0da14e5a0b9b47e31f80b80fbb9d1b7444e49ff1dc31",
+  "rubric_sha256": "6b323124d03c8c2b5f1c00a63314b3727ee45eeba1b6411973ce71e2edf65b59",
   "source_registry_sha256": "0510de1691b20fefb2211c0cbbf39ce5c14cb8e20a729285aed69922ba4fbf9c",
   "change_summary": "首次固定公开医疗健康语料500题与跨平台裁判协议。"
 }

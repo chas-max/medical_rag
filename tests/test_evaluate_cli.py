@@ -1,6 +1,7 @@
 import json
 
 from medical_rag.evaluate import main
+from medical_rag.evaluation_anchors import source_sha256
 
 
 class Judge:
@@ -80,8 +81,20 @@ def test_cli_versioned_release_checks_runtime_mapping_before_model_calls(tmp_pat
            "source_refs": [{"source_id": "doc", "locator": {"page": 1},
                             "quote": "按规范测量。", "anchor_id": "doc#1"}],
            "relevant_chunk_ids": []}
+    release = tmp_path / "questions.jsonl"
+    release.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("按规范测量。", encoding="utf-8")
+    registry = tmp_path / "source-registry.json"
+    registry.write_text(json.dumps({"sources": [{"source_id": "doc", "filename": "source.txt",
+                                                   "sha256": source_sha256(source_file)}]}), encoding="utf-8")
+    rubric = tmp_path / "rubric.md"
+    rubric.write_text("裁判规则", encoding="utf-8")
     source.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
     manifest.write_text(json.dumps({"question_count": 1, "dataset_version": "v1.0",
+                                    "dataset_sha256": source_sha256(release),
+                                    "source_registry_sha256": source_sha256(registry),
+                                    "rubric_sha256": source_sha256(rubric),
                                     "rubric_version": "r1.0", "quotas": {
                                         "answerability": {"answerable": 1}}}), encoding="utf-8")
     calls = []
@@ -100,4 +113,12 @@ def test_cli_versioned_release_checks_runtime_mapping_before_model_calls(tmp_pat
     report = json.loads(output.read_text(encoding="utf-8"))
     assert report["dataset_version"] == "v1.0"
     assert report["rubric_version"] == "r1.0"
+    assert report["release_dataset_sha256"] == source_sha256(release)
+    assert report["runtime_dataset_sha256"] == source_sha256(source)
     assert report["summary"]["answerability_counts"] == {"answerable": 1}
+
+    row["question"] = "恶意替换问题"
+    source.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert main(["--dataset", str(source), "--manifest", str(manifest),
+                 "--output", str(output)], factory=factory) == 2
+    assert len(calls) == 1

@@ -15,6 +15,7 @@ from medical_rag.evaluation_judge_aggregation import aggregate_judges  # noqa: E
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="三平台独立裁判结果汇总")
     parser.add_argument("--dataset", type=Path, required=True)
+    parser.add_argument("--judge-input", type=Path, required=True)
     parser.add_argument("--chatgpt", type=Path, required=True)
     parser.add_argument("--claude", type=Path, required=True)
     parser.add_argument("--qoder", type=Path, required=True)
@@ -23,7 +24,8 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         report = aggregate_judges(args.dataset, [args.chatgpt, args.claude, args.qoder],
-                                  args.output, rubric_version=args.rubric_version)
+                                  args.output, rubric_version=args.rubric_version,
+                                  judge_input_path=args.judge_input)
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"aggregation failed: {exc}", file=sys.stderr)
         return 2

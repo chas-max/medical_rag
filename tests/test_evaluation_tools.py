@@ -83,12 +83,14 @@ def test_remap_fails_on_ambiguous_anchor(tmp_path):
     registry_path = write_registry(tmp_path)
     dataset_path.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
     write_json(chunks_path, [
-        {"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x"},
-        {"id": "c2", "source_id": "src", "text": "原文", "page": 1, "section": "x"},
+        {"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x",
+         "sha256": source_sha256(tmp_path / "src.txt")},
+        {"id": "c2", "source_id": "src", "text": "原文", "page": 1, "section": "x",
+         "sha256": source_sha256(tmp_path / "src.txt")},
     ])
-    with pytest.raises(ValueError, match="ambiguous"):
-        remap_release(dataset_path, chunks_path, registry_path, tmp_path / "out.jsonl")
-    assert not (tmp_path / "out.jsonl").exists()
+    result = remap_release(dataset_path, chunks_path, registry_path, tmp_path / "out.jsonl")
+    assert result["mapping_count"] == 2
+    assert json.loads((tmp_path / "out.jsonl").read_text(encoding="utf-8"))["relevant_chunk_ids"] == ["c1", "c2"]
 
 
 def test_remap_writes_runtime_jsonl_and_sidecar(tmp_path):
@@ -97,7 +99,8 @@ def test_remap_writes_runtime_jsonl_and_sidecar(tmp_path):
     registry_path = write_registry(tmp_path)
     output_path = tmp_path / "out.jsonl"
     dataset_path.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
-    write_json(chunks_path, [{"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x"}])
+    write_json(chunks_path, [{"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x",
+                              "sha256": source_sha256(tmp_path / "src.txt")}])
     result = remap_release(dataset_path, chunks_path, registry_path, output_path)
     assert result["question_count"] == 1
     runtime = json.loads(output_path.read_text(encoding="utf-8").strip())
@@ -105,6 +108,31 @@ def test_remap_writes_runtime_jsonl_and_sidecar(tmp_path):
     sidecar = output_path.with_suffix(output_path.suffix + ".mapping.json")
     report = json.loads(sidecar.read_text(encoding="utf-8"))
     assert report[0]["chunk_id"] == "c1"
+
+
+def test_remap_rejects_missing_or_stale_index_source_hash(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+    registry = write_registry(tmp_path)
+    inventory = tmp_path / "chunks.json"
+    chunk = {"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x"}
+    for digest in (None, "0" * 64):
+        write_json(inventory, [{**chunk, **({"sha256": digest} if digest else {})}])
+        with pytest.raises(ValueError, match="sha256"):
+            remap_release(dataset, inventory, registry, tmp_path / "runtime.jsonl")
+    assert not (tmp_path / "runtime.jsonl").exists()
+
+
+def test_remap_accepts_milvus_markdown_page_zero(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(source_refs=[{
+        "source_id": "src", "locator": {"heading": "标题"}, "quote": "原文", "anchor_id": "src#q"
+    }]), ensure_ascii=False) + "\n", encoding="utf-8")
+    registry = write_registry(tmp_path)
+    inventory = tmp_path / "chunks.json"
+    write_json(inventory, [{"id": "c1", "source_id": "src", "text": "原文", "page": 0,
+                            "section": "标题", "sha256": source_sha256(tmp_path / "src.txt")}])
+    assert remap_release(dataset, inventory, registry, tmp_path / "runtime.jsonl")["mapping_count"] == 1
 
 
 def test_remap_does_not_overwrite_existing_runtime_output(tmp_path):
@@ -159,6 +187,28 @@ def test_validate_release_rejects_dataset_and_rubric_hash_mismatch(tmp_path):
         validate_release(dataset, manifest, registry)
 
 
+def test_validate_release_rechecks_quote_locator_and_anchor_against_source(tmp_path):
+    from medical_rag.evaluation_anchors import make_anchor_id
+
+    source = tmp_path / "guide.md"
+    source.write_text("## 正确章节\n每年随访四次。\n## 其他章节\n按规范测量。\n", encoding="utf-8")
+    registry = tmp_path / "source-registry.json"
+    write_json(registry, {"sources": [{"source_id": "src", "filename": source.name,
+                                        "sha256": source_sha256(source)}]})
+    manifest = tmp_path / "manifest.json"
+    write_json(manifest, {"question_count": 1})
+    dataset = tmp_path / "questions.jsonl"
+    row = valid_row(source_refs=[{"source_id": "src", "locator": {"heading": "正确章节"},
+                                  "quote": "每年随访四次。",
+                                  "anchor_id": make_anchor_id("src", ["正确章节"], "每年随访四次。")}])
+    dataset.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert validate_release(dataset, manifest, registry)["question_count"] == 1
+    row["source_refs"][0]["locator"]["heading"] = "其他章节"
+    dataset.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="摘录"):
+        validate_release(dataset, manifest, registry)
+
+
 def test_remap_rejects_malformed_chunk_inventory(tmp_path):
     dataset = tmp_path / "questions.jsonl"
     dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
@@ -198,11 +248,12 @@ def test_export_judge_cases_omits_provider_errors_and_secrets(tmp_path):
     payload = json.loads(output_path.read_text(encoding="utf-8").strip())
     assert payload["candidate_answer"] == "候选答案"
     assert payload["evidence_excerpts"] == ["证据"]
+    assert payload["source_excerpts"] == ["原文"]
     assert payload["question_type"] == "procedure"
     assert payload["difficulty"] == "medium"
     assert "SECRET" not in output_path.read_text(encoding="utf-8")
     assert set(payload) == {
-        "id", "question", "reference_answer", "key_points", "evidence_excerpts",
+        "id", "question", "reference_answer", "key_points", "source_excerpts", "evidence_excerpts",
         "candidate_answer", "answerability", "question_type", "difficulty",
         "rubric_version", "scores",
     }

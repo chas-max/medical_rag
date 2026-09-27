@@ -56,20 +56,31 @@ def test_match_anchor_rejects_source_mismatch_and_ambiguous_best_matches():
         {"source_id": "guide", "chunk_id": "c1", "text": "血压测量需静坐。"},
         {"source_id": "guide", "chunk_id": "c2", "text": "血压测量需静坐。"},
     ]
-    with pytest.raises(ValueError):
-        match_anchor({"source_id": "guide", "quote": "血压测量需静坐"}, chunks)
+    assert match_anchor({"source_id": "guide", "quote": "血压测量需静坐"}, chunks) == {
+        "chunk_ids": ["c1", "c2"], "score": 1.0, "method": "containment_multi"
+    }
 
     with pytest.raises(ValueError):
         match_anchor({"source_id": "guide", "quote": "完全不存在"}, [])
 
 
-def test_match_anchor_uses_token_overlap_and_enforces_threshold():
+def test_match_anchor_requires_ordered_exact_content_not_token_overlap():
     chunks = [{"source_id": "guide", "chunk_id": "c1", "text": "测量血压前应安静休息五分钟并保持坐姿。"}]
-    result = match_anchor({"source_id": "guide", "quote": "血压测量前安静休息"}, chunks, min_score=0.5)
-    assert result["chunk_id"] == "c1"
-    assert result["method"] == "token_overlap"
-    with pytest.raises(ValueError):
-        match_anchor({"source_id": "guide", "quote": "完全不同的内容"}, chunks, min_score=0.9)
+    with pytest.raises(ValueError, match="exact"):
+        match_anchor({"source_id": "guide", "quote": "血压测量前安静休息"}, chunks)
+    with pytest.raises(ValueError, match="exact"):
+        match_anchor({"source_id": "guide", "quote": "完全不同的内容"}, chunks)
+    with pytest.raises(ValueError, match="exact"):
+        match_anchor({"source_id": "guide", "quote": "甲乙丙"}, [
+            {"source_id": "guide", "chunk_id": "c2", "text": "丙乙甲"}
+        ])
+
+
+def test_match_anchor_ignores_pdf_extraction_whitespace_without_reordering():
+    result = match_anchor({"source_id": "guide", "quote": "血压测量需静坐"}, [
+        {"source_id": "guide", "chunk_id": "c1", "text": "血压\n测量 需 静坐。"}
+    ])
+    assert result == {"chunk_id": "c1", "score": 1.0, "method": "containment"}
 
 
 def test_match_anchor_restricts_candidates_to_page_or_heading():

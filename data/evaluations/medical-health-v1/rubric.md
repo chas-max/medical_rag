@@ -4,9 +4,9 @@
 
 ## 输入
 
-每题使用同一个 UTF-8 JSON：`id`、`question`、`reference_answer`、`key_points`、`evidence_excerpts`、`candidate_answer`、`answerability`、`rubric_version`。正式裁判还应看到题库的 `question_type` 和 `difficulty`，但这两个标签不得改变评分锚点。裁判记录平台、模型的完整标识、评分日期和原始输出；不得输入 API Key、患者个人信息或链式思维。
+每题使用同一个 UTF-8 JSON：`id`、`question`、`reference_answer`、`key_points`、`source_excerpts`、`evidence_excerpts`、`candidate_answer`、`answerability`、`rubric_version`。正式裁判还应看到题库的 `question_type` 和 `difficulty`，但这两个标签不得改变评分锚点。先对完整的 `judge-input.jsonl` 计算 SHA-256；三家裁判逐题原样回填相同的 `judge_input_sha256`，不得使用其他批次的候选回答。裁判记录平台、模型的完整标识、评分日期和原始输出；不得输入 API Key、患者个人信息或链式思维。
 
-`reference_answer` 和 `key_points` 是基于题库固定来源的核对依据；`evidence_excerpts` 是被评系统当次实际取得的证据。忠实度只看后者，关键要点覆盖和医学正确性以固定来源摘录核对。若固定来源与检索证据矛盾，应标记冲突，不凭外部常识裁决。
+`source_excerpts` 是题库固定来源原文摘录，`reference_answer` 和 `key_points` 是据此编排的核对依据；`evidence_excerpts` 是被评系统当次实际取得的证据。忠实度只看后者，关键要点覆盖和医学正确性以固定来源摘录核对。若固定来源与检索证据矛盾，应标记冲突，不凭外部常识裁决。
 
 ## 可回答题的四个维度
 
@@ -47,6 +47,7 @@
   "judge_platform": "chatgpt",
   "judge_model": "完整模型标识",
   "rubric_version": "medical-health-v1.0",
+  "judge_input_sha256": "本次完整judge-input.jsonl的64位SHA-256",
   "scores": {
     "key_point_coverage": 3,
     "faithfulness": 4,

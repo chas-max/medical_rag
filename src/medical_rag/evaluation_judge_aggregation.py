@@ -15,7 +15,8 @@ _WEIGHTS = (0.35, 0.30, 0.20, 0.15)
 _PLATFORMS = {"chatgpt", "claude", "qoder"}
 
 
-def _read_platform(path: Path, known_ids: set[str], rubric_version: str) -> tuple[str, str, dict]:
+def _read_platform(path: Path, known_ids: set[str], rubric_version: str,
+                   input_digest: str) -> tuple[str, str, dict]:
     records = {}
     platforms = set()
     models = set()
@@ -37,6 +38,8 @@ def _read_platform(path: Path, known_ids: set[str], rubric_version: str) -> tupl
                 or not isinstance(item.get("judge_model"), str)
                 or not item["judge_model"].strip()):
             raise ValueError("裁判版本或模型标识无效")
+        if item.get("judge_input_sha256") != input_digest:
+            raise ValueError("裁判 judge-input 输入哈希不匹配；可能混入其他候选回答批次")
         models.add(item["judge_model"])
         if not isinstance(item.get("unsafe"), bool):
             raise ValueError("unsafe 标记无效")
@@ -47,7 +50,7 @@ def _read_platform(path: Path, known_ids: set[str], rubric_version: str) -> tupl
 
 
 def aggregate_judges(dataset_path: Path, judge_paths: list[Path], output_path: Path,
-                     *, rubric_version: str) -> dict:
+                     *, rubric_version: str, judge_input_path: Path) -> dict:
     """Take dimension medians; exclude incomplete cases instead of inventing scores."""
     if len(judge_paths) != 3 or len({path.resolve() for path in judge_paths}) != 3:
         raise ValueError("必须提供三份不同裁判平台的文件")
@@ -56,10 +59,31 @@ def aggregate_judges(dataset_path: Path, judge_paths: list[Path], output_path: P
         raise ValueError("输出文件已存在或与输入文件相同")
     cases = load_evaluation_dataset(dataset_path)
     known = {case["id"] for case in cases}
+    if output_path.resolve() == judge_input_path.resolve():
+        raise ValueError("输出文件不能覆盖 judge-input")
+    input_digest = source_sha256(judge_input_path)
+    input_rows = {}
+    for number, line in enumerate(judge_input_path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            item = json.loads(line)
+        except ValueError as exc:
+            raise ValueError(f"judge-input 第 {number} 行 JSON 无效") from exc
+        if not isinstance(item, dict) or item.get("id") in input_rows or item.get("id") not in known:
+            raise ValueError("judge-input 题目 ID 无效或重复")
+        input_rows[item["id"]] = item
+    if set(input_rows) != known:
+        raise ValueError("judge-input 与题库题目数量不符")
+    for case in cases:
+        item = input_rows[case["id"]]
+        if any(item.get(key) != case[key] for key in
+               ("question", "reference_answer", "key_points", "answerability")):
+            raise ValueError(f"judge-input 与题库 {case['id']} 内容不符")
+        if item.get("source_excerpts") != [ref["quote"] for ref in case["source_refs"]]:
+            raise ValueError(f"judge-input 与题库 {case['id']} 来源摘录不符")
     by_platform = {}
     models = {}
     for path in judge_paths:
-        platform, model, records = _read_platform(path, known, rubric_version)
+        platform, model, records = _read_platform(path, known, rubric_version, input_digest)
         if platform in by_platform:
             raise ValueError("裁判平台重复")
         by_platform[platform] = records
@@ -125,6 +149,7 @@ def aggregate_judges(dataset_path: Path, judge_paths: list[Path], output_path: P
             valid_scores.append(detail["score_100"])
         details.append(detail)
     report = {"dataset_sha256": source_sha256(dataset_path),
+              "judge_input_sha256": input_digest,
               "rubric_version": rubric_version,
               "judge_platforms": sorted(by_platform),
               "judge_models": models,

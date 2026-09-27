@@ -1,2 +1,4 @@
 # Release hashes bind exact bytes; never rewrite their line endings on checkout.
 data/evaluations/medical-health-v1/** -text
+data/*.pdf -text
+data/中国居民膳食指南2022_平衡膳食八准则.md -text
