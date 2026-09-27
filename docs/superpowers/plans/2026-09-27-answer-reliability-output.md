@@ -21,7 +21,7 @@
 1. Runtime provider: `src/medical_rag/config.py`, `api.py`, `service.py`, `workflow/nodes/input.py`, `generation.py`; corresponding `tests/test_api.py`, `test_workflow_api.py`, `test_workflow_nodes.py`, `test_generation.py`.
 2. Offline provider: `src/medical_rag/evaluate.py`, `tests/test_evaluate_cli.py`, `data/evaluations/medical-health-v1/README.md`.
 3. Safe upstream failures and concise prompt: `generation.py`, `service.py`, `tests/test_generation.py`, `tests/test_workflow_api.py`.
-4. Presentation-only formatting: create `frontend/src/components/AnswerContent.tsx` and `frontend/src/test/answer-content.test.tsx`; update `frontend/src/api/workflows.ts` and `frontend/src/styles.css`.
+4. Presentation-only formatting: create `frontend/src/components/AnswerContent.tsx` and `frontend/src/test/answer-content.test.tsx`; update `frontend/src/api/workflows.ts`, `frontend/src/pages/ChatPage.tsx`, `frontend/src/test/pages.test.tsx` and `frontend/src/styles.css`.
 5. Chat/editor wiring: `frontend/src/pages/ChatPage.tsx`, `WorkflowEditorPage.tsx`, `frontend/src/test/pages.test.tsx`, `editor.test.tsx`, `frontend/src/styles.css`, `README.md`.
 
 ---
@@ -308,7 +308,49 @@ Extend the prompt inside `GroundedGenerator.draft` with `"先回答问题的核�
 
 **Interfaces:** Create `AnswerContent({content, citations, abstained, onCitationClick})` with `content: string`, `citations: Citation[]`, `abstained: boolean`, `onCitationClick: (citation: Citation) => void`. The component returns text or structured claim lines and source buttons; it never parses HTML/Markdown. `Citation.chunk_id?: string` is added to the existing type.
 
-- [ ] **Step 1: Write failing component tests.** Create `frontend/src/test/answer-content.test.tsx`:
+- [ ] **Step 1: Add an assertion-based RED test against the existing chat page.** In `frontend/src/test/pages.test.tsx`, add:
+
+```tsx
+it("renders verified claims as separate lines with compact source markers", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.runWorkflow).mockResolvedValue({
+    run_id: "format-1", status: "success",
+    output: { answer: "要点一 [block-1]\n要点二 [block-2]", abstained: false,
+      citations: [
+        { chunk_id: "block-1", filename: "指南.md", excerpt: "要点一" },
+        { chunk_id: "block-2", filename: "问答.pdf", excerpt: "要点二" },
+      ] },
+    trace: [],
+  });
+  render(<MemoryRouter initialEntries={["/chat"]}><App /></MemoryRouter>);
+  await user.type(screen.getByRole("textbox", { name: "输入医疗资料问题" }), "有哪些要点？");
+  await user.click(screen.getByRole("button", { name: "发送问题" }));
+  expect(await screen.findByText(/要点一/)).toBeInTheDocument();
+  expect(screen.getAllByRole("listitem")).toHaveLength(2);
+  expect(screen.getByRole("button", { name: "查看引用 1：指南.md" })).toBeInTheDocument();
+});
+```
+
+- [ ] **Step 2: Verify RED is an assertion failure, not an import error.** Run `npm --prefix frontend test -- src/test/pages.test.tsx`; expected: `getAllByRole("listitem")` fails because the current page renders one plain-text block.
+
+- [ ] **Step 3: Write focused component tests and verify their behavior fails.** After Step 2, create the minimum importable `frontend/src/components/AnswerContent.tsx` stub, then create `frontend/src/test/answer-content.test.tsx`:
+
+```tsx
+import type { Citation } from "../api/workflows";
+
+type Props = {
+  content: string;
+  citations: Citation[];
+  abstained: boolean;
+  onCitationClick: (citation: Citation) => void;
+};
+
+export default function AnswerContent(_props: Props) {
+  return null;
+}
+```
+
+The test file is:
 
 ```tsx
 import { render, screen } from "@testing-library/react";
@@ -338,9 +380,9 @@ it("preserves old text when citation metadata is unavailable", () => {
 });
 ```
 
-- [ ] **Step 2: Verify RED.** Run `npm --prefix frontend test -- src/test/answer-content.test.tsx`; expected: the component cannot be imported.
+Run `npm --prefix frontend test -- src/test/answer-content.test.tsx`; expected: the import succeeds, but both tests fail on missing rendered content against the stub.
 
-- [ ] **Step 3: Implement the component and type.** Add `chunk_id?: string` to `Citation` in `frontend/src/api/workflows.ts`. Create `frontend/src/components/AnswerContent.tsx`:
+- [ ] **Step 4: Implement the component, type and chat rendering.** Add `chunk_id?: string` to `Citation` in `frontend/src/api/workflows.ts`. Replace the stub `frontend/src/components/AnswerContent.tsx` with:
 
 ```tsx
 import { Fragment } from "react";
@@ -387,7 +429,16 @@ Add to `frontend/src/styles.css`:
 .citation-ref:focus-visible { outline: 2px solid #276a4e; border-radius: 4px; }
 ```
 
-- [ ] **Step 4: Verify GREEN.** Run `npm --prefix frontend test -- src/test/answer-content.test.tsx`; expected: both tests pass. Run `npm --prefix frontend run lint`; expected: TypeScript and ESLint pass. Review `git diff -- frontend/src/api/workflows.ts frontend/src/styles.css` and the new component/test before any isolated commit.
+Import `AnswerContent` in `frontend/src/pages/ChatPage.tsx` and replace only the existing `<div className="message-text">{message.content}</div>` with:
+
+```tsx
+{message.role === "assistant" ? (
+  <AnswerContent content={message.content} citations={message.citations || []}
+    abstained={!!message.abstained} onCitationClick={setSelectedCitation} />
+) : <div className="message-text">{message.content}</div>}
+```
+
+- [ ] **Step 5: Verify GREEN.** Run `npm --prefix frontend test -- src/test/answer-content.test.tsx src/test/pages.test.tsx`; expected: the component and page formatting tests pass. Run `npm --prefix frontend run lint`; expected: TypeScript and ESLint pass. Review `git diff -- frontend/src/api/workflows.ts frontend/src/pages/ChatPage.tsx frontend/src/test/pages.test.tsx frontend/src/styles.css` and the new component/test before any isolated commit.
 
 ### Task 5: Chat and editor integration, lean UI, active docs
 
@@ -511,13 +562,9 @@ In the existing `catch`, use `setFailureNotice(error instanceof Error ? error.me
 )}
 ```
 
-Replace message content and the source list with this JSX; keep historical `runId?` in the stored type but remove its rendered element:
+Keep the `AnswerContent` rendering from Task 4. Replace only the source list with this JSX; keep historical `runId?` in the stored type but remove its rendered element:
 
 ```tsx
-{message.role === "assistant" ? (
-  <AnswerContent content={message.content} citations={message.citations || []}
-    abstained={!!message.abstained} onCitationClick={setSelectedCitation} />
-) : <div className="message-text">{message.content}</div>}
 {message.role === "assistant" && !message.abstained && !!message.citations?.length && (
   <div className="citations">
     <span className="small-label">引用资料</span>
