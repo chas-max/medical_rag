@@ -16,12 +16,20 @@ def test_normalization_makes_whitespace_and_punctuation_variants_equivalent():
     )
 
 
+def test_normalization_preserves_fullwidth_digits_and_compatibility_characters():
+    assert normalize_source_text("１２３４５ ①") == "１２３４５ ①"
+
+
 def test_anchor_id_is_stable_across_whitespace_and_punctuation():
     first = make_anchor_id("guide", ["第一章", "测量"], "血压\n测量，需静坐。")
     second = make_anchor_id("guide", ["第一章", "测量"], " 血压 测量, 需静坐. ")
     assert first == second
     assert first.startswith("guide#第一章/测量#")
     assert len(first.rsplit("#", 1)[1]) == 16
+
+
+def test_anchor_id_uses_deterministic_canonical_hash():
+    assert make_anchor_id("guide", ["第一章", "测量"], "血压测量") == "guide#第一章/测量#38ef9fe7c1d1b405"
 
 
 def test_source_sha256_hashes_normalized_source_bytes(tmp_path: Path):
@@ -51,6 +59,9 @@ def test_match_anchor_rejects_source_mismatch_and_ambiguous_best_matches():
     ]
     with pytest.raises(ValueError):
         match_anchor({"source_id": "guide", "quote": "血压测量需静坐"}, chunks)
+
+    with pytest.raises(ValueError):
+        match_anchor({"source_id": "guide", "quote": "完全不存在"}, [])
 
 
 def test_match_anchor_uses_token_overlap_and_enforces_threshold():

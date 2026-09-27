@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
-import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -35,7 +35,7 @@ _PUNCTUATION = str.maketrans(
 
 def normalize_source_text(text: str) -> str:
     """Canonicalize source text while preserving Chinese characters and digits."""
-    normalized = unicodedata.normalize("NFKC", text).translate(_PUNCTUATION)
+    normalized = text.translate(_PUNCTUATION)
     normalized = re.sub(r"\s+", " ", normalized, flags=re.UNICODE)
     normalized = re.sub(r"\s*([,.;:!?()\[\]'])\s*", r"\1", normalized)
     return normalized.strip()
@@ -51,7 +51,11 @@ def make_anchor_id(source_id: str, heading_path: list[str], quote: str) -> str:
     """Create an ID independent of chunking, based on canonical source metadata."""
     canonical_heading = [normalize_source_text(item) for item in heading_path]
     canonical_quote = normalize_source_text(quote)
-    payload = "\x1f".join([source_id, *canonical_heading, canonical_quote]).encode("utf-8")
+    payload = json.dumps(
+        [source_id, canonical_heading, canonical_quote],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     digest = hashlib.sha256(payload).hexdigest()[:16]
     return f"{source_id}#{'/'.join(canonical_heading)}#{digest}"
 
