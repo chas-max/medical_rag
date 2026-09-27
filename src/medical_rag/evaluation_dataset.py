@@ -103,7 +103,11 @@ def validate_quotas(cases: list[dict], manifest: dict) -> None:
             continue
         if not isinstance(expected_values, dict):
             raise ValueError(f"{dimension} 配额格式无效")
-        actual = {key: sum(item.get(dimension) == key for item in cases)
-                  for key in expected_values}
+        actual_counts: dict[str, int] = {}
+        for item in cases:
+            value = item.get(dimension)
+            actual_counts[value] = actual_counts.get(value, 0) + 1
+        actual = dict(sorted(actual_counts.items()))
+        expected_values = dict(sorted(expected_values.items()))
         if actual != expected_values:
             raise ValueError(f"{dimension} 配额不符：{actual} != {expected_values}")

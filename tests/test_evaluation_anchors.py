@@ -1,4 +1,5 @@
 from pathlib import Path
+import hashlib
 
 import pytest
 
@@ -32,12 +33,10 @@ def test_anchor_id_uses_deterministic_canonical_hash():
     assert make_anchor_id("guide", ["第一章", "测量"], "血压测量") == "guide#第一章/测量#38ef9fe7c1d1b405"
 
 
-def test_source_sha256_hashes_normalized_source_bytes(tmp_path: Path):
+def test_source_sha256_hashes_exact_source_bytes(tmp_path: Path):
     path = tmp_path / "source.txt"
     path.write_text("血压\n测量，需静坐。", encoding="utf-8")
-    expected_path = tmp_path / "expected.txt"
-    expected_path.write_text("血压 测量, 需静坐.", encoding="utf-8")
-    assert source_sha256(path) == source_sha256(expected_path)
+    assert source_sha256(path) == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_match_anchor_prefers_unique_quote_containment():

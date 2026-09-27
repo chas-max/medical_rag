@@ -8,6 +8,7 @@ from medical_rag.evaluation_tools import (
     remap_release,
     validate_release,
 )
+from medical_rag.evaluation_anchors import source_sha256
 
 
 def valid_row(identifier="MHE-0001", **overrides):
@@ -36,16 +37,24 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
 
 
+def write_registry(tmp_path: Path, *, source_id: str = "src", content: str = "原文") -> Path:
+    source = tmp_path / "src.txt"
+    source.write_text(content, encoding="utf-8")
+    registry = tmp_path / "source-registry.json"
+    write_json(registry, {"sources": [{"source_id": source_id, "filename": source.name,
+                                         "sha256": source_sha256(source)}]})
+    return registry
+
+
 def test_validate_release_enforces_count_and_quotas(tmp_path):
     dataset = tmp_path / "questions.jsonl"
     manifest = tmp_path / "manifest.json"
-    registry = tmp_path / "source-registry.json"
+    registry = write_registry(tmp_path)
     dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
     write_json(manifest, {"question_count": 1, "quotas": {
         "category": {"基层高血压管理": 1}, "question_type": {"procedure": 1},
         "difficulty": {"medium": 1}, "answerability": {"answerable": 1}
     }})
-    write_json(registry, {"sources": [{"source_id": "src"}]})
     result = validate_release(dataset, manifest, registry)
     assert result["question_count"] == 1
     assert result["source_ids"] == ["src"]
@@ -63,8 +72,7 @@ def test_validate_release_rejects_duplicate_normalized_question(tmp_path):
     ]) + "\n", encoding="utf-8")
     manifest = tmp_path / "manifest.json"
     write_json(manifest, {"question_count": 2})
-    registry = tmp_path / "source-registry.json"
-    write_json(registry, {"sources": [{"source_id": "src"}]})
+    registry = write_registry(tmp_path)
     with pytest.raises(ValueError, match="问题重复"):
         validate_release(dataset, manifest, registry)
 
@@ -72,13 +80,12 @@ def test_validate_release_rejects_duplicate_normalized_question(tmp_path):
 def test_remap_fails_on_ambiguous_anchor(tmp_path):
     dataset_path = tmp_path / "questions.jsonl"
     chunks_path = tmp_path / "chunks.json"
-    registry_path = tmp_path / "source-registry.json"
+    registry_path = write_registry(tmp_path)
     dataset_path.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
     write_json(chunks_path, [
         {"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x"},
         {"id": "c2", "source_id": "src", "text": "原文", "page": 1, "section": "x"},
     ])
-    write_json(registry_path, {"sources": [{"source_id": "src"}]})
     with pytest.raises(ValueError, match="ambiguous"):
         remap_release(dataset_path, chunks_path, registry_path, tmp_path / "out.jsonl")
     assert not (tmp_path / "out.jsonl").exists()
@@ -87,11 +94,10 @@ def test_remap_fails_on_ambiguous_anchor(tmp_path):
 def test_remap_writes_runtime_jsonl_and_sidecar(tmp_path):
     dataset_path = tmp_path / "questions.jsonl"
     chunks_path = tmp_path / "chunks.json"
-    registry_path = tmp_path / "source-registry.json"
+    registry_path = write_registry(tmp_path)
     output_path = tmp_path / "out.jsonl"
     dataset_path.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
     write_json(chunks_path, [{"id": "c1", "source_id": "src", "text": "原文", "page": 1, "section": "x"}])
-    write_json(registry_path, {"sources": [{"source_id": "src"}]})
     result = remap_release(dataset_path, chunks_path, registry_path, output_path)
     assert result["question_count"] == 1
     runtime = json.loads(output_path.read_text(encoding="utf-8").strip())
@@ -99,6 +105,63 @@ def test_remap_writes_runtime_jsonl_and_sidecar(tmp_path):
     sidecar = output_path.with_suffix(output_path.suffix + ".mapping.json")
     report = json.loads(sidecar.read_text(encoding="utf-8"))
     assert report[0]["chunk_id"] == "c1"
+
+
+def test_remap_does_not_overwrite_existing_runtime_output(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+    chunks = tmp_path / "chunks.json"
+    write_json(chunks, [{"id": "c1", "source_id": "src", "text": "原文", "page": None,
+                         "section": "Markdown section"}])
+    output = tmp_path / "runtime.jsonl"
+    output.write_text("previous release\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="已存在"):
+        remap_release(dataset, chunks, write_registry(tmp_path), output)
+    assert output.read_text(encoding="utf-8") == "previous release\n"
+
+
+def test_validate_release_rejects_extra_quota_values(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text("\n".join([
+        json.dumps(valid_row("MHE-0001"), ensure_ascii=False),
+        json.dumps(valid_row("MHE-0002", question="另一个问题", category="其他"), ensure_ascii=False),
+    ]) + "\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    write_json(manifest, {"question_count": 2, "quotas": {"category": {"基层高血压管理": 1}}})
+    with pytest.raises(ValueError, match="category 配额"):
+        validate_release(dataset, manifest, write_registry(tmp_path))
+
+
+def test_validate_release_fails_closed_for_missing_source_hash_metadata(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    write_json(manifest, {"question_count": 1})
+    registry = tmp_path / "source-registry.json"
+    write_json(registry, {"sources": [{"source_id": "src"}]})
+    with pytest.raises(ValueError, match="sha256"):
+        validate_release(dataset, manifest, registry)
+
+
+def test_remap_rejects_malformed_chunk_inventory(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+    chunks = tmp_path / "chunks.json"
+    write_json(chunks, [{"id": "c1", "source_id": "src", "text": "原文", "page": 1}])
+    with pytest.raises(ValueError, match="page/section"):
+        remap_release(dataset, chunks, write_registry(tmp_path), tmp_path / "out.jsonl")
+
+
+def test_export_rejects_nonfinite_and_out_of_range_scores(tmp_path):
+    dataset = tmp_path / "questions.jsonl"
+    dataset.write_text(json.dumps(valid_row(), ensure_ascii=False) + "\n", encoding="utf-8")
+    report = tmp_path / "report.json"
+    base = {"id": "MHE-0001", "evidence": [], "answer": {"answer": "候选", "abstained": False}}
+    for value in (True, 1.1, float("nan"), float("inf")):
+        item = {**base, "faithfulness": {"score": value}}
+        write_json(report, {"cases": [item]})
+        with pytest.raises(ValueError, match="score"):
+            export_judge_cases(report, dataset, tmp_path / "judge.jsonl")
 
 
 def test_export_judge_cases_omits_provider_errors_and_secrets(tmp_path):

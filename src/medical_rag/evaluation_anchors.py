@@ -42,9 +42,8 @@ def normalize_source_text(text: str) -> str:
 
 
 def source_sha256(path: Path) -> str:
-    """Return SHA-256 of a source file's normalized UTF-8 text."""
-    text = path.read_text(encoding="utf-8")
-    return hashlib.sha256(normalize_source_text(text).encode("utf-8")).hexdigest()
+    """Return SHA-256 of the exact source file bytes."""
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def make_anchor_id(source_id: str, heading_path: list[str], quote: str) -> str:

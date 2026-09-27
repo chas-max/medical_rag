@@ -8,7 +8,9 @@ are derived artifacts produced by :func:`remap_release`.
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -47,7 +49,7 @@ def _source_ids_and_hashes(registry: Any) -> tuple[set[str], dict[str, str | Non
             raise ValueError(f"source_id 重复: {source_id}")
         source_ids.add(source_id)
         digest = entry.get("sha256", entry.get("file_sha256"))
-        if digest is not None and (not isinstance(digest, str) or len(digest) != 64):
+        if digest is not None and (not isinstance(digest, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", digest)):
             raise ValueError(f"source {source_id} 的 sha256 无效")
         hashes[source_id] = digest
     return source_ids, hashes
@@ -74,17 +76,20 @@ def _check_registry_hashes(
     entries = _registry_entries(registry)
     for entry in entries:
         digest = entry.get("sha256", entry.get("file_sha256"))
+        source_id = entry.get("source_id", "")
         if not digest:
-            continue  # Minimal registries are useful for local deterministic tests.
+            raise ValueError(f"source {source_id} 缺少 sha256")
         path_value = entry.get("path", entry.get("filename", entry.get("file")))
         if not path_value:
-            continue
+            raise ValueError(f"source {source_id} 缺少文件路径")
         path = Path(path_value)
         if not path.is_absolute():
             # Resolve relative to registry location when available.
             if registry_path:
                 path = registry_path.parent / path
-        if path.exists() and path.is_file() and source_sha256(path).lower() != digest.lower():
+        if not path.exists() or not path.is_file():
+            raise ValueError(f"source {source_id} 文件不存在")
+        if source_sha256(path).lower() != digest.lower():
             raise ValueError(f"source {entry['source_id']} 的 sha256 不匹配")
     return source_ids, hashes
 
@@ -159,6 +164,12 @@ def _load_chunks(path: Path) -> list[dict[str, Any]]:
         text = chunk.get("text", chunk.get("content"))
         if not all(isinstance(item, str) and item.strip() for item in (chunk_id, source_id, text)):
             raise ValueError(f"第 {index} 个 chunk 缺少 id/source_id/text")
+        if ("page" not in chunk or "section" not in chunk
+                or (chunk["page"] is not None and
+                    (isinstance(chunk["page"], bool) or not isinstance(chunk["page"], int)
+                     or chunk["page"] < 1))
+                or not isinstance(chunk["section"], str)):
+            raise ValueError(f"第 {index} 个 chunk 缺少 page/section")
         if chunk_id in seen:
             raise ValueError(f"chunk_id 重复: {chunk_id}")
         seen.add(chunk_id)
@@ -168,6 +179,11 @@ def _load_chunks(path: Path) -> list[dict[str, Any]]:
 
 def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, output_path: Path) -> dict[str, Any]:
     """Resolve stable source anchors against the current deterministic inventory."""
+    sidecar = output_path.with_suffix(output_path.suffix + ".mapping.json")
+    if output_path.resolve() in {path.resolve() for path in (dataset_path, chunks_path, registry_path)}:
+        raise ValueError("输出路径不能覆盖输入文件")
+    if output_path.exists() or sidecar.exists():
+        raise ValueError("输出文件已存在，请选择新路径")
     registry = _read_json(registry_path)
     source_ids, _ = _check_registry_hashes(registry, registry_path=registry_path)
     cases = load_evaluation_dataset(dataset_path)
@@ -183,6 +199,8 @@ def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, ou
             row = dict(case)
             resolved: list[str] = []
             for ref in case["source_refs"]:
+                if ref.get("source_id") not in source_ids:
+                    raise ValueError(f"题目 {case['id']} 引用了未知来源: {ref.get('source_id')}")
                 if case.get("answerability") == "insufficient_evidence":
                     mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
                                            "chunk_id": None, "method": "skipped", "score": None,
@@ -202,9 +220,13 @@ def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, ou
         raise ValueError(str(exc)) from exc
     payload = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
                       for row in runtime_rows)
-    sidecar = output_path.with_suffix(output_path.suffix + ".mapping.json")
-    _atomic_write(output_path, payload)
-    _atomic_write(sidecar, json.dumps(mapping_report, ensure_ascii=False, indent=2) + "\n")
+    try:
+        _atomic_write(sidecar, json.dumps(mapping_report, ensure_ascii=False, indent=2) + "\n")
+        _atomic_write(output_path, payload)
+    except Exception:
+        output_path.unlink(missing_ok=True)
+        sidecar.unlink(missing_ok=True)
+        raise
     return {"question_count": len(runtime_rows), "mapping_count": len(mapping_report),
             "output_path": str(output_path), "mapping_report": str(sidecar)}
 
@@ -212,7 +234,14 @@ def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, ou
 def _safe_score(value: Any) -> float | None:
     if isinstance(value, dict):
         value = value.get("score")
-    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("score 无效")
+    numeric = float(value)
+    if not math.isfinite(numeric) or not 0 <= numeric <= 1:
+        raise ValueError("score 超出范围")
+    return numeric
 
 
 def export_judge_cases(report_path: Path, dataset_path: Path, output_path: Path) -> int:
