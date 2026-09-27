@@ -1,0 +1,256 @@
+"""Release validation, chunk remapping, and judge export utilities.
+
+These functions deliberately keep file I/O deterministic and avoid any model or
+vector-store dependencies.  Source references are the durable truth; chunk IDs
+are derived artifacts produced by :func:`remap_release`.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import tempfile
+from pathlib import Path
+from typing import Any
+
+from .evaluation_anchors import match_anchor, normalize_source_text, source_sha256
+from .evaluation_dataset import load_evaluation_dataset, validate_quotas
+
+
+def _read_json(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError) as exc:
+        raise ValueError(f"无法读取 JSON 文件: {path.name}") from exc
+
+
+def _registry_entries(registry: Any) -> list[dict[str, Any]]:
+    entries = registry.get("sources", registry) if isinstance(registry, dict) else registry
+    if isinstance(entries, dict):
+        entries = [{"source_id": key, **(value if isinstance(value, dict) else {})}
+                   for key, value in entries.items()]
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ValueError("source registry 格式无效")
+    return entries
+
+
+def _source_ids_and_hashes(registry: Any) -> tuple[set[str], dict[str, str | None]]:
+    entries = _registry_entries(registry)
+    source_ids: set[str] = set()
+    hashes: dict[str, str | None] = {}
+    for entry in entries:
+        source_id = entry.get("source_id")
+        if not isinstance(source_id, str) or not source_id.strip():
+            raise ValueError("source registry 缺少 source_id")
+        source_id = source_id.strip()
+        if source_id in source_ids:
+            raise ValueError(f"source_id 重复: {source_id}")
+        source_ids.add(source_id)
+        digest = entry.get("sha256", entry.get("file_sha256"))
+        if digest is not None and (not isinstance(digest, str) or len(digest) != 64):
+            raise ValueError(f"source {source_id} 的 sha256 无效")
+        hashes[source_id] = digest
+    return source_ids, hashes
+
+
+def _check_registry_hashes(
+    registry: Any,
+    manifest: dict[str, Any] | None = None,
+    *,
+    registry_path: Path | None = None,
+) -> tuple[set[str], dict[str, str | None]]:
+    source_ids, hashes = _source_ids_and_hashes(registry)
+    required = {}
+    if isinstance(manifest, dict):
+        raw = manifest.get("source_hashes", manifest.get("required_source_hashes", {}))
+        if isinstance(raw, dict):
+            required = raw
+    for source_id, expected in required.items():
+        if source_id not in source_ids:
+            raise ValueError(f"source registry 缺少来源: {source_id}")
+        actual = hashes.get(source_id)
+        if not actual or actual.lower() != str(expected).lower():
+            raise ValueError(f"source {source_id} 的 sha256 不匹配")
+    entries = _registry_entries(registry)
+    for entry in entries:
+        digest = entry.get("sha256", entry.get("file_sha256"))
+        if not digest:
+            continue  # Minimal registries are useful for local deterministic tests.
+        path_value = entry.get("path", entry.get("filename", entry.get("file")))
+        if not path_value:
+            continue
+        path = Path(path_value)
+        if not path.is_absolute():
+            # Resolve relative to registry location when available.
+            if registry_path:
+                path = registry_path.parent / path
+        if path.exists() and path.is_file() and source_sha256(path).lower() != digest.lower():
+            raise ValueError(f"source {entry['source_id']} 的 sha256 不匹配")
+    return source_ids, hashes
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent), text=True)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except OSError:
+            pass
+        raise
+
+
+def validate_release(dataset_path: Path, manifest_path: Path, registry_path: Path) -> dict[str, Any]:
+    """Validate a complete rich release and return a safe summary."""
+    manifest = _read_json(manifest_path)
+    registry = _read_json(registry_path)
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest 格式无效")
+    source_ids, hashes = _check_registry_hashes(registry, manifest, registry_path=registry_path)
+    expected = manifest.get("question_count", manifest.get("expected_count"))
+    cases = load_evaluation_dataset(dataset_path, expected_count=expected)
+    validate_quotas(cases, manifest)
+    seen_questions: dict[str, str] = {}
+    referenced: set[str] = set()
+    for case in cases:
+        key = normalize_source_text(case["question"]).casefold()
+        if key in seen_questions:
+            raise ValueError(f"问题重复: {case['id']} 与 {seen_questions[key]}")
+        seen_questions[key] = case["id"]
+        for ref in case["source_refs"]:
+            source_id = ref["source_id"]
+            if source_id not in source_ids:
+                raise ValueError(f"题目 {case['id']} 引用了未知来源: {source_id}")
+            referenced.add(source_id)
+    quota_counts = {}
+    for dimension in ("category", "question_type", "difficulty", "answerability"):
+        quota_counts[dimension] = {}
+        for case in cases:
+            value = case[dimension]
+            quota_counts[dimension][value] = quota_counts[dimension].get(value, 0) + 1
+    return {
+        "question_count": len(cases),
+        "source_ids": sorted(referenced),
+        "registered_source_count": len(source_ids),
+        "source_hash_count": sum(value is not None for value in hashes.values()),
+        "quota_counts": quota_counts,
+        "dataset_path": str(dataset_path),
+    }
+
+
+def _load_chunks(path: Path) -> list[dict[str, Any]]:
+    value = _read_json(path)
+    chunks = value.get("chunks") if isinstance(value, dict) else value
+    if not isinstance(chunks, list):
+        raise ValueError("chunk inventory 必须是 JSON 数组")
+    normalized = []
+    seen: set[str] = set()
+    for index, chunk in enumerate(chunks, 1):
+        if not isinstance(chunk, dict):
+            raise ValueError(f"第 {index} 个 chunk 格式无效")
+        chunk_id = chunk.get("id", chunk.get("chunk_id"))
+        source_id = chunk.get("source_id")
+        text = chunk.get("text", chunk.get("content"))
+        if not all(isinstance(item, str) and item.strip() for item in (chunk_id, source_id, text)):
+            raise ValueError(f"第 {index} 个 chunk 缺少 id/source_id/text")
+        if chunk_id in seen:
+            raise ValueError(f"chunk_id 重复: {chunk_id}")
+        seen.add(chunk_id)
+        normalized.append({**chunk, "chunk_id": chunk_id, "id": chunk_id, "text": text})
+    return normalized
+
+
+def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, output_path: Path) -> dict[str, Any]:
+    """Resolve stable source anchors against the current deterministic inventory."""
+    registry = _read_json(registry_path)
+    source_ids, _ = _check_registry_hashes(registry, registry_path=registry_path)
+    cases = load_evaluation_dataset(dataset_path)
+    chunks = _load_chunks(chunks_path)
+    chunk_sources = {chunk["source_id"] for chunk in chunks}
+    if not chunk_sources <= source_ids:
+        unknown = sorted(chunk_sources - source_ids)
+        raise ValueError(f"chunk inventory 包含未知来源: {', '.join(unknown)}")
+    runtime_rows: list[dict[str, Any]] = []
+    mapping_report: list[dict[str, Any]] = []
+    try:
+        for case in cases:
+            row = dict(case)
+            resolved: list[str] = []
+            for ref in case["source_refs"]:
+                if case.get("answerability") == "insufficient_evidence":
+                    mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
+                                           "chunk_id": None, "method": "skipped", "score": None,
+                                           "warnings": ["insufficient_evidence"]})
+                    continue
+                result = match_anchor(ref, chunks)
+                chunk_id = str(result["chunk_id"])
+                if chunk_id not in resolved:
+                    resolved.append(chunk_id)
+                mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
+                                       "chunk_id": chunk_id, "method": result["method"],
+                                       "score": result["score"], "warnings": []})
+            row["relevant_chunk_ids"] = resolved
+            runtime_rows.append(row)
+    except (KeyError, TypeError, ValueError) as exc:
+        # Do not leave a successful-looking runtime copy behind on failure.
+        raise ValueError(str(exc)) from exc
+    payload = "".join(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n"
+                      for row in runtime_rows)
+    sidecar = output_path.with_suffix(output_path.suffix + ".mapping.json")
+    _atomic_write(output_path, payload)
+    _atomic_write(sidecar, json.dumps(mapping_report, ensure_ascii=False, indent=2) + "\n")
+    return {"question_count": len(runtime_rows), "mapping_count": len(mapping_report),
+            "output_path": str(output_path), "mapping_report": str(sidecar)}
+
+
+def _safe_score(value: Any) -> float | None:
+    if isinstance(value, dict):
+        value = value.get("score")
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def export_judge_cases(report_path: Path, dataset_path: Path, output_path: Path) -> int:
+    """Export a provider-neutral, secret-free JSONL judge payload."""
+    report = _read_json(report_path)
+    if not isinstance(report, dict) or not isinstance(report.get("cases"), list):
+        raise ValueError("evaluation report 格式无效")
+    dataset = {case["id"]: case for case in load_evaluation_dataset(dataset_path)}
+    rubric_version = report.get("rubric_version")
+    if rubric_version is None and isinstance(report.get("config"), dict):
+        rubric_version = report["config"].get("rubric_version")
+    rubric_version = str(rubric_version or "medical-health-v1")
+    exported: list[dict[str, Any]] = []
+    for item in report["cases"]:
+        if not isinstance(item, dict) or item.get("id") not in dataset:
+            raise ValueError("report 中存在未知题目 ID")
+        source = dataset[item["id"]]
+        answer = item.get("answer")
+        if isinstance(answer, dict):
+            candidate = answer.get("answer")
+        else:
+            candidate = answer
+        evidence = item.get("evidence", [])
+        excerpts = [entry.get("text", "") for entry in evidence
+                     if isinstance(entry, dict) and isinstance(entry.get("text", ""), str)]
+        scores = {name: _safe_score(item.get(name)) for name in
+                  ("faithfulness", "context_relevance", "answer_relevance")}
+        exported.append({
+            "id": item["id"],
+            "question": source["question"],
+            "reference_answer": source["reference_answer"],
+            "key_points": source["key_points"],
+            "evidence_excerpts": excerpts,
+            "candidate_answer": candidate if isinstance(candidate, str) else None,
+            "answerability": source["answerability"],
+            "rubric_version": rubric_version,
+            "scores": scores,
+        })
+    _atomic_write(output_path, "".join(json.dumps(item, ensure_ascii=False, separators=(",", ":")) + "\n"
+                                       for item in exported))
+    return len(exported)
