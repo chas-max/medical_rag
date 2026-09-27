@@ -1,34 +1,17 @@
 """Offline dataset validation and end-to-end RAG evaluation reports."""
 
-import json
 from pathlib import Path
 
 from .evaluation_metrics import mean_or_none, retrieval_scores
+from .evaluation_dataset import load_evaluation_dataset
 
 
 def load_dataset(path: Path) -> list[dict]:
     """Read and validate every JSONL row before permitting any model calls."""
-    cases = []
-    ids = set()
-    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-        try:
-            row = json.loads(line)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"第 {line_number} 行不是有效 JSON") from exc
-        if not isinstance(row, dict) or not {"question", "relevant_chunk_ids"} <= row.keys() or not row.keys() <= {"id", "question", "relevant_chunk_ids"}:
-            raise ValueError(f"第 {line_number} 行字段不符合要求")
-        question, relevant = row["question"], row["relevant_chunk_ids"]
-        identifier = row.get("id", str(line_number))
-        if (not isinstance(question, str) or not question.strip()
-                or not isinstance(identifier, str) or not identifier.strip() or identifier in ids
-                or not isinstance(relevant, list) or not relevant
-                or any(not isinstance(item, str) or not item.strip() for item in relevant)
-                or len(relevant) != len(set(relevant))):
-            raise ValueError(f"第 {line_number} 行题目或相关块 ID 无效")
-        ids.add(identifier)
-        cases.append({"id": identifier, "question": question.strip(), "relevant_chunk_ids": relevant})
-    if not cases:
-        raise ValueError("题集为空")
+    cases = load_evaluation_dataset(path)
+    for case in cases:
+        if "answerability" not in case and not case["relevant_chunk_ids"]:
+            raise ValueError("第 1 行题目或相关块 ID 无效")
     return cases
 
 
@@ -46,11 +29,20 @@ def evaluate_cases(cases: list[dict], service: object, judge: object, top_k: int
                   "retrieval": None, "evidence": [], "answer": None, "abstained": None,
                   "faithfulness": None, "context_relevance": None, "answer_relevance": None,
                   "error": None, "judge_errors": []}
+        for field in ("reference_answer", "key_points", "answerability", "category",
+                      "question_type", "difficulty", "source_refs"):
+            if field in case:
+                result[field] = case[field]
+        insufficient = case.get("answerability") == "insufficient_evidence"
+        if insufficient:
+            result.update({"expected_abstention": True, "correct_abstention": None,
+                           "unsupported_answer": None})
         results.append(result)
         try:
             evidence = service.search(question, top_k)
-            result["retrieval"] = retrieval_scores(
-                [item.chunk.id for item in evidence], set(case["relevant_chunk_ids"]), top_k)
+            if not insufficient:
+                result["retrieval"] = retrieval_scores(
+                    [item.chunk.id for item in evidence], set(case["relevant_chunk_ids"]), top_k)
             result["evidence"] = [{"chunk_id": item.chunk.id, "text": item.chunk.text}
                                   for item in evidence]
         except Exception:
@@ -62,6 +54,10 @@ def evaluate_cases(cases: list[dict], service: object, judge: object, top_k: int
             result["abstained"] = answer["abstained"]
         except Exception:
             result["error"] = "ANSWER_FAILED"
+            continue
+        if insufficient:
+            result["correct_abstention"] = bool(result["abstained"])
+            result["unsupported_answer"] = not result["abstained"]
             continue
         if result["abstained"]:
             continue
@@ -90,7 +86,8 @@ def evaluate_cases(cases: list[dict], service: object, judge: object, top_k: int
         result["answer_relevance"] = try_judge("ANSWER_RELEVANCE", judge.score_answer,
                                                 question, answer["answer"])
 
-    valid_retrieval = [item["retrieval"] for item in results if item["retrieval"] is not None]
+    valid_retrieval = [item["retrieval"] for item in results
+                       if item["retrieval"] is not None and item.get("answerability") != "insufficient_evidence"]
     dimensions = ("faithfulness", "context_relevance", "answer_relevance")
     valid_scores = {name: [item[name]["score"] for item in results
                            if item[name] is not None and item[name]["score"] is not None]
@@ -106,6 +103,16 @@ def evaluate_cases(cases: list[dict], service: object, judge: object, top_k: int
                     "judge_failures": judge_failures,
                     "valid_counts": {name: len(values) for name, values in valid_scores.items()}})
     summary.update({name: mean_or_none(values) for name, values in valid_scores.items()})
+    abstention_cases = [item for item in results if item.get("expected_abstention")]
+    correct_abstentions = [item["correct_abstention"] for item in abstention_cases
+                           if item["correct_abstention"] is not None]
+    unsupported = [item["unsupported_answer"] for item in abstention_cases
+                   if item["unsupported_answer"] is not None]
+    summary.update({"expected_abstention_count": len(abstention_cases),
+                    "correct_abstention_count": sum(correct_abstentions),
+                    "correct_abstention_rate": mean_or_none(correct_abstentions),
+                    "unsupported_answer_count": sum(unsupported),
+                    "unsupported_answer_rate": mean_or_none(unsupported)})
     return {"config": {"top_k": top_k, "answer_provider": answer_provider,
                        "judge_provider": judge_provider, "judge_model": judge.model},
             "cases": results, "summary": summary}

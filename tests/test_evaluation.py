@@ -153,3 +153,24 @@ def test_answer_failure_preserves_retrieval_without_judging():
     assert case["faithfulness"] is None
     assert not judge.calls
     assert "secret" not in json.dumps(report)
+
+
+def test_insufficient_evidence_records_abstention_and_excludes_recall():
+    case = {
+        "id": "MHE-1", "question": "q", "relevant_chunk_ids": [],
+        "reference_answer": "资料不足时拒答", "key_points": ["拒答"],
+        "answerability": "insufficient_evidence", "category": "公卫",
+        "question_type": "fact", "difficulty": "easy",
+        "source_refs": [{"source_id": "s", "locator": {"heading": "h"},
+                         "quote": "无足够证据", "anchor_id": "s#h#1"}],
+    }
+    service, judge = Service(ids=(), abstained=True), Judge()
+    report = evaluate_cases([case], service, judge, 2, "qwen", "deepseek")
+    result = report["cases"][0]
+    assert result["expected_abstention"] is True
+    assert result["correct_abstention"] is True
+    assert result["unsupported_answer"] is False
+    assert report["summary"]["expected_abstention_count"] == 1
+    assert report["summary"]["correct_abstention_rate"] == 1
+    assert report["summary"]["recall"] is None
+    assert not judge.calls
