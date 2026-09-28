@@ -191,7 +191,9 @@ class WorkflowEngine:
                 )
                 return WorkflowRunResult(run_id, "failed", {}, context.trace)
 
-            if result.status == "success":
+            # Explicitly skipped nodes may publish a harmless branch placeholder.
+            # Engine-induced skips above never publish outputs.
+            if result.status in ("success", "skipped") and result.outputs:
                 node_outputs[node_id] = dict(result.outputs)
             context.trace.append(
                 NodeTrace(

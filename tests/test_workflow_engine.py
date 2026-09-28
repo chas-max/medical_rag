@@ -640,3 +640,66 @@ async def test_engine_skips_join_when_any_required_fan_in_value_is_absent() -> N
 
     assert called == []
     assert result.trace_by_node("join").status == "skipped"
+
+
+@pytest.mark.asyncio
+async def test_explicit_skipped_result_can_supply_join_placeholder() -> None:
+    registry = make_registry(
+        FunctionalNode(
+            "query.input",
+            "Input",
+            "input",
+            outputs={"route": "string"},
+            function=lambda inputs, context: NodeResult({"route": "direct"}, "success"),
+        ),
+        FunctionalNode(
+            "branch.skip",
+            "Skip",
+            "question",
+            inputs={"route": "string"},
+            outputs={"variant": "query_variant"},
+            function=lambda inputs, context: NodeResult(
+                {"variant": {"active": False}}, "skipped"
+            ),
+        ),
+        FunctionalNode(
+            "join.node",
+            "Join",
+            "output",
+            inputs={"variant": "query_variant"},
+            outputs={"answer": "string"},
+            function=lambda inputs, context: NodeResult(
+                {"answer": "original" if not inputs["variant"]["active"] else "changed"},
+                "success",
+            ),
+        ),
+    )
+    definition = make_definition(
+        [
+            {"id": "query", "type": "query.input"},
+            {"id": "branch", "type": "branch.skip"},
+            {"id": "join", "type": "join.node"},
+        ],
+        [
+            {
+                "id": "e1",
+                "source": "query",
+                "source_port": "route",
+                "target": "branch",
+                "target_port": "route",
+            },
+            {
+                "id": "e2",
+                "source": "branch",
+                "source_port": "variant",
+                "target": "join",
+                "target_port": "variant",
+            },
+        ],
+    )
+
+    result = await WorkflowEngine(registry).run(definition, {})
+
+    assert result.output == {"answer": "original"}
+    assert result.trace_by_node("branch").status == "skipped"
+    assert result.trace_by_node("join").status == "success"
