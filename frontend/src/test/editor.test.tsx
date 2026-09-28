@@ -129,37 +129,21 @@ it("adds, configures and saves a new node with a version increment", async () =>
   );
 });
 
-it("shows validation issues and failed run traces without exposing a draft as executable", async () => {
+it("keeps validation in the editor without a conversation test runner", async () => {
   const user = userEvent.setup();
   vi.mocked(api.validateWorkflow).mockResolvedValue({
     valid: false,
     issues: [{ code: "MISSING_INPUT", message: "缺少连接", node_id: "query" }],
-  });
-  vi.mocked(api.runWorkflow).mockResolvedValue({
-    run_id: "abc12345",
-    status: "failed",
-    output: {},
-    trace: [
-      {
-        node_id: "query",
-        status: "failed",
-        duration_ms: 12,
-        metadata: {},
-        error: { code: "MODEL_ERROR", message: "模型服务不可用" },
-      },
-    ],
   });
   render(
     <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
       <App />
     </MemoryRouter>,
   );
+  expect(screen.getByRole("button", { name: "✓ 校验" })).toBeInTheDocument();
+  expect(screen.queryByRole("textbox", { name: "测试问题" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /运行已发布版/ })).not.toBeInTheDocument();
   await user.click(await screen.findByRole("button", { name: "✓ 校验" }));
   expect(await screen.findByText(/发现 1 个校验问题/)).toBeInTheDocument();
-  await user.click(screen.getByRole("button", { name: /运行已发布版/ }));
-  expect(await screen.findByText("模型服务不可用")).toBeInTheDocument();
-  expect(api.runWorkflow).toHaveBeenCalledWith(
-    "medical-answer",
-    expect.objectContaining({ question: "高血压患者如何管理？", provider: "qwen" }),
-  );
+  expect(api.runWorkflow).not.toHaveBeenCalled();
 });

@@ -19,11 +19,9 @@ import {
   getNodes,
   getWorkflow,
   getWorkflows,
-  runWorkflow,
   saveWorkflow,
   validateWorkflow,
   type NodeMetadata,
-  type RunResult,
   type Workflow,
   type ValidationResult,
 } from "../api/workflows";
@@ -60,11 +58,9 @@ function Editor() {
   const [edges, setEdges] = useState<Edge[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [validation, setValidation] = useState<ValidationResult | null>(null);
-  const [run, setRun] = useState<RunResult | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [traceOpen, setTraceOpen] = useState(true);
-  const [testQuestion, setTestQuestion] = useState("高血压患者如何管理？");
 
   useEffect(() => {
     let alive = true;
@@ -78,7 +74,6 @@ function Editor() {
         setNodes(graph.nodes);
         setEdges(graph.edges);
         setValidation(null);
-        setRun(null);
         setSelectedId(null);
         setError("");
         window.setTimeout(
@@ -111,7 +106,6 @@ function Editor() {
   );
   const changed = () => {
     setValidation(null);
-    setRun(null);
   };
   const onNodesChange = useCallback((changes: NodeChange<GraphNode>[]) => {
     setNodes((previous) => applyNodeChanges(changes, previous));
@@ -250,35 +244,6 @@ function Editor() {
       setBusy(false);
     }
   }
-  async function execute() {
-    if (!original) return;
-    setBusy(true);
-    setError("");
-    setTraceOpen(true);
-    try {
-      const result = await runWorkflow(original.id, {
-        question: testQuestion,
-        provider: "qwen",
-        top_k: 5,
-      });
-      setRun(result);
-      setNodes((previous) =>
-        previous.map((node) => ({
-          ...node,
-          data: {
-            ...node.data,
-            traceStatus: result.trace.find((item) => item.node_id === node.id)
-              ?.status,
-          },
-        })),
-      );
-    } catch (problem) {
-      setError(problem instanceof Error ? problem.message : "运行失败");
-    } finally {
-      setBusy(false);
-    }
-  }
-
   return (
     <div className="editor-layout">
       <div className="editor-header">
@@ -394,7 +359,7 @@ function Editor() {
                 适应画布 ⛶
               </button>
               <button onClick={() => setTraceOpen((value) => !value)}>
-                {traceOpen ? "收起" : "展开"}运行记录
+                {traceOpen ? "收起" : "展开"}校验记录
               </button>
             </div>
           </div>
@@ -457,23 +422,8 @@ function Editor() {
             <div className="trace-panel">
               <div className="trace-heading">
                 <div>
-                  <span className="eyebrow">INSPECT & RUN</span>
-                  <h2>运行与校验</h2>
-                </div>
-                <div className="test-run">
-                  <input
-                    aria-label="测试问题"
-                    value={testQuestion}
-                    onChange={(event) => setTestQuestion(event.target.value)}
-                    placeholder="输入测试问题"
-                  />
-                  <button
-                    className="button-primary"
-                    onClick={() => void execute()}
-                    disabled={busy || !original}
-                  >
-                    ▷ 运行已发布版
-                  </button>
+                  <span className="eyebrow">INSPECT & VALIDATE</span>
+                  <h2>工作流校验</h2>
                 </div>
               </div>
               {error && (
@@ -503,42 +453,10 @@ function Editor() {
                   )}
                 </div>
               )}
-              {run ? (
-                <div className="trace-list">
-                  <span className="trace-result">
-                    运行 {run.status === "success" ? "成功" : "失败"} · #
-                    {run.run_id.slice(0, 8)}
-                  </span>
-                  {run.trace.map((item) => (
-                    <button
-                      key={item.node_id}
-                      onClick={() => setSelectedId(item.node_id)}
-                    >
-                      <span className={`trace-dot ${item.status}`} />
-                      {nodes.find((node) => node.id === item.node_id)?.data
-                        .metadata?.title || item.node_id}
-                      <small>
-                        {item.status} · {item.duration_ms}ms
-                      </small>
-                      {item.error && (
-                        <span className="trace-error">
-                          {item.error.message}
-                        </span>
-                      )}
-                    </button>
-                  ))}
-                  {run.output.answer && (
-                    <p className="trace-answer">{run.output.answer}</p>
-                  )}
-                </div>
-              ) : (
-                !validation &&
+              {!validation &&
                 !error && (
-                  <p className="empty-trace">
-                    校验当前画布，或运行已发布版本以查看逐节点轨迹。
-                  </p>
-                )
-              )}
+                  <p className="empty-trace">校验当前画布以查看校验结果。</p>
+                )}
             </div>
           )}
         </div>
