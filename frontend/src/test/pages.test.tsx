@@ -21,7 +21,57 @@ const workflow: api.Workflow = {
   name: "医疗资料问答",
   version: 1,
   status: "published",
-  nodes: [],
+  nodes: [
+    "query.input",
+    "retrieval.dense",
+    "evidence.gate",
+    "generation.llm",
+    "citation.validate",
+    "answer.output",
+  ].map((type, index) => ({
+    id: `node-${index}`,
+    type,
+    position: { x: 0, y: 0 },
+    config: {},
+  })),
+  edges: [
+    [0, 1],
+    [1, 2],
+    [2, 3],
+    [3, 4],
+    [4, 5],
+  ].map(([source, target]) => ({
+    id: `edge-${source}-${target}`,
+    source: `node-${source}`,
+    source_port: "output",
+    target: `node-${target}`,
+    target_port: "input",
+  })),
+};
+const expandedWorkflow: api.Workflow = {
+  ...workflow,
+  id: "medical-answer-expanded",
+  name: "路由式医疗资料问答",
+};
+const searchWorkflow: api.Workflow = {
+  ...workflow,
+  id: "medical-search",
+  name: "医疗资料检索",
+  nodes: [
+    { id: "query", type: "query.input", position: { x: 0, y: 0 }, config: {} },
+    { id: "retrieval", type: "retrieval.dense", position: { x: 0, y: 0 }, config: {} },
+    { id: "output", type: "search.output", position: { x: 0, y: 0 }, config: {} },
+  ],
+  edges: [
+    { id: "query-retrieval", source: "query", source_port: "question", target: "retrieval", target_port: "question" },
+    { id: "retrieval-output", source: "retrieval", source_port: "evidence", target: "output", target_port: "evidence" },
+  ],
+};
+const ingestionWorkflow: api.Workflow = {
+  ...workflow,
+  id: "document-ingestion",
+  name: "文档入库",
+  nodes: [{ id: "input", type: "document.input", position: { x: 0, y: 0 }, config: {} }],
   edges: [],
 };
 beforeEach(() => {
@@ -292,4 +342,70 @@ it("renders verified claims as separate lines with compact source markers", asyn
   expect(await screen.findByText(/要点一/)).toBeInTheDocument();
   expect(screen.getAllByRole("listitem")).toHaveLength(2);
   expect(screen.getByRole("button", { name: "查看引用 1：指南.md" })).toBeInTheDocument();
+});
+
+it("shows only complete answer workflows in the chat selector", async () => {
+  vi.mocked(api.getWorkflows).mockResolvedValue([
+    searchWorkflow,
+    ingestionWorkflow,
+    expandedWorkflow,
+    workflow,
+  ]);
+  render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  const selector = await screen.findByRole("combobox", { name: "工作流" });
+  expect(selector).toHaveValue("medical-answer");
+  expect(screen.getByRole("option", { name: "医疗资料问答 · v1" })).toBeInTheDocument();
+  expect(
+    screen.getByRole("option", { name: "路由式医疗资料问答 · v1" }),
+  ).toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "医疗资料检索 · v1" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("option", { name: "文档入库 · v1" })).not.toBeInTheDocument();
+});
+
+it("sends the next question through the workflow selected in chat", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflows).mockResolvedValue([workflow, expandedWorkflow]);
+  vi.mocked(api.runWorkflow).mockResolvedValue({
+    run_id: "expanded-run",
+    status: "success",
+    output: { answer: "路由回答", abstained: false, citations: [] },
+    trace: [],
+  });
+  render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  await user.selectOptions(
+    await screen.findByRole("combobox", { name: "工作流" }),
+    "medical-answer-expanded",
+  );
+  await user.type(
+    screen.getByRole("textbox", { name: "输入医疗资料问题" }),
+    "需要路由的问题",
+  );
+  await user.click(screen.getByRole("button", { name: "发送问题" }));
+  await waitFor(() =>
+    expect(api.runWorkflow).toHaveBeenCalledWith("medical-answer-expanded", {
+      question: "需要路由的问题",
+      provider: "qwen",
+      top_k: 5,
+    }),
+  );
+});
+
+it("does not send when no complete answer workflow is available", async () => {
+  vi.mocked(api.getWorkflows).mockResolvedValue([searchWorkflow, ingestionWorkflow]);
+  render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  expect(await screen.findByText("暂无可用的回答工作流")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
+  expect(api.runWorkflow).not.toHaveBeenCalled();
 });

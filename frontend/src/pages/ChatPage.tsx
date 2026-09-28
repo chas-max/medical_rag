@@ -9,6 +9,7 @@ import {
   type Citation,
   type Workflow,
 } from "../api/workflows";
+import { selectAnswerWorkflows } from "../workflow/selection";
 
 type Message = {
   role: "user" | "assistant";
@@ -34,7 +35,8 @@ export default function ChatPage() {
   const [current, setCurrent] = useState<string | null>(null);
   const currentRef = useRef<string | null>(null);
   const [workflows, setWorkflows] = useState<Workflow[]>([]);
-  const [workflowId, setWorkflowId] = useState("medical-answer");
+  const [workflowId, setWorkflowId] = useState("");
+  const [workflowLoading, setWorkflowLoading] = useState(true);
   const [topK, setTopK] = useState(5);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [healthy, setHealthy] = useState<boolean | null>(null);
@@ -62,14 +64,19 @@ export default function ChatPage() {
   useEffect(() => {
     getWorkflows()
       .then((items) => {
-        const answers = items.filter((item) =>
-          item.nodes.some((node) => node.type === "answer.output"),
-        );
+        const answers = selectAnswerWorkflows(items);
         setWorkflows(answers);
-        if (answers.length && !answers.some((item) => item.id === workflowId))
-          setWorkflowId(answers[0].id);
+        setWorkflowId((current) => {
+          if (answers.some((item) => item.id === current)) return current;
+          return answers.find((item) => item.id === "medical-answer")?.id || answers[0]?.id || "";
+        });
       })
-      .catch((error) => setNotice(error.message));
+      .catch((error) => {
+        setWorkflows([]);
+        setWorkflowId("");
+        setNotice(error.message);
+      })
+      .finally(() => setWorkflowLoading(false));
     getHealth()
       .then((result) => setHealthy(result.milvus))
       .catch(() => setHealthy(false));
@@ -83,7 +90,8 @@ export default function ChatPage() {
 
   async function send(value = question) {
     const text = value.trim();
-    if (!text || busy) return;
+    if (!text || busy || workflowLoading || !workflowId) return;
+    const selectedWorkflowId = workflowId;
     const id = currentRef.current || crypto.randomUUID();
     clearFailure(id);
     currentRef.current = id;
@@ -112,7 +120,7 @@ export default function ChatPage() {
     setNotice("");
     setBusy(true);
     try {
-      const result = await runWorkflow(workflowId, {
+      const result = await runWorkflow(selectedWorkflowId, {
         question: text,
         provider: "qwen",
         top_k: topK,
@@ -205,7 +213,9 @@ export default function ChatPage() {
             <span className="small-label">工作流引擎</span>
             <strong>让每一步都有迹可循</strong>
             <p>检索、证据门控与引用校验，组成可审查的回答路径。</p>
-            <Link to={`/workflows/${workflowId}`}>查看工作流 ↗</Link>
+            <Link to={`/workflows/${workflowId || "medical-answer"}`}>
+              查看工作流 ↗
+            </Link>
           </div>
           <div className="sidebar-foot">✳ &nbsp; 知源工作台 · v0.1</div>
         </div>
@@ -310,28 +320,30 @@ export default function ChatPage() {
                 <button onClick={() => current && clearFailure(current)} aria-label="关闭错误提示">×</button>
               </div>
             )}
-            <details className="advanced-settings">
-              <summary onClick={() => setAdvancedOpen((open) => !open)}>高级设置</summary>
-              {advancedOpen && (
-              <div className="settings-bar">
+            <div className="settings-bar workflow-selector">
               <label>
                 工作流{" "}
                 <select
                   aria-label="工作流"
                   value={workflowId}
+                  disabled={workflowLoading || !workflows.length}
                   onChange={(event) => setWorkflowId(event.target.value)}
                 >
-                  {workflows.length ? (
-                    workflows.map((item) => (
-                      <option key={item.id} value={item.id}>
-                        {item.name} · v{item.version}
-                      </option>
-                    ))
-                  ) : (
-                    <option value="medical-answer">医疗资料问答</option>
-                  )}
+                  {workflows.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.name} · v{item.version}
+                    </option>
+                  ))}
                 </select>
               </label>
+              {!workflowLoading && !workflows.length && (
+                <span className="muted">暂无可用的回答工作流</span>
+              )}
+            </div>
+            <details className="advanced-settings">
+              <summary onClick={() => setAdvancedOpen((open) => !open)}>高级设置</summary>
+              {advancedOpen && (
+              <div className="settings-bar">
               <label>
                 证据数{" "}
                 <select
@@ -387,7 +399,7 @@ export default function ChatPage() {
                 <button
                   className="send"
                   aria-label="发送问题"
-                  disabled={busy || !question.trim()}
+                  disabled={busy || workflowLoading || !workflowId || !question.trim()}
                   onClick={() => void send()}
                 >
                   ↑
