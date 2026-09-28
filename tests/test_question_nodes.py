@@ -6,7 +6,7 @@ import pytest
 from medical_rag.types import ApiError
 from medical_rag.workflow.contracts import ExecutionContext
 from medical_rag.workflow.nodes.question import (
-    RoutedQuestionNode, decompose, hyde, rewrite, route_question, stepback,
+    RoutedQuestionNode, decompose, hyde, rewrite, route_question, select, stepback,
 )
 
 
@@ -81,3 +81,43 @@ def test_transport_failure_is_not_treated_as_invalid_json():
 
     with pytest.raises(ApiError, match="稍后重试"):
         route_question(INPUT, {}, CONTEXT, BrokenTransport())
+
+
+@pytest.mark.parametrize("route,expected", [
+    ("direct", ["高血压如何随访？"]),
+    ("rewrite", ["高血压如何随访？", "随访要求？"]),
+    ("decompose", ["高血压如何随访？", "频率？", "内容？"]),
+    ("hyde", ["高血压如何随访？"]),
+    ("stepback", ["高血压如何随访？", "随访原则？"]),
+])
+def test_selector_uses_only_chosen_branch_and_original(route, expected):
+    inactive = {"active": False, "questions": [], "hypothetical": None}
+    inputs = {"question": "高血压如何随访？", "route": route,
+              "rewrite": inactive, "decompose": inactive,
+              "hyde": inactive, "stepback": inactive}
+    selected = {
+        "rewrite": {"active": True, "questions": ["随访要求？"], "hypothetical": None},
+        "decompose": {"active": True, "questions": ["频率？", "内容？"], "hypothetical": None},
+        "hyde": {"active": True, "questions": [], "hypothetical": "规律记录血压。"},
+        "stepback": {"active": True, "questions": ["随访原则？"], "hypothetical": None},
+    }
+    if route != "direct":
+        inputs[route] = selected[route]
+    plan = select(inputs, {}, CONTEXT)["query_plan"]
+    assert plan["questions"] == expected
+    assert plan["hypothetical"] == ("规律记录血压。" if route == "hyde" else None)
+
+
+def test_selector_deduplicates_original_against_hyde_and_other_questions():
+    inactive = {"active": False, "questions": [], "hypothetical": None}
+    inputs = {"question": "问题", "route": "hyde", "rewrite": inactive,
+              "decompose": inactive, "stepback": inactive,
+              "hyde": {"active": True, "questions": [], "hypothetical": " 问题 "}}
+    assert select(inputs, {}, CONTEXT)["query_plan"] == {
+        "questions": ["问题"], "hypothetical": None}
+
+
+def test_selector_rejects_inactive_chosen_branch():
+    with pytest.raises(ValueError, match="所选问题分支未生成结果"):
+        select({"question": "问题", "route": "rewrite",
+                "rewrite": {"active": False, "questions": [], "hypothetical": None}}, {}, CONTEXT)

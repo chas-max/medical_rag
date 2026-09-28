@@ -88,3 +88,22 @@ class RoutedQuestionNode(BuiltinNode):
                 "skipped",
             )
         return await super().execute(inputs, config, context)
+
+
+def select(inputs: dict, config: dict, context: ExecutionContext) -> dict:
+    original = inputs["question"].strip()
+    route = inputs["route"]
+    selected = inputs[route] if route != "direct" else None
+    if route != "direct" and not selected["active"]:
+        raise ValueError("所选问题分支未生成结果")
+    questions = [original]
+    hypothetical = None
+    if selected is not None:
+        for question in selected["questions"]:
+            clean = question.strip()
+            if clean and clean not in questions:
+                questions.append(clean)
+        candidate = selected["hypothetical"]
+        if candidate is not None and candidate.strip() not in questions:
+            hypothetical = candidate.strip()
+    return {"query_plan": {"questions": questions, "hypothetical": hypothetical}}

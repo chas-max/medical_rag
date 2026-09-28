@@ -1,6 +1,7 @@
 """Dense/BM25 retrieval, reciprocal rank fusion, and reranking."""
 
 from dataclasses import replace
+from fractions import Fraction
 
 from ...types import Evidence
 from ..contracts import ExecutionContext
@@ -41,3 +42,29 @@ def rerank(inputs: dict, config: dict, context: ExecutionContext, reranker: obje
     ranked = [replace(item, score=float(score)) for item, score in zip(evidence, scores)
               if float(score) >= cutoff]
     return {"evidence": sorted(ranked, key=lambda item: item.score, reverse=True)[:inputs["top_k"]]}
+
+
+def expanded(inputs: dict, config: dict, context: ExecutionContext, store: object,
+             embedder: object, candidate_k: int) -> dict:
+    k = int(config.get("k", 60))
+    if k < 1:
+        raise ValueError("RRF k 必须大于零")
+    plan = inputs["query_plan"]
+    ranked_lists = []
+    for question in plan["questions"]:
+        vector = embedder.encode([question])[0]
+        ranked_lists.append(store.search_dense(vector, candidate_k))
+        ranked_lists.append(store.search_bm25(question, candidate_k))
+    if plan["hypothetical"] is not None:
+        vector = embedder.encode([plan["hypothetical"]])[0]
+        ranked_lists.append(store.search_dense(vector, candidate_k))
+    fused: dict[str, Evidence] = {}
+    scores: dict[str, Fraction] = {}
+    for candidates in ranked_lists:
+        for rank, item in enumerate(candidates, 1):
+            key = item.chunk.id
+            scores[key] = scores.get(key, Fraction(0)) + Fraction(1, k + rank)
+            fused[key] = item
+    evidence = [replace(item, fused_score=float(scores[key])) for key, item in fused.items()]
+    return {"evidence": sorted(evidence, key=lambda item: item.fused_score,
+                               reverse=True)}
