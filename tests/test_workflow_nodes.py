@@ -79,6 +79,18 @@ def test_default_graphs_are_valid():
         assert validate_workflow(graph, registry) == []
 
 
+def test_expanded_graph_registers_and_validates_without_changing_defaults():
+    _, _, registry = setup()
+    repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
+    graph = repository.get("medical-answer-expanded")
+    assert graph.status == "published"
+    assert validate_workflow(graph, registry) == []
+    assert {"question.router", "question.rewrite", "question.decompose",
+            "question.hyde", "question.stepback", "question.select",
+            "retrieval.expanded"}.issubset({item["type"] for item in registry.metadata()})
+    assert repository.get("medical-answer").id == "medical-answer"
+
+
 def test_document_to_answer_workflow_and_duplicate():
     store, transport, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")

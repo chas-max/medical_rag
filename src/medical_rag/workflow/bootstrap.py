@@ -2,8 +2,9 @@
 
 from functools import partial
 
-from .nodes import documents, evidence, generation, input as input_nodes, output, retrieval
+from .nodes import documents, evidence, generation, input as input_nodes, output, question, retrieval
 from .nodes.base import BuiltinNode
+from .nodes.question import RoutedQuestionNode
 from .registry import NodeRegistry
 
 
@@ -32,6 +33,34 @@ def build_registry(store: object, embedder: object, reranker: object,
                     {"evidence": "evidence_list"}, partial(retrieval.rerank, reranker=reranker,
                                                               threshold=threshold),
                     {"threshold": {"type": "number", "default": threshold, "minimum": 0, "maximum": 1}}),
+        BuiltinNode("question.router", "问题路由", "question",
+                    {"question": "string", "provider": "string"}, {"route": "string"},
+                    partial(question.route_question, transport=getattr(generator, "transport", None))),
+        RoutedQuestionNode("question.rewrite", "问题重写", "question",
+                           {"question": "string", "provider": "string", "route": "string"},
+                           {"variant": "query_variant"},
+                           partial(question.rewrite, transport=getattr(generator, "transport", None))),
+        RoutedQuestionNode("question.decompose", "复杂问题分解", "question",
+                           {"question": "string", "provider": "string", "route": "string"},
+                           {"variant": "query_variant"},
+                           partial(question.decompose, transport=getattr(generator, "transport", None))),
+        RoutedQuestionNode("question.hyde", "假设性回答", "question",
+                           {"question": "string", "provider": "string", "route": "string"},
+                           {"variant": "query_variant"},
+                           partial(question.hyde, transport=getattr(generator, "transport", None))),
+        RoutedQuestionNode("question.stepback", "抽象问题", "question",
+                           {"question": "string", "provider": "string", "route": "string"},
+                           {"variant": "query_variant"},
+                           partial(question.stepback, transport=getattr(generator, "transport", None))),
+        BuiltinNode("question.select", "选择检索问题", "question",
+                    {"question": "string", "route": "string", "rewrite": "query_variant",
+                     "decompose": "query_variant", "hyde": "query_variant",
+                     "stepback": "query_variant"}, {"query_plan": "query_plan"}, question.select),
+        BuiltinNode("retrieval.expanded", "扩展检索融合", "retrieval",
+                    {"query_plan": "query_plan"}, {"evidence": "evidence_list"},
+                    partial(retrieval.expanded, store=store, embedder=embedder,
+                            candidate_k=candidate_k),
+                    {"k": {"type": "integer", "default": 60, "minimum": 1}}),
         BuiltinNode("evidence.gate", "证据门控", "evidence", {"evidence": "evidence_list"},
                     {"evidence": "evidence_list", "abstained": "boolean", "answer": "string",
                      "citations": "citations"},
