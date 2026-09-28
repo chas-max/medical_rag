@@ -24,8 +24,16 @@ def test_expanded_workflow_is_listed_and_rejects_invalid_query(tmp_path):
     assert any(item["type"] == "question.router" for item in api.get("/nodes").json()["data"])
     assert api.post("/workflows/medical-answer-expanded/runs",
                     json={"inputs": {"question": " "}}).json()["error"]["code"] == "INVALID_QUERY"
-    assert api.post("/workflows/medical-answer-expanded/runs",
-                    json={"inputs": {"question": "高血压", "top_k": 21}}).status_code == 422
+    invalid_top_k = api.post("/workflows/medical-answer-expanded/runs",
+                             json={"inputs": {"question": "高血压", "top_k": 21}})
+    assert invalid_top_k.status_code == 422
+    assert invalid_top_k.json()["error"]["code"] == "INVALID_QUERY"
+    invalid_provider = api.post(
+        "/workflows/medical-answer-expanded/runs",
+        json={"inputs": {"question": "高血压", "provider": "other"}},
+    )
+    assert invalid_provider.status_code == 422
+    assert invalid_provider.json()["error"]["code"] == "INVALID_PROVIDER"
 
 
 @pytest.mark.parametrize("chosen,transform_reply", [
@@ -42,6 +50,7 @@ def test_expanded_workflow_routes_one_branch_and_preserves_cited_answer(
             self.calls = []
 
         def complete(self, provider, system, user):
+            assert provider == "qwen"
             payload = json.loads(user)
             self.calls.append(payload)
             if "分类为" in system:
