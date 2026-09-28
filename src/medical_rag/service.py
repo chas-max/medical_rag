@@ -62,7 +62,7 @@ class RagService:
             raise ApiError("WORKFLOW_NOT_PUBLISHED", "仅可运行已发布的工作流", 409) from exc
         if validate_workflow(definition, self.registry):
             raise ApiError("INVALID_WORKFLOW", "工作流校验未通过", 422)
-        if workflow_id in ("medical-answer", "medical-search"):
+        if workflow_id in ("medical-answer", "medical-search", "medical-answer-expanded"):
             if not isinstance(inputs.get("question"), str) or not inputs["question"].strip():
                 raise ApiError("INVALID_QUERY", "问题不能为空", 422)
             top_k = inputs.get("top_k", self.settings.top_k)
