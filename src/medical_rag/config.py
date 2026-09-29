@@ -25,6 +25,6 @@ class Settings(BaseSettings):
     tavily_max_results: int = Field(default=5, ge=1, le=20)
     tavily_timeout_seconds: float = Field(default=10.0, gt=0, le=60)
     web_content_max_chars: int = Field(default=1200, ge=200, le=4000)
-    clear_evidence_threshold: float = Field(default=0.75, ge=0, le=1)
+    clear_evidence_threshold: float = Field(default=0.65, ge=0, le=1)
     min_clear_evidence: int = Field(default=2, ge=1, le=20)
     max_agent_tool_calls: int = Field(default=2, ge=0, le=5)

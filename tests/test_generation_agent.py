@@ -165,6 +165,31 @@ def test_web_excerpt_is_verified_exactly_like_local_evidence():
     assert result["citations"] == []
 
 
+def test_excerpt_may_differ_only_in_whitespace_and_is_returned_as_source_slice():
+    source = "血压达标患者，至少每 3 个月随访 1 次；\n未达标患者，每月至少随访 1 次。"
+    block = Evidence(Chunk("k1", "doc", "guide.md", source, "guide.md", "管理", 2, 0), 0.9)
+    result = GroundedGenerator(Transport()).validate(claims({"chunk_id": "k1",
+                                                             "excerpt": "血压达标患者，至少每3个月随访1次；未达标患者"}),
+                                                     [block])
+
+    assert result["abstained"] is False
+    assert result["citations"][0]["excerpt"] in source
+    assert result["citations"][0]["origin"] == "knowledge_base"
+
+
+def test_unsupported_claim_is_dropped_while_verified_claims_survive():
+    block = kb()
+    draft = json.dumps({"claims": [
+        {"text": "伪造结论", "citations": [{"chunk_id": "k1", "excerpt": "从不存在的表述"}]},
+        {"text": "应规律随访", "citations": [{"chunk_id": "k1", "excerpt": "应规律随访"}]},
+    ]})
+    result = GroundedGenerator(Transport()).validate(draft, [block])
+
+    assert result["abstained"] is False
+    assert result["answer"] == "应规律随访 [k1]"
+    assert len(result["citations"]) == 1
+
+
 def test_tool_loop_stops_at_the_configured_budget():
     stub = StubSearch()
     transport = Transport([tool_call("call-1", "血压目标值"), tool_call("call-2", "用药方案")])

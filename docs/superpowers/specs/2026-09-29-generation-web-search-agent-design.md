@@ -20,7 +20,11 @@
 
 ## 证据、引用与门控
 
-网页命中转换为 `Chunk`/`Evidence`：块 ID 为 `web-` 加 URL 摘要、`source_id` 与 `section` 存 URL、`filename` 存标题、正文按 `WEB_CONTENT_MAX_CHARS` 截断、同一 URL 去重、`origin="web"`。`citation.validate` 合同不变，excerpt 必须逐字出现在对应块中，所以联网引用同样无法伪造。生成节点除 `draft` 外输出本次**有效证据集**，新流程把 `citation.validate` 的 `evidence` 端口从门控改接生成节点，保证校验看到的证据与提示词完全一致。门控在检索为空但允许联网兜底时不再立即拒答，把兜底交给自检；若联网仍无可用证据，生成器不调用模型，引用校验返回既有拒答文案。`UNSAFE_ANSWER_FLOW` 的四条不变量全部保留：门控证据仍只能来自重排、生成证据仍只能来自门控、草稿仍只能来自生成节点、答案仍只能来自引用校验。
+网页命中转换为 `Chunk`/`Evidence`：块 ID 为 `web-` 加 URL 摘要、`source_id` 与 `section` 存 URL、`filename` 存标题、正文按 `WEB_CONTENT_MAX_CHARS` 截断、同一 URL 去重、`origin="web"`。`citation.validate` 合同不变，excerpt 必须能对应回相应块，所以联网引用同样无法伪造；引用对象新增 `origin`，前端与调用方据此区分网页来源。生成节点除 `draft` 外输出本次**有效证据集**，新流程把 `citation.validate` 的 `evidence` 端口从门控改接生成节点，保证校验看到的证据与提示词完全一致。门控在检索为空但允许联网兜底时不再立即拒答，把兜底交给自检；若联网仍无可用证据，生成器不调用模型，引用校验返回既有拒答文案。`UNSAFE_ANSWER_FLOW` 的四条不变量全部保留：门控证据仍只能来自重排、生成证据仍只能来自门控、草稿仍只能来自生成节点、答案仍只能来自引用校验。
+
+## 真机联调带来的两项校准
+
+首版按 `CLEAR_EVIDENCE_THRESHOLD=0.75` 上线后，实测本语料的相关题最高重排分只有 0.726–0.73，无关题约 0.50——0.75 会把"已经清晰"的检索误判为模糊、每题都触网，因此默认值下调为 **0.65**，换语料后仍需以评测集重新校准。其次，PDF 抽取正文带换行，模型逐字复制时会重新折行，严格的字节级 `excerpt in text` 判定导致**所有回答被拒**；沿用主工作区已验证的 `_verified_excerpt`：先按原文命中，否则在忽略空白的归一化文本上定位并回灌原文切片，单条结论校验不过只丢弃该条、其余仍可作答。同时吸收同一工作区的 Qwen 延迟修复（`enable_thinking=False`、`timeout=120s`、`max_retries=0`），否则带证据的生成会撞穿原 30 s 客户端超时。主工作区尚未提交的 `embeddings.py` 性能优化（重排 `max_length=512`、`bfloat16`）未纳入本分支，联网流程实测 54–58 s，合并后应尽快采用。
 
 ## 失败与降级
 

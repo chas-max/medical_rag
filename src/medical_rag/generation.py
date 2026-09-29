@@ -1,6 +1,7 @@
 """Provider-specific generation with per-claim verified source excerpts."""
 
 import json
+import re
 
 from openai import (APIConnectionError, APIStatusError, APITimeoutError,
                     AuthenticationError, PermissionDeniedError, RateLimitError)
@@ -169,31 +170,58 @@ class GroundedGenerator:
         try:
             result = json.loads(output)
             claims = result["claims"]
-            if not isinstance(claims, list) or not claims or len(claims) > 8:
+            if not isinstance(claims, list) or not claims:
                 return refusal
+            # Models occasionally return more claims than requested; expose only a bounded
+            # prefix, and every visible claim still passes the same checks below.
+            claims = claims[:8]
             lines = []
             citations = {}
             for claim in claims:
-                statement = claim["text"]
-                refs = claim["citations"]
+                statement, refs = claim["text"], claim["citations"]
                 if not isinstance(statement, str) or not statement.strip() or not isinstance(refs, list) or not refs:
-                    return refusal
+                    continue
                 ids = []
+                claim_citations = {}
                 for ref in refs:
                     block_id, excerpt = ref["chunk_id"], ref["excerpt"]
                     item = allowed.get(block_id)
-                    if (item is None or not isinstance(excerpt, str) or not excerpt.strip()
-                            or excerpt not in item.chunk.text):
-                        return refusal
+                    if item is None or not isinstance(excerpt, str) or not excerpt.strip():
+                        ids = []
+                        break
+                    verified = self._verified_excerpt(item.chunk.text, excerpt)
+                    if verified is None:
+                        ids = []
+                        break
                     source = item.chunk
-                    citations[block_id] = {"chunk_id": block_id, "filename": source.filename,
-                                           "section": source.section, "page": source.page,
-                                           "excerpt": excerpt, "origin": item.origin}
+                    claim_citations[block_id] = {"chunk_id": block_id, "filename": source.filename,
+                                                 "section": source.section, "page": source.page,
+                                                 "excerpt": verified, "origin": item.origin}
                     ids.append(block_id)
+                if not ids:
+                    continue
+                citations.update(claim_citations)
                 lines.append(f"{statement.strip()} " + " ".join(f"[{block_id}]" for block_id in dict.fromkeys(ids)))
+            if not lines:
+                return refusal
             return {"answer": "\n".join(lines), "citations": list(citations.values()), "abstained": False}
         except (ValueError, TypeError, KeyError, AttributeError):
             return refusal
+
+    @staticmethod
+    def _verified_excerpt(source: str, excerpt: str) -> str | None:
+        """Return the source slice when an excerpt differs only in whitespace."""
+        if excerpt in source:
+            return excerpt
+        normalized_excerpt = "".join(character for character in excerpt if not character.isspace())
+        if not normalized_excerpt:
+            return None
+        source_positions = [index for index, character in enumerate(source) if not character.isspace()]
+        normalized_source = "".join(source[index] for index in source_positions)
+        match = re.search(re.escape(normalized_excerpt), normalized_source)
+        if not match:
+            return None
+        return source[source_positions[match.start()]:source_positions[match.end() - 1] + 1]
 
 
 def build_generator(settings: Settings, transport: object | None = None,
