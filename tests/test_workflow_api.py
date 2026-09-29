@@ -155,16 +155,17 @@ def test_legacy_routes_use_default_workflows(tmp_path):
 def test_editor_can_save_draft_then_publish_valid_new_version(tmp_path):
     api, service = client(tmp_path)
     draft = api.get("/workflows/medical-answer").json()["data"]
-    draft["version"] = 2
+    next_version = draft["version"] + 1
+    draft["version"] = next_version
     draft["status"] = "draft"
     draft["nodes"] = []
     draft["edges"] = []
     saved = api.put("/workflows/medical-answer", json=draft)
     assert saved.status_code == 200
-    assert saved.json()["data"]["version"] == 2
+    assert saved.json()["data"]["version"] == next_version
     # A draft never removes the last published version from chat.
     assert api.post("/workflows/medical-answer/runs", json={"inputs": {"question": "高血压"}}).status_code == 200
-    draft["version"] = 3
+    draft["version"] = next_version + 1
     draft["status"] = "published"
     assert api.put("/workflows/medical-answer", json=draft).status_code == 422
 
