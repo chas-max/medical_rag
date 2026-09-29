@@ -12,6 +12,7 @@ def build_registry(store: object, embedder: object, reranker: object,
                    generator: object, settings: object = None) -> NodeRegistry:
     registry = NodeRegistry()
     candidate_k = getattr(settings, "candidate_k", 20)
+    rerank_k = getattr(settings, "rerank_k", 15)
     threshold = getattr(settings, "evidence_threshold", 0.5)
     nodes = [
         BuiltinNode("query.input", "问题输入", "input", {},
@@ -31,8 +32,9 @@ def build_registry(store: object, embedder: object, reranker: object,
         BuiltinNode("retrieval.rerank", "重排", "rerank",
                     {"question": "string", "top_k": "integer", "evidence": "evidence_list"},
                     {"evidence": "evidence_list"}, partial(retrieval.rerank, reranker=reranker,
-                                                              threshold=threshold),
-                    {"threshold": {"type": "number", "default": threshold, "minimum": 0, "maximum": 1}}),
+                                                              threshold=threshold, rerank_k=rerank_k),
+                    {"threshold": {"type": "number", "default": threshold, "minimum": 0, "maximum": 1},
+                     "rerank_k": {"type": "integer", "default": rerank_k, "minimum": 1}}),
         BuiltinNode("question.router", "问题路由", "question",
                     {"question": "string", "provider": "string"}, {"route": "string"},
                     partial(question.route_question, transport=getattr(generator, "transport", None))),

@@ -398,6 +398,42 @@ it("sends the next question through the workflow selected in chat", async () => 
   );
 });
 
+it("restores the workflow chosen on the editor page", async () => {
+  localStorage.setItem(
+    "zhiyuan-current-workflow-v1",
+    "medical-answer-expanded",
+  );
+  vi.mocked(api.getWorkflows).mockResolvedValue([workflow, expandedWorkflow]);
+  render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByRole("combobox", { name: "工作流" }),
+  ).toHaveValue("medical-answer-expanded");
+});
+
+it("publishes the workflow selected in chat to the editor page", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflows).mockResolvedValue([workflow, expandedWorkflow]);
+  render(
+    <MemoryRouter initialEntries={["/chat"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  await user.selectOptions(
+    await screen.findByRole("combobox", { name: "工作流" }),
+    "medical-answer-expanded",
+  );
+  expect(localStorage.getItem("zhiyuan-current-workflow-v1")).toBe(
+    "medical-answer-expanded",
+  );
+  expect(
+    screen.getByRole("link", { name: /工作流编辑器/ }),
+  ).toHaveAttribute("href", "/workflows/medical-answer-expanded");
+});
+
 it("does not send when no complete answer workflow is available", async () => {
   vi.mocked(api.getWorkflows).mockResolvedValue([searchWorkflow, ingestionWorkflow]);
   render(

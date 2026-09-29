@@ -1,3 +1,4 @@
+import asyncio
 import sys
 from pathlib import Path
 
@@ -85,3 +86,24 @@ def test_unknown_route_also_uses_error_envelope():
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "HTTP_ERROR"
     assert response.json()["success"] is False
+
+
+def test_workflow_runs_are_offloaded_from_the_event_loop(monkeypatch):
+    calls = []
+
+    class WorkflowService(FakeService):
+        async def run_workflow(self, workflow_id, inputs):
+            return {"run_id": "run-1", "status": "success", "output": {}, "trace": []}
+
+    async def fake_run_in_threadpool(function, *args):
+        calls.append(function)
+        return await asyncio.to_thread(function, *args)
+
+    monkeypatch.setattr("medical_rag.api.run_in_threadpool", fake_run_in_threadpool)
+    response = TestClient(create_app(service=WorkflowService())).post(
+        "/workflows/medical-answer/runs", json={"inputs": {"question": "高血压"}}
+    )
+
+    assert response.status_code == 200
+    assert response.json()["data"]["run_id"] == "run-1"
+    assert len(calls) == 1

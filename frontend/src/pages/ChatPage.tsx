@@ -9,7 +9,11 @@ import {
   type Citation,
   type Workflow,
 } from "../api/workflows";
-import { selectAnswerWorkflows } from "../workflow/selection";
+import {
+  readCurrentWorkflowId,
+  selectAnswerWorkflows,
+  writeCurrentWorkflowId,
+} from "../workflow/selection";
 
 type Message = {
   role: "user" | "assistant";
@@ -66,10 +70,13 @@ export default function ChatPage() {
       .then((items) => {
         const answers = selectAnswerWorkflows(items);
         setWorkflows(answers);
-        setWorkflowId((current) => {
-          if (answers.some((item) => item.id === current)) return current;
-          return answers.find((item) => item.id === "medical-answer")?.id || answers[0]?.id || "";
-        });
+        const selected =
+          answers.find((item) => item.id === readCurrentWorkflowId())?.id ||
+          answers.find((item) => item.id === "medical-answer")?.id ||
+          answers[0]?.id ||
+          "";
+        setWorkflowId(selected);
+        writeCurrentWorkflowId(selected);
       })
       .catch((error) => {
         setWorkflows([]);
@@ -327,7 +334,10 @@ export default function ChatPage() {
                   aria-label="工作流"
                   value={workflowId}
                   disabled={workflowLoading || !workflows.length}
-                  onChange={(event) => setWorkflowId(event.target.value)}
+                  onChange={(event) => {
+                    setWorkflowId(event.target.value);
+                    writeCurrentWorkflowId(event.target.value);
+                  }}
                 >
                   {workflows.map((item) => (
                     <option key={item.id} value={item.id}>

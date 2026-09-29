@@ -70,7 +70,7 @@ def test_transport_requires_provider_key_before_network():
 
 
 def test_transport_uses_only_configured_qwen_model():
-    models = []
+    models, options = [], []
 
     class Completions:
         def create(self, **kwargs):
@@ -80,11 +80,13 @@ def test_transport_uses_only_configured_qwen_model():
 
     class Client:
         def __init__(self, **kwargs):
+            options.append(kwargs)
             self.chat = type("Chat", (), {"completions": Completions()})()
 
     transport = OpenAITransport(Settings(qwen_api_key="key"), client_factory=Client)
     assert transport.complete("qwen", "system", "user") == "{}"
     assert models == ["qwen3.8-flash"]
+    assert options[0]["max_retries"] == 0
     with pytest.raises(ApiError) as rejected:
         transport.complete("deepseek", "system", "user")
     assert rejected.value.code == "INVALID_PROVIDER"
@@ -142,7 +144,7 @@ def test_draft_is_not_public_until_separate_citation_validation():
     assert result["citations"][0]["chunk_id"] == "block1"
 
 
-def test_generation_prompt_answers_core_before_details():
+def test_generation_prompt_limits_claim_count_to_validator_limit():
     class PromptTransport:
         def __init__(self):
             self.system = ""
@@ -153,5 +155,100 @@ def test_generation_prompt_answers_core_before_details():
 
     transport = PromptTransport()
     GroundedGenerator(transport).draft("问题", [evidence()], "qwen")
+
+    assert "8 条结论" in transport.system
+    assert "逐字复制" in transport.system
     assert "优先 3–5 条" in transport.system
     assert "先回答问题" in transport.system
+
+
+def test_validator_caps_excess_claims_after_validating_the_visible_prefix():
+    claims = [
+        {"text": f"结论 {index}", "citations": [{"chunk_id": "block1", "excerpt": "规律随访"}]}
+        for index in range(9)
+    ]
+
+    result = GroundedGenerator(Transport(json.dumps({"claims": claims}))).answer(
+        "问题", [evidence()], "qwen"
+    )
+
+    assert result["abstained"] is False
+    assert result["answer"].count("[block1]") == 8
+
+
+def test_validator_accepts_model_excerpt_with_only_whitespace_normalized():
+    item = Evidence(
+        Chunk("block1", "doc", "guide.md", "血压\n控制满意。", "guide.md", "管理", 2, 0),
+        0.9,
+    )
+    output = json.dumps({"claims": [{
+        "text": "血压应控制满意",
+        "citations": [{"chunk_id": "block1", "excerpt": "血压 控制满意。"}],
+    }]})
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [item], "qwen")
+
+    assert result["abstained"] is False
+    assert result["citations"][0]["excerpt"] == "血压\n控制满意。"
+
+
+def test_validator_accepts_whitespace_inserted_or_removed_inside_excerpt():
+    item = Evidence(
+        Chunk("block1", "doc", "guide.md", "2 周内随访。", "guide.md", "管理", 2, 0),
+        0.9,
+    )
+    output = json.dumps({"claims": [{
+        "text": "应在两周内随访",
+        "citations": [{"chunk_id": "block1", "excerpt": "2周内随访。"}],
+    }]})
+
+    result = GroundedGenerator(Transport(output)).answer("何时随访？", [item], "qwen")
+
+    assert result["abstained"] is False
+    assert result["citations"][0]["excerpt"] == "2 周内随访。"
+
+
+def test_validator_keeps_verified_claims_when_another_claim_has_bad_citation():
+    output = json.dumps({"claims": [
+        {"text": "应规律随访", "citations": [{"chunk_id": "block1", "excerpt": "应规律随访"}]},
+        {"text": "未经支持的结论", "citations": [{"chunk_id": "block1", "excerpt": "不存在的原文"}]},
+    ]})
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    assert result["abstained"] is False
+    assert result["answer"].startswith("应规律随访 [block1]")
+    assert "未经支持的结论" not in result["answer"]
+
+
+def test_validator_abstains_when_all_claims_have_bad_citations():
+    output = json.dumps({"claims": [
+        {"text": "未经支持的结论", "citations": [{"chunk_id": "block1", "excerpt": "不存在的原文"}]},
+    ]})
+
+    result = GroundedGenerator(Transport(output)).answer("问题", [evidence()], "qwen")
+
+    assert result["abstained"] is True
+    assert result["citations"] == []
+
+
+def test_answer_reports_model_unavailability_without_returning_retrieved_excerpt():
+    class UnavailableTransport:
+        def complete(self, provider, system, user):
+            raise TimeoutError("模型服务不可达")
+
+    with pytest.raises(ApiError) as raised:
+        GroundedGenerator(UnavailableTransport()).answer("如何管理？", [evidence()], "qwen")
+
+    assert raised.value.code == "MODEL_UNAVAILABLE"
+    assert raised.value.status == 503
+    assert evidence().chunk.text not in str(raised.value)
+
+
+def test_answer_does_not_hide_non_connection_model_errors():
+    class InvalidModelTransport:
+        def complete(self, provider, system, user):
+            raise ValueError("模型配置错误")
+
+    with pytest.raises(ValueError, match="模型配置错误"):
+        GroundedGenerator(InvalidModelTransport()).answer("如何管理？", [evidence()], "qwen")

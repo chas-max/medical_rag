@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -67,6 +67,65 @@ const workflow: api.Workflow = {
   ],
   edges: [],
 };
+const answerNode = (
+  id: string,
+  type: string,
+): api.Workflow["nodes"][number] => ({
+  id,
+  type,
+  position: { x: 0, y: 0 },
+  config: {},
+});
+
+const answerEdge = (source: string, target: string): api.Workflow["edges"][number] => ({
+  id: `${source}-${target}`,
+  source,
+  source_port: "output",
+  target,
+  target_port: "input",
+});
+
+const answerWorkflow: api.Workflow = {
+  ...workflow,
+  nodes: [
+    answerNode("query", "query.input"),
+    answerNode("dense", "retrieval.dense"),
+    answerNode("gate", "evidence.gate"),
+    answerNode("llm", "generation.llm"),
+    answerNode("citation", "citation.validate"),
+    answerNode("output", "answer.output"),
+  ],
+  edges: [
+    answerEdge("query", "dense"),
+    answerEdge("dense", "gate"),
+    answerEdge("gate", "llm"),
+    answerEdge("llm", "citation"),
+    answerEdge("citation", "output"),
+  ],
+};
+const expandedWorkflow: api.Workflow = {
+  ...answerWorkflow,
+  id: "medical-answer-expanded",
+  name: "路由式医疗资料问答",
+};
+const searchWorkflow: api.Workflow = {
+  ...answerWorkflow,
+  id: "medical-search",
+  name: "医疗资料检索",
+  nodes: [
+    answerNode("query", "query.input"),
+    answerNode("dense", "retrieval.dense"),
+    answerNode("output", "search.output"),
+  ],
+  edges: [answerEdge("query", "dense"), answerEdge("dense", "output")],
+};
+const ingestionWorkflow: api.Workflow = {
+  ...answerWorkflow,
+  id: "document-ingestion",
+  name: "文档入库",
+  nodes: [answerNode("input", "document.input")],
+  edges: [],
+};
 const catalog: api.NodeMetadata[] = [
   {
     type: "query.input",
@@ -86,6 +145,7 @@ const catalog: api.NodeMetadata[] = [
   },
 ];
 beforeEach(() => {
+  localStorage.clear();
   vi.mocked(api.getWorkflow).mockResolvedValue(workflow);
   vi.mocked(api.getWorkflows).mockResolvedValue([workflow]);
   vi.mocked(api.getNodes).mockResolvedValue(catalog);
@@ -146,4 +206,67 @@ it("keeps validation in the editor without a conversation test runner", async ()
   await user.click(await screen.findByRole("button", { name: "✓ 校验" }));
   expect(await screen.findByText(/发现 1 个校验问题/)).toBeInTheDocument();
   expect(api.runWorkflow).not.toHaveBeenCalled();
+});
+
+it("lists only complete answer workflows in the switcher", async () => {
+  vi.mocked(api.getWorkflows).mockResolvedValue([
+    answerWorkflow,
+    expandedWorkflow,
+    searchWorkflow,
+    ingestionWorkflow,
+  ]);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  const selector = await screen.findByRole("combobox", { name: "切换工作流" });
+  expect(
+    within(selector).getByRole("option", { name: "医疗资料问答" }),
+  ).toBeInTheDocument();
+  expect(
+    within(selector).getByRole("option", { name: "路由式医疗资料问答" }),
+  ).toBeInTheDocument();
+  expect(
+    within(selector).queryByRole("option", { name: "医疗资料检索" }),
+  ).not.toBeInTheDocument();
+  expect(
+    within(selector).queryByRole("option", { name: "文档入库" }),
+  ).not.toBeInTheDocument();
+});
+
+it("keeps a deep-linked non-answer workflow editable", async () => {
+  vi.mocked(api.getWorkflows).mockResolvedValue([answerWorkflow, searchWorkflow]);
+  vi.mocked(api.getWorkflow).mockResolvedValue(searchWorkflow);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-search"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByRole("heading", { name: "医疗资料检索" }),
+  ).toBeInTheDocument();
+  expect(
+    await screen.findByRole("combobox", { name: "切换工作流" }),
+  ).toHaveValue("medical-search");
+});
+
+it("publishes the workflow switch to the chat page", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflows).mockResolvedValue([
+    answerWorkflow,
+    expandedWorkflow,
+  ]);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  await user.selectOptions(
+    await screen.findByRole("combobox", { name: "切换工作流" }),
+    "medical-answer-expanded",
+  );
+  expect(localStorage.getItem("zhiyuan-current-workflow-v1")).toBe(
+    "medical-answer-expanded",
+  );
 });

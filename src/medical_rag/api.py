@@ -1,5 +1,6 @@
 """FastAPI entry point and consistent public response envelope."""
 
+import asyncio
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -136,7 +137,13 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None)
 
     @app.post("/workflows/{workflow_id}/runs")
     async def run_workflow(workflow_id: str, payload: WorkflowRunRequest):
-        return _success(await _service().run_workflow(workflow_id, payload.inputs))
+        # Workflow nodes call synchronous Milvus/model clients. Run the whole
+        # workflow in a worker so a cold local model load cannot block health
+        # checks or other requests on the FastAPI event loop.
+        def execute():
+            return asyncio.run(_service().run_workflow(workflow_id, payload.inputs))
+
+        return _success(await run_in_threadpool(execute))
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str):

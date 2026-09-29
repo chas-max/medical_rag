@@ -1,9 +1,17 @@
+import { useSyncExternalStore } from "react";
 import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import ChatPage from "./pages/ChatPage";
 import WorkflowEditorPage from "./pages/WorkflowEditorPage";
+import {
+  readCurrentWorkflowId,
+  subscribeCurrentWorkflowId,
+} from "./workflow/selection";
 
 export default function App() {
   const location = useLocation();
+  const currentWorkflow =
+    useSyncExternalStore(subscribeCurrentWorkflowId, readCurrentWorkflowId) ||
+    "medical-answer";
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -24,7 +32,7 @@ export default function App() {
             className={
               location.pathname.startsWith("/workflows") ? "active" : ""
             }
-            to="/workflows/medical-answer"
+            to={`/workflows/${currentWorkflow}`}
           >
             ◇ &nbsp; 工作流编辑器
           </Link>
@@ -37,7 +45,7 @@ export default function App() {
         <Route path="/chat" element={<ChatPage />} />
         <Route
           path="/workflows"
-          element={<Navigate to="/workflows/medical-answer" replace />}
+          element={<Navigate to={`/workflows/${currentWorkflow}`} replace />}
         />
         <Route path="/workflows/:workflowId" element={<WorkflowEditorPage />} />
         <Route path="*" element={<Navigate to="/chat" replace />} />

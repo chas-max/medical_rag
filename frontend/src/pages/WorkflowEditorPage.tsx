@@ -33,6 +33,10 @@ import {
   toWorkflow,
   type GraphNode,
 } from "../workflow/graph";
+import {
+  selectAnswerWorkflows,
+  writeCurrentWorkflowId,
+} from "../workflow/selection";
 
 const nodeTypes = { workflow: WorkflowNode };
 const categories: Record<string, string> = {
@@ -69,7 +73,7 @@ function Editor() {
         if (!alive) return;
         setCatalog(types);
         setOriginal(workflow);
-        setWorkflows(available);
+        setWorkflows(selectAnswerWorkflows(available));
         const graph = toGraph(workflow, types);
         setNodes(graph.nodes);
         setEdges(graph.edges);
@@ -232,7 +236,7 @@ function Editor() {
       }
       const saved = await saveWorkflow(draft);
       setOriginal(saved);
-      setWorkflows(await getWorkflows());
+      setWorkflows(selectAnswerWorkflows(await getWorkflows()));
       setError(
         status === "published"
           ? `已发布 v${saved.version}`
@@ -260,17 +264,21 @@ function Editor() {
           <select
             aria-label="切换工作流"
             value={workflowId}
-            onChange={(event) => navigate(`/workflows/${event.target.value}`)}
+            onChange={(event) => {
+              writeCurrentWorkflowId(event.target.value);
+              navigate(`/workflows/${event.target.value}`);
+            }}
           >
-            {workflows.length ? (
-              workflows.map((item) => (
-                <option key={item.id} value={item.id}>
-                  {item.name}
-                </option>
-              ))
-            ) : (
-              <option value={workflowId}>{workflowId}</option>
+            {!workflows.some((item) => item.id === workflowId) && (
+              <option value={workflowId}>
+                {original?.name || workflowId}
+              </option>
             )}
+            {workflows.map((item) => (
+              <option key={item.id} value={item.id}>
+                {item.name}
+              </option>
+            ))}
           </select>
           <button
             className="button-ghost"

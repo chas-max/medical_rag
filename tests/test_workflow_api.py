@@ -1,10 +1,14 @@
+import json
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
+from openai import OpenAI
 
 from medical_rag.api import create_app
 from medical_rag.config import Settings
-from medical_rag.generation import GroundedGenerator
+from medical_rag.generation import GroundedGenerator, OpenAITransport
 from medical_rag.service import RagService
 from medical_rag.types import ApiError
 
@@ -70,6 +74,58 @@ def test_model_rate_limit_stays_safe_in_both_answer_routes(tmp_path):
     failure = next(item["error"] for item in run.json()["data"]["trace"]
                    if item["status"] == "failed")
     assert failure == {"code": "MODEL_RATE_LIMITED", "message": "生成模型请求过于频繁，请稍后重试"}
+
+
+@pytest.mark.parametrize("route", ["/answers", "/workflows/medical-answer/runs"])
+def test_qwen_answer_routes_disable_default_thinking_before_waiting_for_json(tmp_path, route):
+    """Exercise both answer routes through the real SDK's HTTP request body."""
+    requests = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        requests.append(body)
+        # Qwen defaults to thinking, which can exceed the synchronous timeout.
+        if body.get("enable_thinking", True):
+            raise httpx.ReadTimeout("Thinking exceeded the read timeout", request=request)
+        block = json.loads(body["messages"][-1]["content"])["evidence"][0]
+        content = json.dumps({"claims": [{
+            "text": "应规律随访",
+            "citations": [{"chunk_id": block["chunk_id"], "excerpt": "规律随访"}],
+        }]})
+        return httpx.Response(200, json={
+            "id": "chatcmpl-test", "object": "chat.completion", "created": 0,
+            "model": body["model"],
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": content}}],
+        })
+
+    settings = Settings(_env_file=None, qwen_api_key="test-key",
+                        qwen_base_url="https://qwen.invalid/v1")
+    with httpx.Client(transport=httpx.MockTransport(upstream)) as http_client:
+        def client_factory(**kwargs):
+            return OpenAI(**kwargs, http_client=http_client)
+
+        generator = GroundedGenerator(OpenAITransport(settings, client_factory=client_factory))
+        service = RagService(settings, MemoryStore(), Embedder(), Reranker(),
+                             generator, workflow_root=tmp_path)
+        with TestClient(create_app(service=service)) as api:
+            uploaded = api.post("/documents", files={"file": (
+                "guide.md", "# 高血压\n\n高血压患者应规律随访。".encode())})
+            assert uploaded.status_code == 200
+            inputs = {"question": "高血压", "provider": "qwen", "top_k": 5}
+            response = api.post(route, json={"inputs": inputs} if route.endswith("/runs") else inputs)
+
+    assert response.status_code == 200
+    data = response.json()["data"]
+    if route.endswith("/runs"):
+        assert data["status"] == "success"
+        assert all(node["status"] == "success" for node in data["trace"])
+        data = data["output"]
+    assert data["abstained"] is False
+    assert data["answer"].startswith("应规律随访 [")
+    assert data["citations"][0]["excerpt"] == "规律随访"
+    assert len(requests) == 1
+    assert requests[0]["enable_thinking"] is False
 
 
 def test_invalid_workflow_and_inputs_have_stable_errors(tmp_path):

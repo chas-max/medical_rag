@@ -56,3 +56,23 @@ export function isAnswerWorkflow(workflow: Workflow): boolean {
 export function selectAnswerWorkflows(workflows: Workflow[]): Workflow[] {
   return workflows.filter(isAnswerWorkflow);
 }
+
+const CURRENT_WORKFLOW_KEY = "zhiyuan-current-workflow-v1";
+const currentWorkflowListeners = new Set<() => void>();
+
+export function readCurrentWorkflowId(): string | null {
+  return localStorage.getItem(CURRENT_WORKFLOW_KEY);
+}
+
+export function writeCurrentWorkflowId(workflowId: string) {
+  if (!workflowId || readCurrentWorkflowId() === workflowId) return;
+  localStorage.setItem(CURRENT_WORKFLOW_KEY, workflowId);
+  currentWorkflowListeners.forEach((notify) => notify());
+}
+
+export function subscribeCurrentWorkflowId(notify: () => void) {
+  currentWorkflowListeners.add(notify);
+  return () => {
+    currentWorkflowListeners.delete(notify);
+  };
+}

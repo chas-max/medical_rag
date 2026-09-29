@@ -1,5 +1,10 @@
 import { expect, it } from "vitest";
-import { isAnswerWorkflow, selectAnswerWorkflows } from "../workflow/selection";
+import {
+  isAnswerWorkflow,
+  readCurrentWorkflowId,
+  selectAnswerWorkflows,
+  writeCurrentWorkflowId,
+} from "../workflow/selection";
 import type { Workflow } from "../api/workflows";
 
 const node = (id: string, type: string): Workflow["nodes"][number] => ({
@@ -71,4 +76,18 @@ it("filters the list without mutating it", () => {
     "answer",
   ]);
   expect(workflows).toHaveLength(2);
+});
+
+it("shares the chosen workflow id between pages", () => {
+  localStorage.clear();
+  expect(readCurrentWorkflowId()).toBeNull();
+  writeCurrentWorkflowId("medical-answer-expanded");
+  expect(readCurrentWorkflowId()).toBe("medical-answer-expanded");
+});
+
+it("ignores an empty workflow id instead of clearing the shared one", () => {
+  localStorage.clear();
+  writeCurrentWorkflowId("answer");
+  writeCurrentWorkflowId("");
+  expect(readCurrentWorkflowId()).toBe("answer");
 });

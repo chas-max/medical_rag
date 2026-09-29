@@ -6,7 +6,7 @@
 
 ## 本地准备（PowerShell）
 
-需要 Python 3.11+、Node.js 20.19+/22.12+、Docker Desktop（建议至少 8 GB 可用内存）和联网下载模型的能力。首次向量化和重排会下载 `BAAI/bge-small-zh-v1.5`、`BAAI/bge-reranker-v2-m3`；后续使用本地缓存。启动 Milvus 的 Compose 配置参考[官方 2.6.x 安装说明](https://milvus.io/docs/v2.6.x/install_standalone-docker-compose.md)。
+需要 Python 3.11+、Node.js 20.19+/22.12+、Docker Desktop（建议至少 8 GB 可用内存）和联网下载模型的能力。首次向量化和重排会下载 `BAAI/bge-small-zh-v1.5`、`BAAI/bge-reranker-v2-m3`；后续使用本地缓存。权重加载固定 `local_files_only=True`，缓存缺失时重排只留一行 warning 就退化成词面分数——此时检索指标反映的是 RRF 名次而非重排能力，跨批次不可比；huggingface.co 不可达时先用 `HF_ENDPOINT=https://hf-mirror.com` 把权重放进缓存。启动 Milvus 的 Compose 配置参考[官方 2.6.x 安装说明](https://milvus.io/docs/v2.6.x/install_standalone-docker-compose.md)。
 
 ```powershell
 python -m venv .venv
@@ -24,6 +24,8 @@ npm --prefix frontend install
 npm --prefix frontend run build
 uvicorn medical_rag.api:app --app-dir src --reload
 ```
+
+同步生成请求显式设置 `enable_thinking=false`，避免 Qwen 默认思考模式在多段证据问答中超过等待时间；客户端超时上限为 120 秒。修改生成代码后，未启用 `--reload` 的后端需要重启才能生效。
 
 启动后端前，先等待 `standalone` 健康。
 
@@ -77,7 +79,7 @@ python -m pytest tests/test_milvus_integration.py -q
 Remove-Item Env:RUN_MILVUS_INTEGRATION
 ```
 
-集成测试只创建、删除以 `rag_it_` 开头的临时集合；不会删除业务集合。默认测试不调用收费的生成 API。Milvus 对小于默认每段 1,024 行的语料可能以暴力扫描检索，即使集合已配置 `HNSW_PQ`；因此物理索引是否建成须查看 `describe_index().indexed_rows`，可选集成测试使用 2,048 行并检查此指标。[Milvus 性能 FAQ](https://milvus.io/docs/v2.6.x/performance_faq.md)。配置不兼容会明确报错，但小语料的内部扫描不等于切换了集合的索引类型。`HNSW_PQ` 参数为 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`，默认检索融合 RRF `k=60`、重排阈值 0.5；阈值需用业务评测集校准。
+集成测试只创建、删除以 `rag_it_` 开头的临时集合；不会删除业务集合。默认测试不调用收费的生成 API。Milvus 对小于默认每段 1,024 行的语料可能以暴力扫描检索，即使集合已配置 `HNSW_PQ`；因此物理索引是否建成须查看 `describe_index().indexed_rows`，可选集成测试使用 2,048 行并检查此指标。[Milvus 性能 FAQ](https://milvus.io/docs/v2.6.x/performance_faq.md)。配置不兼容会明确报错，但小语料的内部扫描不等于切换了集合的索引类型。`HNSW_PQ` 参数为 `M=16`、`efConstruction=200`、`m=64`、`nbits=4`，默认检索融合 RRF `k=60`、重排阈值 0.5；阈值需用业务评测集校准。重排只打分给 RRF 头部 `rerank_k=15` 个候选（`top_k` 更大时自动放宽池宽）：480 题里标注块的 RRF 最好名次中位数为 0，池宽 15 会让 1.9%（9/477）的题在重排前就丢掉标注块，12 为 3.8%。`bge-reranker-v2-m3` 声明 8192 token 窗口，CPU 上给 35 候选打整块要 36 秒，因此固定 `max_length=512` 与 `torch_dtype=bfloat16`（15 候选约 9.3 秒，fp32 约 16 秒且 2.3GB 权重在 16GB 机器上会被换页）；实测 bf16 相对 fp32 在 15 候选全序上零逆序、分数最大偏差 0.0024。
 
 ## 离线评估
 

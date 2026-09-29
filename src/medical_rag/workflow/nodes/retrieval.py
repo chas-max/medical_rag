@@ -31,15 +31,18 @@ def rrf(inputs: dict, config: dict, context: ExecutionContext) -> dict:
 
 
 def rerank(inputs: dict, config: dict, context: ExecutionContext, reranker: object,
-           threshold: float) -> dict:
+           threshold: float, rerank_k: int) -> dict:
     evidence = inputs["evidence"]
     if not evidence:
         return {"evidence": []}
-    scores = reranker.score(inputs["question"], [item.chunk.text for item in evidence])
-    if len(scores) != len(evidence):
+    # Cross-encoding every fused candidate costs tens of seconds on CPU, so score the
+    # RRF head only; a top_k beyond the cap widens the pool instead of truncating results.
+    pool = evidence[:max(rerank_k, int(inputs["top_k"]))]
+    scores = reranker.score(inputs["question"], [item.chunk.text for item in pool])
+    if len(scores) != len(pool):
         raise ValueError("重排分数数量与候选不一致")
     cutoff = float(config.get("threshold", threshold))
-    ranked = [replace(item, score=float(score)) for item, score in zip(evidence, scores)
+    ranked = [replace(item, score=float(score)) for item, score in zip(pool, scores)
               if float(score) >= cutoff]
     return {"evidence": sorted(ranked, key=lambda item: item.score, reverse=True)[:inputs["top_k"]]}
 
