@@ -13,6 +13,7 @@ def build_registry(store: object, embedder: object, reranker: object,
     registry = NodeRegistry()
     candidate_k = getattr(settings, "candidate_k", 20)
     threshold = getattr(settings, "evidence_threshold", 0.5)
+    web_search_available = bool(getattr(generator, "tools", None))
     nodes = [
         BuiltinNode("query.input", "问题输入", "input", {},
                     {"question": "string", "top_k": "integer", "provider": "string"}, input_nodes.query_input),
@@ -64,11 +65,15 @@ def build_registry(store: object, embedder: object, reranker: object,
         BuiltinNode("evidence.gate", "证据门控", "evidence", {"evidence": "evidence_list"},
                     {"evidence": "evidence_list", "abstained": "boolean", "answer": "string",
                      "citations": "citations"},
-                    partial(evidence.gate, threshold=threshold),
-                    {"threshold": {"type": "number", "default": threshold, "minimum": 0, "maximum": 1}}),
+                    partial(evidence.gate, threshold=threshold,
+                            web_search_available=web_search_available),
+                    {"threshold": {"type": "number", "default": threshold, "minimum": 0, "maximum": 1},
+                     "allow_web_search": {"type": "boolean", "default": False}}),
         BuiltinNode("generation.llm", "模型回答", "generation",
                     {"question": "string", "provider": "string", "evidence": "evidence_list"},
-                    {"draft": "string"}, partial(generation.draft, generator=generator)),
+                    {"draft": "string", "evidence": "evidence_list"},
+                    partial(generation.draft, generator=generator),
+                    {"web_search": {"type": "boolean", "default": False}}),
         BuiltinNode("citation.validate", "引用校验", "citation",
                     {"draft": "string", "evidence": "evidence_list"},
                     {"answer": "answer"}, partial(generation.validate, generator=generator)),

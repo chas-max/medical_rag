@@ -19,15 +19,14 @@ def _live_dependencies(settings: Settings, answer_provider: str, judge_provider:
 
     from .embeddings import BgeEmbedder, BgeReranker
     from .evaluation_judge import EvaluationJudge
-    from .generation import GroundedGenerator, OpenAITransport
+    from .generation import OpenAITransport, build_generator
     from .service import RagService
     from .store import MilvusStore
 
     client = MilvusClient(uri=settings.milvus_uri, token=settings.milvus_token or None)
     store = MilvusStore(client, settings.collection_name)
     store.ensure_schema()
-    service = RagService(settings, store, BgeEmbedder(), BgeReranker(),
-                         GroundedGenerator(OpenAITransport(settings)))
+    service = RagService(settings, store, BgeEmbedder(), BgeReranker(), build_generator(settings))
     judge = EvaluationJudge(OpenAITransport(settings), judge_provider, settings.qwen_model)
     return service, judge
 

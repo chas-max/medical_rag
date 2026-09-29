@@ -46,7 +46,7 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None)
             from pymilvus import MilvusClient
 
             from .embeddings import BgeEmbedder, BgeReranker
-            from .generation import GroundedGenerator, OpenAITransport
+            from .generation import build_generator
             from .service import RagService
             from .store import MilvusStore
 
@@ -54,7 +54,7 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None)
             store = MilvusStore(client, settings.collection_name)
             store.ensure_schema()
             active_service = RagService(settings, store, BgeEmbedder(), BgeReranker(),
-                                        GroundedGenerator(OpenAITransport(settings)))
+                                        build_generator(settings))
         yield
 
     app = FastAPI(title="公开医疗资料检索问答", version="0.1.0", lifespan=lifespan)

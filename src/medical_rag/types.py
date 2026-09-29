@@ -2,6 +2,9 @@
 
 from dataclasses import dataclass
 
+ORIGIN_KNOWLEDGE_BASE = "knowledge_base"
+ORIGIN_WEB = "web"
+
 
 @dataclass(frozen=True)
 class Document:
@@ -31,6 +34,7 @@ class Evidence:
     chunk: Chunk
     score: float
     fused_score: float = 0.0
+    origin: str = ORIGIN_KNOWLEDGE_BASE
 
 
 class ApiError(Exception):
