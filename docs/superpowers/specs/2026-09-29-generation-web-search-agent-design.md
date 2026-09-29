@@ -2,7 +2,7 @@
 
 ## 目标与范围
 
-问答的生成阶段在检索不足时通过 Tavily 联网补充上下文，并把 `tavily_search` 作为**可注册的工具**接入，而不是固定的流程节点，为后续生成 agent 增加更多工具（短期记忆、human in the loop 等）留出同一接入点。联网命中与本地检索块一样进入提示词并参与逐条引用校验，来源标注为 `web`。默认流程 `medical-answer` 的节点连线与拒答行为保持不变；能力通过新增的已发布流程 `medical-answer-websearch` 与节点配置启用，`TAVILY_API_KEY` 未配置时工具集为空、行为与不联网完全一致。
+问答的生成阶段在检索不足时通过 Tavily 联网补充上下文，并把 `tavily_search` 作为**可注册的工具**接入，而不是固定的流程节点，为后续生成 agent 增加更多工具（短期记忆、human in the loop 等）留出同一接入点。联网命中与本地检索块一样进入提示词并参与逐条引用校验，来源标注为 `web`。能力已默认开启在已发布的 `medical-answer` v2 上（`/answers` 与问答页都走它），v1 作为不含联网的历史版本保留；`TAVILY_API_KEY` 未配置时工具集为空，门控退回过早拒答，行为与不联网完全一致。
 
 ## 自检的三种情况
 
@@ -36,4 +36,4 @@ Tavily 故障映射为 `WEB_SEARCH_NOT_CONFIGURED / UNAVAILABLE / AUTH_FAILED / 
 
 ## 验证
 
-`tests/test_web_search.py` 覆盖请求构造、Bearer 与超时/状态码映射、正文截断与去重、工具 Schema 与参数校验；`tests/test_generation_agent.py` 覆盖三种自检情况、工具轮次与预算、联网伪造摘录被拒、搜索失败降级以及无工具时的既有行为；`tests/test_workflow_nodes.py` 覆盖新流程校验通过、检索为空时由联网作答并输出 `origin=web` 引用，以及默认流程即使装配了工具仍按原门控拒答。`httpx` 由开发依赖提升为运行时依赖。
+`tests/test_web_search.py` 覆盖请求构造、Bearer 与超时/状态码映射、正文截断与去重、工具 Schema 与参数校验；`tests/test_generation_agent.py` 覆盖三种自检情况、工具轮次与预算、联网伪造摘录被拒、搜索失败降级以及无工具时的既有行为；`tests/test_workflow_nodes.py` 覆盖 `medical-answer` v2 校验通过、检索落空时由联网作答并输出 `origin=web` 引用，以及 v1 历史版本在同样装配工具时仍按原门控拒答。`httpx` 由开发依赖提升为运行时依赖。真机联调还验证了：无关题（高铁里程）由新华网、交通运输部公报等网页来源作答并给出 5 条 `origin=web` 引用，相关题（高血压随访，最高分 0.73）判为 `clear` 后完全不调用 Tavily。

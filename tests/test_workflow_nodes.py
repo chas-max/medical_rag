@@ -159,7 +159,7 @@ def test_no_evidence_skips_model_and_returns_abstention():
     assert transport.calls == 0
 
 
-def test_websearch_graph_answers_from_web_when_retrieval_misses():
+def test_default_graph_answers_from_web_when_retrieval_misses():
     store = Store()
     store.chunks = []
     search = WebSearch()
@@ -167,8 +167,9 @@ def test_websearch_graph_answers_from_web_when_retrieval_misses():
     generator = GroundedGenerator(transport, ToolRegistry([tavily_search_tool(search)]))
     registry = build_registry(store, Embedder(), Reranker(), generator, Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    graph = repository.get("medical-answer-websearch")
+    graph = repository.get("medical-answer")
 
+    assert (graph.version, graph.status) == (2, "published")
     assert validate_workflow(graph, registry) == []
     result = asyncio.run(WorkflowEngine(registry).run(graph, {
         "question": "未知", "provider": "qwen", "top_k": 5}))
@@ -184,14 +185,14 @@ def test_websearch_graph_answers_from_web_when_retrieval_misses():
     assert (transport.complete_calls, transport.chat_calls) == (0, 1)
 
 
-def test_default_graph_abstains_without_network_even_with_tools():
+def test_published_history_still_refuses_without_network():
     store = Store()
     store.chunks = []
     search = WebSearch()
     generator = GroundedGenerator(WebTransport(), ToolRegistry([tavily_search_tool(search)]))
     registry = build_registry(store, Embedder(), Reranker(), generator, Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 1), {
         "question": "未知", "provider": "qwen", "top_k": 5}))
 
     assert (search.calls, result.output["abstained"], result.trace_by_node("llm").status) == (

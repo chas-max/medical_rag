@@ -1,7 +1,7 @@
 {
-  "id": "medical-answer-websearch",
-  "name": "医疗资料问答（联网补充）",
-  "version": 1,
+  "id": "medical-answer",
+  "name": "医疗资料问答（检索不足时联网补充）",
+  "version": 2,
   "status": "published",
   "nodes": [
     {"id":"query","type":"query.input","position":{"x":80,"y":180},"config":{}},
