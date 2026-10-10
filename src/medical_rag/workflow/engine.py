@@ -7,7 +7,7 @@ from typing import Literal
 from uuid import uuid4
 
 from ..types import ApiError
-from .contracts import ExecutionContext, NodeTrace
+from .contracts import ExecutionContext, NodeTrace, StreamEmitter
 from .definition import WorkflowDefinition, WorkflowEdge, WorkflowNode
 from .registry import NodeRegistry
 
@@ -34,17 +34,22 @@ class WorkflowRunResult:
 class WorkflowEngine:
     """Runs registered workflow nodes in stable topological order."""
 
-    def __init__(self, registry: NodeRegistry) -> None:
+    def __init__(self, registry: NodeRegistry, capabilities: dict[str, bool] | None = None) -> None:
         self.registry = registry
+        # 全局内置能力对所有工作流一视同仁：节点不再自行声明是否联网。
+        self.capabilities = dict(capabilities or {})
 
     async def run(
-        self, definition: WorkflowDefinition, inputs: dict[str, object]
+        self, definition: WorkflowDefinition, inputs: dict[str, object],
+        emit: StreamEmitter | None = None,
     ) -> WorkflowRunResult:
         run_id = uuid4().hex
         context = ExecutionContext(
             run_id=run_id,
             workflow_id=definition.id,
             variables=dict(inputs),
+            capabilities=dict(self.capabilities),
+            emit=emit,
         )
         nodes_by_id: dict[str, WorkflowNode] = {}
         for node in definition.nodes:

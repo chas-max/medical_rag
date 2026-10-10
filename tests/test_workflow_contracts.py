@@ -47,6 +47,8 @@ def test_registry_exposes_stable_node_metadata() -> None:
             "inputs": {},
             "outputs": {"question": "string"},
             "config_schema": {},
+            "fixed": True,
+            "canonical": True,
         },
         {
             "type": "z.output",
@@ -55,6 +57,8 @@ def test_registry_exposes_stable_node_metadata() -> None:
             "inputs": {},
             "outputs": {"question": "string"},
             "config_schema": {},
+            "fixed": True,
+            "canonical": False,
         },
     ]
 
@@ -100,6 +104,8 @@ def test_registry_metadata_deep_copies_nested_node_metadata() -> None:
             "inputs": {"request": "object"},
             "outputs": {"question": "string"},
             "config_schema": {"nested": {"limits": [1, 2]}},
+            "fixed": True,
+            "canonical": True,
         }
     ]
 

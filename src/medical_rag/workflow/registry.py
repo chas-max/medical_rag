@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 
-from .contracts import Node
+from .contracts import CANONICAL_FIXED_TYPES, FIXED_NODE_CATEGORIES, Node
 
 
 class NodeRegistry:
@@ -28,6 +28,8 @@ class NodeRegistry:
                 "inputs": deepcopy(node.inputs),
                 "outputs": deepcopy(node.outputs),
                 "config_schema": deepcopy(node.config_schema),
+                "fixed": node.category in FIXED_NODE_CATEGORIES,
+                "canonical": CANONICAL_FIXED_TYPES.get(node.category) == node.type,
             }
             for node in sorted(self._nodes.values(), key=lambda registered: registered.type)
         ]

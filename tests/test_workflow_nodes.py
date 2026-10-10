@@ -10,8 +10,9 @@ from medical_rag.tools import ToolRegistry, tavily_search_tool
 from medical_rag.types import Chunk, Evidence
 from medical_rag.web_search import WebPage
 from medical_rag.workflow.bootstrap import build_registry
-from medical_rag.workflow.contracts import ExecutionContext
+from medical_rag.workflow.contracts import CAPABILITY_WEB_SEARCH, ExecutionContext
 from medical_rag.workflow.engine import WorkflowEngine
+from medical_rag.workflow.nodes import generation as generation_node
 from medical_rag.workflow.nodes.input import query_input
 from medical_rag.workflow.repository import WorkflowRepository
 from medical_rag.workflow.validator import validate_workflow
@@ -171,8 +172,8 @@ def test_default_graph_answers_from_web_when_retrieval_misses():
 
     assert (graph.version, graph.status) == (2, "published")
     assert validate_workflow(graph, registry) == []
-    result = asyncio.run(WorkflowEngine(registry).run(graph, {
-        "question": "未知", "provider": "qwen", "top_k": 5}))
+    engine = WorkflowEngine(registry, {CAPABILITY_WEB_SEARCH: True})
+    result = asyncio.run(engine.run(graph, {"question": "未知", "provider": "qwen", "top_k": 5}))
 
     assert search.calls == ["未知"]
     assert result.trace_by_node("gate").status == "success"
@@ -185,18 +186,20 @@ def test_default_graph_answers_from_web_when_retrieval_misses():
     assert (transport.complete_calls, transport.chat_calls) == (0, 1)
 
 
-def test_published_history_still_refuses_without_network():
+def test_published_history_keeps_its_own_evidence_wiring():
+    """v1 把门控证据接给引用校验：全局联网能发起检索，但补充证据对它不可见，结论仍被拒。"""
     store = Store()
     store.chunks = []
     search = WebSearch()
     generator = GroundedGenerator(WebTransport(), ToolRegistry([tavily_search_tool(search)]))
     registry = build_registry(store, Embedder(), Reranker(), generator, Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 1), {
+    engine = WorkflowEngine(registry, {CAPABILITY_WEB_SEARCH: True})
+    result = asyncio.run(engine.run(repository.get("medical-answer", 1), {
         "question": "未知", "provider": "qwen", "top_k": 5}))
 
     assert (search.calls, result.output["abstained"], result.trace_by_node("llm").status) == (
-        [], True, "skipped")
+        ["未知"], True, "success")
 
 
 def test_invalid_citation_from_workflow_abstains():
@@ -215,6 +218,91 @@ def test_invalid_citation_from_workflow_abstains():
     assert result.output["citations"] == []
 
 
+def test_workflow_output_exposes_analysis_without_changing_the_verified_answer():
+    """answer.output 只做透传：analysis 必须原样到达公开结果，answer 格式不受影响。"""
+    document = json.dumps({
+        "claims": [{"text": "应规律随访", "citations": [
+            {"chunk_id": "c1", "excerpt": "规律随访"}]}],
+        "analysis": {"summary": "规律随访属于长期管理的一部分，便于医生及时调整方案。",
+                     "extensions": ["复诊时带上既往检查资料。"], "based_on": ["c1"]},
+    }, ensure_ascii=False)
+
+    class AnalysisTransport:
+        def complete(self, provider, system, user):
+            return document
+
+    store = Store()
+    store.chunks = [Chunk("c1", "d1", "guide.md", "高血压患者应规律随访。", "guide.md", "", 1, 0)]
+    registry = build_registry(store, Embedder(), Reranker(),
+                              GroundedGenerator(AnalysisTransport()), Settings())
+    repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+        "question": "高血压", "provider": "qwen", "top_k": 5}))
+
+    assert result.status == "success"
+    assert result.output["abstained"] is False
+    assert result.output["answer"] == "应规律随访 [c1]"
+    assert result.output["analysis"]["based_on"] == ["c1"]
+    assert result.output["analysis"]["extensions"] == ["复诊时带上既往检查资料。"]
+
+
+def test_draft_node_gives_the_analysis_its_own_event_and_wire_shape():
+    """节点必须把生成器的两种载荷分流：分析段走 analysis 事件，且 data 直接是分析对象。
+
+    这里刻意从节点层进入（而不是直接调 generator.draft），因为把分析段塞进 claim 通道的
+    缺陷正好藏在节点这一层的包装里；回归测试只有在这一层才拦得住。
+    """
+    document = json.dumps({
+        "claims": [{"text": "应规律随访", "citations": [
+            {"chunk_id": "c1", "excerpt": "规律随访"}]}],
+        "analysis": {"summary": "把结论串起来看，随访与长期管理是同一件事。",
+                     "extensions": ["复诊时带上既往检查资料。"], "based_on": ["c1"]},
+    }, ensure_ascii=False)
+
+    class FakeGenerator:
+        def generate_stream(self, *args, **kwargs):
+            raise AssertionError("节点应优先走逐条推送的路径")
+
+        def draft(self, question, evidence, provider, web_search=False, on_claim=None):
+            # 节点必须把联网能力原样传进来，漏传会让检索落空时不再兜底。
+            assert web_search is False
+            if on_claim is not None:
+                on_claim({"text": "应规律随访 [c1]", "citations": [{"chunk_id": "c1"}]})
+                on_claim({"event": "analysis", "analysis": {
+                    "summary": "把结论串起来看，随访与长期管理是同一件事。",
+                    "extensions": ["复诊时带上既往检查资料。"], "based_on": ["c1"]}})
+            return {"draft": document, "evidence": evidence}
+
+    emitted = []
+    chunk = Chunk("c1", "d1", "guide.md", "高血压患者应规律随访。", "guide.md", "", 1, 0)
+    context = ExecutionContext("run", "w", {}, emit=emitted.append)
+    result = generation_node.draft(
+        {"question": "高血压", "provider": "qwen", "evidence": [Evidence(chunk, 0.9)]},
+        {}, context, FakeGenerator())
+
+    assert result["draft"] == document
+    assert [item["event"] for item in emitted] == ["status", "claim", "analysis"]
+    # claim 事件必须带 text/citations，前端直接按这两个键读取。
+    assert emitted[1]["data"] == {"text": "应规律随访 [c1]", "citations": [{"chunk_id": "c1"}]}
+    # analysis 事件的 data 就是分析对象本身，而不是再包一层的 {"analysis": ...}。
+    assert emitted[2]["data"]["extensions"] == ["复诊时带上既往检查资料。"]
+    assert emitted[2]["data"]["based_on"] == ["c1"]
+
+
+def test_draft_node_without_a_streaming_generator_stays_off_the_wire():
+    """没有流式能力的生成器只能走整段生成：除状态事件外不得推送任何结论。"""
+    class PlainGenerator:
+        def generate(self, question, evidence, provider, web_search=False):
+            return {"draft": "{}", "evidence": evidence}
+
+    emitted = []
+    context = ExecutionContext("run", "w", {}, emit=emitted.append)
+    generation_node.draft({"question": "高血压", "provider": "qwen", "evidence": []}, {}, context,
+                          PlainGenerator())
+
+    assert [item["event"] for item in emitted] == ["status"]
+
+
 def test_rrf_fuses_duplicate_chunks():
     store, _, registry = setup()
     chunk = Chunk("same", "d", "guide.md", "高血压", "guide.md", "", None, 0)
@@ -223,3 +311,64 @@ def test_rrf_fuses_duplicate_chunks():
         {"k": 60}, ExecutionContext("run", "w", {})))
     assert len(result.outputs["evidence"]) == 1
     assert result.outputs["evidence"][0].fused_score == 2 / 61
+
+
+def test_streaming_draft_pushes_claims_before_the_analysis_section():
+    """前端按事件顺序排版：结论必须全部先到，解释段固定在最后一条。"""
+    document = json.dumps({
+        "claims": [{"text": "应规律随访", "citations": [
+            {"chunk_id": "c1", "excerpt": "规律随访"}]}],
+        "analysis": {"summary": "规律随访是长期管理的一部分，便于医生及时调整方案。",
+                     "extensions": ["复诊时带上既往检查资料。"], "based_on": ["c1"]},
+    }, ensure_ascii=False)
+
+    class StreamTransport:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def complete(self, provider, system, user):
+            return self.payload
+
+        def stream_chat(self, provider, messages, tools=None, on_content=None):
+            step = 7
+            for index in range(0, len(self.payload), step):
+                if on_content is not None:
+                    on_content(self.payload[index:index + step])
+            return {"content": self.payload, "tool_calls": []}
+
+    emitted = []
+    chunk = Chunk("c1", "d1", "guide.md", "高血压患者应规律随访。", "guide.md", "", 1, 0)
+    generator = GroundedGenerator(StreamTransport(document))
+    result = generator.draft("高血压", [Evidence(chunk, 0.9)], "qwen", on_claim=emitted.append)
+
+    assert result["draft"] == document
+    assert "analysis" not in result
+    assert [item.get("event", "claim") for item in emitted] == ["claim", "analysis"]
+    assert emitted[0]["text"] == "应规律随访 [c1]"
+    assert emitted[1]["analysis"]["based_on"] == ["c1"]
+
+
+def test_analysis_never_reaches_a_client_when_no_claim_verifies():
+    """解释段读起来再合理，只要结论没通过逐字校验，流上就不能出现 analysis 事件。"""
+    document = json.dumps({
+        "claims": [{"text": "伪造结论", "citations": [
+            {"chunk_id": "c1", "excerpt": "不存在的摘录"}]}],
+        "analysis": {"summary": "这段解释本身读起来很合理。", "extensions": [],
+                     "based_on": ["c1"]},
+    }, ensure_ascii=False)
+
+    class StreamTransport:
+        def complete(self, provider, system, user):
+            return document
+
+        def stream_chat(self, provider, messages, tools=None, on_content=None):
+            if on_content is not None:
+                on_content(document)
+            return {"content": document, "tool_calls": []}
+
+    emitted = []
+    chunk = Chunk("c1", "d1", "guide.md", "高血压患者应规律随访。", "guide.md", "", 1, 0)
+    GroundedGenerator(StreamTransport()).draft(
+        "高血压", [Evidence(chunk, 0.9)], "qwen", on_claim=emitted.append)
+
+    assert emitted == []

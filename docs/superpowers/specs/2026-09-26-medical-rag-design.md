@@ -50,7 +50,7 @@ class Node:
         ...
 ```
 
-Node Registry 向 `/nodes` 暴露节点类型、分类、端口和配置 Schema，前端据此生成节点面板和属性表单。首批问答节点为 `query.input`、`retrieval.dense`、`retrieval.bm25`、`retrieval.rrf`、`retrieval.rerank`、`evidence.gate`、`generation.llm`、`citation.validate` 和 `answer.output`；入库节点为 `document.input`、`document.parse`、`document.chunk`、`document.embed`、`document.store` 和 `document.output`。
+Node Registry 向 `/nodes` 暴露节点类型、分类、端口和配置 Schema，前端据此生成节点面板和属性表单。首批问答节点为 `query.input`、`retrieval.dense`、`retrieval.bm25`、`retrieval.rrf`、`retrieval.rerank`、`evidence.gate`、`generation.llm`、`citation.validate` 和 `answer.output`；入库节点为 `document.input`、`document.parse`、`document.chunk`、`document.embed`、`document.store` 和 `document.output`。不是所有能力都做成节点：联网检索是每条工作流都由运行时注入的全局能力（`ExecutionContext.capabilities`，见 [全局联网能力设计](2026-09-30-global-web-search-capability-design.md)），因此不出现在节点库与节点配置里。
 
 默认问答工作流为：
 

@@ -45,7 +45,7 @@
     {"id":"q-llm","source":"query","source_port":"question","target":"llm","target_port":"question"},
     {"id":"p-llm","source":"query","source_port":"provider","target":"llm","target_port":"provider"},
     {"id":"llm-citation","source":"llm","source_port":"draft","target":"citation","target_port":"draft"},
-    {"id":"gate-citation","source":"gate","source_port":"evidence","target":"citation","target_port":"evidence"},
+    {"id":"llm-citation-evidence","source":"llm","source_port":"evidence","target":"citation","target_port":"evidence"},
     {"id":"citation-output","source":"citation","source_port":"answer","target":"output","target_port":"answer"}
   ]
 }

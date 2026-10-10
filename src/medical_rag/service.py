@@ -6,6 +6,7 @@ from pathlib import Path
 from .config import Settings
 from .types import ApiError
 from .workflow.bootstrap import build_registry
+from .workflow.contracts import CAPABILITY_WEB_SEARCH, StreamEmitter
 from .workflow.definition import WorkflowDefinition
 from .workflow.engine import WorkflowEngine, WorkflowRunResult
 from .workflow.repository import WorkflowRepository
@@ -15,6 +16,12 @@ from .workflow.validator import validate_workflow
 DEFAULT_WORKFLOWS = Path(__file__).resolve().parents[2] / "workflows"
 
 
+def global_capabilities(generator: object) -> dict[str, bool]:
+    """Capabilities every workflow gets by construction, independent of its graph."""
+    # 生成器只有在 Tavily 已配置时才持有工具；没有钥匙就没有联网能力，与不联网时行为一致。
+    return {CAPABILITY_WEB_SEARCH: bool(getattr(generator, "tools", None))}
+
+
 class RagService:
     def __init__(self, settings: Settings, store: object, embedder: object,
                  reranker: object, generator: object,
@@ -22,7 +29,8 @@ class RagService:
         self.settings = settings
         self.store = store
         self.registry = build_registry(store, embedder, reranker, generator, settings)
-        self.engine = WorkflowEngine(self.registry)
+        self.capabilities = global_capabilities(generator)
+        self.engine = WorkflowEngine(self.registry, self.capabilities)
         self.repository = WorkflowRepository(workflow_root or DEFAULT_WORKFLOWS,
                                              DEFAULT_WORKFLOWS if workflow_root else None)
         self.runs: dict[str, WorkflowRunResult] = {}
@@ -55,7 +63,8 @@ class RagService:
         except ValueError as exc:
             raise ApiError("WORKFLOW_CONFLICT", str(exc), 409) from exc
 
-    async def run_workflow(self, workflow_id: str, inputs: dict[str, object]) -> WorkflowRunResult:
+    async def run_workflow(self, workflow_id: str, inputs: dict[str, object],
+                           emit: StreamEmitter | None = None) -> WorkflowRunResult:
         try:
             definition = self.repository.get_published(workflow_id)
         except KeyError as exc:
@@ -72,7 +81,7 @@ class RagService:
                 raise ApiError("INVALID_PROVIDER", "不支持的生成模型厂商", 422)
             inputs = {**inputs, "top_k": top_k}
         self.last_workflow_id = workflow_id
-        result = await self.engine.run(definition, inputs)
+        result = await self.engine.run(definition, inputs, emit=emit)
         self.runs[result.run_id] = result
         return result
 

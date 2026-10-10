@@ -31,6 +31,19 @@ def test_workflow_api_lists_nodes_and_published_workflows(tmp_path):
                for item in workflows.json()["data"])
 
 
+def test_node_catalog_marks_input_and_output_nodes_fixed(tmp_path):
+    api, _ = client(tmp_path)
+    catalog = api.get("/nodes").json()["data"]
+
+    assert {item["type"] for item in catalog if item["fixed"]} == {
+        "query.input", "document.input", "answer.output", "search.output",
+        "document.output",
+    }
+    assert {item["type"] for item in catalog if item["canonical"]} == {
+        "query.input", "answer.output",
+    }
+
+
 def test_workflow_run_and_lookup_use_envelope(tmp_path):
     api, service = client(tmp_path)
     response = api.post("/workflows/medical-answer/runs", json={"inputs": {

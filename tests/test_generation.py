@@ -11,7 +11,7 @@ from openai import (APIConnectionError, APIStatusError, APITimeoutError,
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from medical_rag.config import Settings
-from medical_rag.generation import GroundedGenerator, OpenAITransport
+from medical_rag.generation import ABSTENTION, GroundedGenerator, OpenAITransport
 from medical_rag.types import ApiError, Chunk, Evidence
 
 
@@ -136,10 +136,12 @@ def test_draft_is_not_public_until_separate_citation_validation():
     transport = Transport(json.dumps({"claims": [{"text": "应规律随访", "citations": [
         {"chunk_id": "block1", "excerpt": "规律随访"}]}]}))
     generator = GroundedGenerator(transport)
-    draft = generator.draft("如何管理？", [evidence()], "qwen")
-    assert isinstance(draft, str)
-    assert "claims" in draft
-    result = generator.validate(draft, [evidence()])
+    # 草稿步骤交回未校验的 draft 文本与本次实际使用的证据，供引用校验节点复核。
+    produced = generator.draft("如何管理？", [evidence()], "qwen")
+    assert isinstance(produced["draft"], str)
+    assert "claims" in produced["draft"]
+    assert produced["evidence"] == [evidence()]
+    result = generator.validate(produced["draft"], produced["evidence"])
     assert result["abstained"] is False
     assert result["citations"][0]["chunk_id"] == "block1"
 
@@ -156,10 +158,38 @@ def test_generation_prompt_limits_claim_count_to_validator_limit():
     transport = PromptTransport()
     GroundedGenerator(transport).draft("问题", [evidence()], "qwen")
 
-    assert "8 条结论" in transport.system
+    assert "最多 8 条" in transport.system
     assert "逐字复制" in transport.system
     assert "优先 3–5 条" in transport.system
-    assert "先回答问题" in transport.system
+    assert "第 1 条直接回答问题" in transport.system
+    # 摘录越长越容易在改写或跨行时对不上原文，整条被逐字校验丢掉。
+    assert "短句" in transport.system
+
+
+def test_prompt_separates_grounded_claims_from_the_free_analysis_section():
+    """分析段故意允许发散，提示词必须说清它的边界：可复述已引结论，不得新增医学事实。"""
+    class PromptTransport:
+        def __init__(self):
+            self.system = ""
+
+        def complete(self, provider, system, user):
+            self.system = system
+            return '{"claims":[]}'
+
+    transport = PromptTransport()
+    GroundedGenerator(transport).draft("问题", [evidence()], "qwen")
+
+    assert "analysis" in transport.system
+    assert "based_on" in transport.system
+    # 允许发散的同时，仍然禁止把无出处的医学事实写进解释段。
+    assert "严禁新增任何医学事实" in transport.system
+    assert "不得引入证据之外的医学事实" in transport.system
+    # 复述已验证结论里的数值是允许的，反馈里明确禁止会出现"安全的复述被删、新断言放行"。
+    assert "复述" in transport.system
+    # 给出填好的正例，比单纯的形容词更能约束输出形状。
+    assert '"based_on":["c1"]' in transport.system
+    # analysis 可以省略，避免模型为了满足字段形状硬凑空话。
+    assert "省略 analysis" in transport.system
 
 
 def test_validator_caps_excess_claims_after_validating_the_visible_prefix():
@@ -252,3 +282,121 @@ def test_answer_does_not_hide_non_connection_model_errors():
 
     with pytest.raises(ValueError, match="模型配置错误"):
         GroundedGenerator(InvalidModelTransport()).answer("如何管理？", [evidence()], "qwen")
+
+
+def analysis_document(summary="规律随访是管理慢性病的基础。", extensions=None, based_on=None,
+                      text="应规律随访", excerpt="规律随访"):
+    return json.dumps({"claims": [{"text": text, "citations": [
+        {"chunk_id": "block1", "excerpt": excerpt}]}],
+        "analysis": {"summary": summary, "extensions": extensions or [],
+                     "based_on": based_on or ["block1"]}}, ensure_ascii=False)
+
+
+def test_analysis_section_expands_the_answer_without_entering_the_verified_answer():
+    output = analysis_document(extensions=["定期随访便于医生及时发现病情变化。"])
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    assert result["abstained"] is False
+    # answer 仍然只含逐字校验过的结论，评测与旧调用方拿到的一模一样。
+    assert result["answer"] == "应规律随访 [block1]"
+    assert result["analysis"]["summary"] == "规律随访是管理慢性病的基础。"
+    assert result["analysis"]["extensions"] == ["定期随访便于医生及时发现病情变化。"]
+    assert result["analysis"]["based_on"] == ["block1"]
+
+
+def test_analysis_is_absent_when_the_draft_carries_none():
+    output = json.dumps({"claims": [{"text": "应规律随访", "citations": [
+        {"chunk_id": "block1", "excerpt": "规律随访"}]}]})
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    assert result["abstained"] is False
+    assert "analysis" not in result
+
+
+def test_analysis_never_becomes_a_channel_around_verbatim_validation():
+    """结论全部被逐字校验丢掉时，附带的解释段必须一起丢掉，否则等于绕过引用校验。"""
+    output = json.dumps({"claims": [{"text": "伪造结论", "citations": [
+        {"chunk_id": "block1", "excerpt": "不存在的原文"}]}],
+        "analysis": {"summary": "这段解释本身读起来很合理。", "extensions": [],
+                     "based_on": ["block1"]}}, ensure_ascii=False)
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    assert result == {"answer": ABSTENTION, "citations": [], "abstained": True}
+
+
+@pytest.mark.parametrize("analysis", [
+    # 无所依据：analysis 只能挂在已验证结论引用过的块上。
+    {"summary": "规律随访很重要。", "extensions": [], "based_on": ["other"]},
+    {"summary": "规律随访很重要。", "extensions": [], "based_on": []},
+    # 形状不对的一律丢弃，不做修补。
+    {"summary": "", "extensions": [], "based_on": ["block1"]},
+    {"summary": "   ", "extensions": [], "based_on": ["block1"]},
+    {"summary": 123, "extensions": [], "based_on": ["block1"]},
+    {"summary": "规律随访很重要。", "extensions": [], "based_on": [1, None]},
+    # 不可迭代的 based_on / extensions 必须只丢掉分析段，不能抛异常连累已验证结论。
+    {"summary": "规律随访很重要。", "based_on": 5},
+    {"summary": "规律随访很重要。", "based_on": True},
+    {"summary": "规律随访很重要。", "based_on": None},
+    {"summary": "规律随访很重要。", "based_on": "block1"},
+    {"summary": "规律随访很重要。", "based_on": ["block1"], "extensions": 5},
+    # 字符串 extensions 会被逐字符拆开渲染，必须整段丢弃而不是"修成"单个汉字。
+    {"summary": "规律随访很重要。", "based_on": ["block1"], "extensions": "建议尽快就医"},
+    "规律随访很重要。",
+    ["规律随访很重要。"],
+    5,
+    None,
+])
+def test_invalid_analysis_is_dropped_while_claims_survive(analysis):
+    """分析段再离谱也只影响它自己：answer/citations/abstained 必须保持已校验结论的语义。"""
+    output = json.dumps({"claims": [{"text": "应规律随访", "citations": [
+        {"chunk_id": "block1", "excerpt": "规律随访"}]}], "analysis": analysis}, ensure_ascii=False)
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    assert result["abstained"] is False
+    assert result["answer"] == "应规律随访 [block1]"
+    assert "analysis" not in result
+
+
+@pytest.mark.parametrize("summary", [
+    # 复述已验证结论里的数值是安全的，必须放行；按字面禁数字会把这段整段删掉。
+    "血压目标与指南给出的数值一致，需要长期坚持。",
+    "通常需要按固定间隔复查一次。",
+    "复查的松紧取决于血压是否达标以及正在用什么方案。",
+    "这是长期管理的一部分，也是十分常见的做法。",
+])
+def test_analysis_accepts_safe_restatements_of_verified_values(summary):
+    result = GroundedGenerator(Transport(analysis_document(summary=summary))).answer(
+        "如何管理？", [evidence()], "qwen")
+
+    assert result["abstained"] is False
+    assert result["analysis"]["summary"] == summary
+
+
+def test_analysis_only_keeps_blocks_that_a_verified_claim_already_cited():
+    """based_on 是唯一的结构性锚点：没被已验证结论引用过的块静默剔除，而不是放行。"""
+    output = json.dumps({
+        "claims": [{"text": "应规律随访", "citations": [
+            {"chunk_id": "block1", "excerpt": "规律随访"}]}],
+        "analysis": {"summary": "把结论串起来解释一下。", "extensions": [],
+                     "based_on": ["block1", "never-cited", "other"]},
+    }, ensure_ascii=False)
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    assert result["analysis"]["based_on"] == ["block1"]
+
+
+def test_analysis_keeps_only_valid_extensions_up_to_the_cap():
+    output = analysis_document(extensions=[
+        "随访便于医生掌握病情变化。", "", "记录用药后的感受。",
+        "复诊时带上既往检查资料。", "出现不适及时就医。"])
+
+    result = GroundedGenerator(Transport(output)).answer("如何管理？", [evidence()], "qwen")
+
+    # 空串被丢，其余按原顺序保留；上限按"通过校验的条数"计算，不因丢条而少给。
+    assert result["analysis"]["extensions"] == [
+        "随访便于医生掌握病情变化。", "记录用药后的感受。", "复诊时带上既往检查资料。"]

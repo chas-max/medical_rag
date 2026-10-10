@@ -4,23 +4,28 @@ import AnswerContent from "../components/AnswerContent";
 import {
   getHealth,
   getWorkflows,
-  runWorkflow,
+  streamWorkflow,
   uploadDocument,
+  type AnalysisPayload,
   type Citation,
-  type Workflow,
+  type ClaimPayload,
+  type StatusPayload,
 } from "../api/workflows";
 import {
   readCurrentWorkflowId,
   selectAnswerWorkflows,
   writeCurrentWorkflowId,
 } from "../workflow/selection";
-
 type Message = {
   role: "user" | "assistant";
   content: string;
   citations?: Citation[];
+  /** 服务端校验过的解释段；不是事实来源，单独成段呈现。 */
+  analysis?: AnalysisPayload;
   abstained?: boolean;
   runId?: string;
+  /** 流式回答正在逐条到达；最终结果落地后清除。 */
+  pending?: boolean;
 };
 type Conversation = { id: string; title: string; messages: Message[] };
 const STORAGE = "zhiyuan-conversations-v1";
@@ -33,12 +38,19 @@ function initialConversations(): Conversation[] {
   }
 }
 
+/** 刷新中断的流式回答按普通消息保存，不留下永远"生成中"的占位。 */
+function persisted(conversations: Conversation[]): Conversation[] {
+  return conversations.map((item) => ({
+    ...item,
+    messages: item.messages.map((message) => ({ ...message, pending: undefined })),
+  }));
+}
+
 export default function ChatPage() {
   const [conversations, setConversations] =
     useState<Conversation[]>(initialConversations);
   const [current, setCurrent] = useState<string | null>(null);
   const currentRef = useRef<string | null>(null);
-  const [workflows, setWorkflows] = useState<Workflow[]>([]);
   const [workflowId, setWorkflowId] = useState("");
   const [workflowLoading, setWorkflowLoading] = useState(true);
   const [topK, setTopK] = useState(5);
@@ -48,6 +60,7 @@ export default function ChatPage() {
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
   const [failureNotices, setFailureNotices] = useState<Record<string, string>>({});
+  const [stages, setStages] = useState<Record<string, StatusPayload>>({});
   const [selectedCitation, setSelectedCitation] = useState<Citation | null>(
     null,
   );
@@ -55,6 +68,13 @@ export default function ChatPage() {
   const endRef = useRef<HTMLDivElement>(null);
   const active = conversations.find((item) => item.id === current);
   const failureNotice = current ? failureNotices[current] : undefined;
+  const streaming = !!active?.messages.at(-1)?.pending;
+  const stage = current ? stages[current] : undefined;
+  const waitingText = streaming
+    ? "正在生成并校验后续引用…"
+    : stage
+      ? `已检索到 ${stage.evidence} 条证据，正在生成回答${stage.web_search ? "（必要时联网补充）" : ""}…`
+      : "正在检索并验证证据…";
 
   function clearFailure(id: string) {
     setFailureNotices((previous) => {
@@ -65,11 +85,102 @@ export default function ChatPage() {
     });
   }
 
+  function setStage(id: string, status: StatusPayload) {
+    setStages((previous) => ({ ...previous, [id]: status }));
+  }
+
+  function clearStage(id: string) {
+    setStages((previous) => {
+      if (!(id in previous)) return previous;
+      const next = { ...previous };
+      delete next[id];
+      return next;
+    });
+  }
+
+  /** 把一个已通过引用校验的结论追加到流式回答上。 */
+  function appendClaim(conversationId: string, claim: ClaimPayload) {
+    setConversations((previous) =>
+      previous.map((item) => {
+        if (item.id !== conversationId) return item;
+        const messages = [...item.messages];
+        const last = messages[messages.length - 1];
+        if (last?.role === "assistant" && last.pending) {
+          const citations = [...(last.citations || [])];
+          const known = new Set(citations.map((citation) => citation.chunk_id));
+          for (const citation of claim.citations) {
+            if (citation.chunk_id && known.has(citation.chunk_id)) continue;
+            known.add(citation.chunk_id);
+            citations.push(citation);
+          }
+          messages[messages.length - 1] = {
+            ...last,
+            content: last.content ? `${last.content}\n${claim.text}` : claim.text,
+            citations,
+          };
+        } else {
+          messages.push({
+            role: "assistant",
+            content: claim.text,
+            citations: claim.citations,
+            pending: true,
+          });
+        }
+        return { ...item, messages };
+      }),
+    );
+  }
+
+  /** 解释段固定排在所有结论之后，只落在最后一条待定回答上。 */
+  function appendAnalysis(conversationId: string, analysis: AnalysisPayload) {
+    setConversations((previous) =>
+      previous.map((item) => {
+        if (item.id !== conversationId) return item;
+        const messages = [...item.messages];
+        const last = messages[messages.length - 1];
+        if (last?.role === "assistant" && last.pending) {
+          messages[messages.length - 1] = { ...last, analysis };
+        }
+        return { ...item, messages };
+      }),
+    );
+  }
+
+  /** 失败或空回答时不留下半截流式内容，行为与整段生成时一致。 */
+  function dropPendingAnswer(conversationId: string) {
+    setConversations((previous) =>
+      previous.map((item) => {
+        if (item.id !== conversationId) return item;
+        const last = item.messages[item.messages.length - 1];
+        if (last?.role !== "assistant" || !last.pending) return item;
+        return { ...item, messages: item.messages.slice(0, -1) };
+      }),
+    );
+  }
+
+  /** 用最终校验结果替换流式占位，未流式时直接追加。 */
+  function settleAnswer(conversationId: string, message: Message) {
+    setConversations((previous) =>
+      previous.map((item) => {
+        if (item.id !== conversationId) return item;
+        const last = item.messages[item.messages.length - 1];
+        return {
+          ...item,
+          messages:
+            last?.role === "assistant" && last.pending
+              ? [...item.messages.slice(0, -1), message]
+              : [...item.messages, message],
+        };
+      }),
+    );
+  }
+
   useEffect(() => {
+    // 切换工作流只发生在工作流编辑器页；这里沿用编辑器写入的 ID，
+    // 它失效（草稿/下架/拼错）时回退到默认问答流程。
     getWorkflows()
       .then((items) => {
         const answers = selectAnswerWorkflows(items);
-        setWorkflows(answers);
         const selected =
           answers.find((item) => item.id === readCurrentWorkflowId())?.id ||
           answers.find((item) => item.id === "medical-answer")?.id ||
@@ -79,7 +190,6 @@ export default function ChatPage() {
         writeCurrentWorkflowId(selected);
       })
       .catch((error) => {
-        setWorkflows([]);
         setWorkflowId("");
         setNotice(error.message);
       })
@@ -89,11 +199,11 @@ export default function ChatPage() {
       .catch(() => setHealthy(false));
   }, []);
   useEffect(() => {
-    localStorage.setItem(STORAGE, JSON.stringify(conversations));
+    localStorage.setItem(STORAGE, JSON.stringify(persisted(conversations)));
   }, [conversations]);
   useEffect(() => {
     endRef.current?.scrollIntoView?.({ behavior: "smooth" });
-  }, [active?.messages.length]);
+  }, [active?.messages.length, active?.messages.at(-1)?.content.length]);
 
   async function send(value = question) {
     const text = value.trim();
@@ -101,6 +211,7 @@ export default function ChatPage() {
     const selectedWorkflowId = workflowId;
     const id = currentRef.current || crypto.randomUUID();
     clearFailure(id);
+    clearStage(id);
     currentRef.current = id;
     setCurrent(id);
     setConversations((previous) => {
@@ -127,12 +238,17 @@ export default function ChatPage() {
     setNotice("");
     setBusy(true);
     try {
-      const result = await runWorkflow(selectedWorkflowId, {
-        question: text,
-        provider: "qwen",
-        top_k: topK,
-      });
+      const result = await streamWorkflow(
+        selectedWorkflowId,
+        { question: text, provider: "qwen", top_k: topK },
+        (event) => {
+          if (event.event === "claim") appendClaim(id, event.data);
+          else if (event.event === "analysis") appendAnalysis(id, event.data);
+          else if (event.event === "status") setStage(id, event.data);
+        },
+      );
       if (result.status === "failed") {
+        dropPendingAnswer(id);
         const failure = result.trace.find((item) => item.status === "failed")?.error;
         setFailureNotices((previous) => ({
           ...previous,
@@ -141,31 +257,29 @@ export default function ChatPage() {
         return;
       }
       if (!result.output.abstained && !result.output.answer?.trim()) {
+        dropPendingAnswer(id);
         setFailureNotices((previous) => ({
           ...previous,
           [id]: "该工作流没有产生回答",
         }));
         return;
       }
-      const message: Message = {
+      // 最终结果以服务端权威输出为准，覆盖流式阶段累积的内容。
+      settleAnswer(id, {
         role: "assistant",
         content: result.output.answer || "该工作流没有产生回答",
         citations: result.output.citations || [],
+        analysis: result.output.analysis as AnalysisPayload | undefined,
         abstained: result.output.abstained,
-      };
-      setConversations((previous) =>
-        previous.map((item) =>
-          item.id === id
-            ? { ...item, messages: [...item.messages, message] }
-            : item,
-        ),
-      );
+      });
     } catch (error) {
+      dropPendingAnswer(id);
       setFailureNotices((previous) => ({
         ...previous,
         [id]: error instanceof Error ? error.message : "请求失败",
       }));
     } finally {
+      clearStage(id);
       setBusy(false);
     }
   }
@@ -278,10 +392,14 @@ export default function ChatPage() {
                       {message.abstained && (
                         <span className="abstain">证据不足</span>
                       )}
+                      {message.pending && (
+                        <span className="streaming-badge">已校验 · 生成中</span>
+                      )}
                     </div>
                     {message.role === "assistant" ? (
                       <AnswerContent content={message.content} citations={message.citations || []}
-                        abstained={!!message.abstained} onCitationClick={setSelectedCitation} />
+                        analysis={message.analysis} abstained={!!message.abstained}
+                        onCitationClick={setSelectedCitation} />
                     ) : <div className="message-text">{message.content}</div>}
                     {message.role === "assistant" && !message.abstained && !!message.citations?.length && (
                       <div className="citations">
@@ -304,7 +422,7 @@ export default function ChatPage() {
               ))}
               {busy && (
                 <div className="thinking">
-                  <span className="spinner" /> 正在检索并验证证据…
+                  <span className="spinner" /> {waitingText}
                 </div>
               )}
               <div ref={endRef} />
@@ -327,29 +445,11 @@ export default function ChatPage() {
                 <button onClick={() => current && clearFailure(current)} aria-label="关闭错误提示">×</button>
               </div>
             )}
-            <div className="settings-bar workflow-selector">
-              <label>
-                工作流{" "}
-                <select
-                  aria-label="工作流"
-                  value={workflowId}
-                  disabled={workflowLoading || !workflows.length}
-                  onChange={(event) => {
-                    setWorkflowId(event.target.value);
-                    writeCurrentWorkflowId(event.target.value);
-                  }}
-                >
-                  {workflows.map((item) => (
-                    <option key={item.id} value={item.id}>
-                      {item.name} · v{item.version}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              {!workflowLoading && !workflows.length && (
-                <span className="muted">暂无可用的回答工作流</span>
-              )}
-            </div>
+            {!workflowLoading && !workflowId && (
+              <p className="notice" role="status">
+                暂无可用的回答工作流，请在「工作流编辑器」页切换或发布一个完整流程。
+              </p>
+            )}
             <details className="advanced-settings">
               <summary onClick={() => setAdvancedOpen((open) => !open)}>高级设置</summary>
               {advancedOpen && (
@@ -369,7 +469,9 @@ export default function ChatPage() {
                 </select>
               </label>
               <span className="settings-spacer" />
-              <Link to={`/workflows/${workflowId}`}>编辑此工作流 ↗</Link>
+              <Link to={`/workflows/${workflowId || "medical-answer"}`}>
+                切换 / 编辑工作流 ↗
+              </Link>
               </div>
               )}
             </details>

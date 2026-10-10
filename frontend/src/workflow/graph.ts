@@ -13,17 +13,48 @@ export type GraphNode = Node<{
   traceStatus?: string;
 }>;
 
-export const toGraph = (workflow: Workflow, catalog: NodeMetadata[]) => ({
-  nodes: workflow.nodes.map((node) => ({
-    id: node.id,
+const categoryOf = (node: GraphNode) => node.data.metadata?.category || "";
+
+/** 同类别的其它节点数量：固定节点只有在这归零时才是不可删的。 */
+export const fixedSiblings = (node: GraphNode, nodes: GraphNode[]) =>
+  nodes.filter((item) => item.id !== node.id && categoryOf(item) === categoryOf(node)).length;
+
+export function createGraphNode(
+  meta: NodeMetadata,
+  position: { x: number; y: number },
+): GraphNode {
+  return {
+    id: `${meta.type.replaceAll(".", "-")}-${crypto.randomUUID().slice(0, 6)}`,
     type: "workflow",
-    position: node.position,
+    position,
+    deletable: !meta.fixed,
     data: {
-      nodeType: node.type,
-      metadata: catalog.find((item) => item.type === node.type),
-      config: node.config,
+      nodeType: meta.type,
+      metadata: meta,
+      config: Object.fromEntries(
+        Object.entries(meta.config_schema)
+          .filter(([, schema]) => schema.default !== undefined)
+          .map(([key, schema]) => [key, schema.default!]),
+      ),
     },
-  })) as GraphNode[],
+  };
+}
+
+export const toGraph = (workflow: Workflow, catalog: NodeMetadata[]) => ({
+  nodes: workflow.nodes.map((node) => {
+    const metadata = catalog.find((item) => item.type === node.type);
+    return {
+      id: node.id,
+      type: "workflow",
+      position: node.position,
+      deletable: !metadata?.fixed,
+      data: {
+        nodeType: node.type,
+        metadata,
+        config: node.config,
+      },
+    };
+  }) as GraphNode[],
   edges: workflow.edges.map((edge) => ({
     id: edge.id,
     source: edge.source,
@@ -34,6 +65,33 @@ export const toGraph = (workflow: Workflow, catalog: NodeMetadata[]) => ({
     animated: false,
   })) as Edge[],
 });
+
+/**
+ * 输入/输出类节点是固定节点：图里缺整类时按后端标注的规范类型补回，
+ * 保证画布始终有一条从固定入口走到固定出口的完整路径。
+ */
+export function withFixedNodes(
+  nodes: GraphNode[],
+  catalog: NodeMetadata[],
+): { nodes: GraphNode[]; added: NodeMetadata[] } {
+  const added: NodeMetadata[] = [];
+  const columns = nodes.map((node) => node.position.x);
+  const left = columns.length ? Math.min(...columns) - 255 : 60;
+  const right = columns.length ? Math.max(...columns) + 255 : 570;
+  const next = [...nodes];
+  for (const category of new Set(
+    catalog.filter((item) => item.fixed).map((item) => item.category),
+  )) {
+    if (next.some((node) => categoryOf(node) === category)) continue;
+    const meta =
+      catalog.find((item) => item.canonical && item.category === category) ||
+      catalog.find((item) => item.fixed && item.category === category);
+    if (!meta) continue;
+    next.push(createGraphNode(meta, { x: category === "input" ? left : right, y: 80 }));
+    added.push(meta);
+  }
+  return { nodes: next, added };
+}
 
 export function toWorkflow(
   original: Workflow,

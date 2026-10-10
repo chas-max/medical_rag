@@ -19,7 +19,7 @@ export default function WorkflowNode({ data, selected }: NodeProps<GraphNode>) {
   const output = Object.entries(meta?.outputs || {});
   return (
     <div
-      className={`flow-node category-${meta?.category || "unknown"} ${selected ? "selected" : ""} ${data.traceStatus || ""}`}
+      className={`flow-node category-${meta?.category || "unknown"} ${selected ? "selected" : ""} ${data.traceStatus || ""} ${meta?.fixed ? "fixed" : ""}`}
     >
       <div className="flow-node-heading">
         <span className="flow-icon">{icons[meta?.category || ""] || "◇"}</span>
@@ -27,7 +27,13 @@ export default function WorkflowNode({ data, selected }: NodeProps<GraphNode>) {
           <strong>{meta?.title || data.nodeType}</strong>
           <small>{data.nodeType}</small>
         </div>
-        <span className="flow-node-menu">⋮</span>
+        {meta?.fixed ? (
+          <span className="flow-node-lock" title="固定节点：常驻画布，不可单独删除">
+            固定
+          </span>
+        ) : (
+          <span className="flow-node-menu">⋮</span>
+        )}
       </div>
       <div className="flow-node-ports">
         <div>

@@ -1,6 +1,6 @@
 {
   "id": "medical-answer",
-  "name": "医疗资料问答（检索不足时联网补充）",
+  "name": "医疗资料问答",
   "version": 2,
   "status": "published",
   "nodes": [
@@ -9,8 +9,8 @@
     {"id":"bm25","type":"retrieval.bm25","position":{"x":330,"y":300},"config":{}},
     {"id":"fusion","type":"retrieval.rrf","position":{"x":580,"y":180},"config":{"k":60}},
     {"id":"rerank","type":"retrieval.rerank","position":{"x":830,"y":180},"config":{}},
-    {"id":"gate","type":"evidence.gate","position":{"x":1080,"y":180},"config":{"allow_web_search":true}},
-    {"id":"llm","type":"generation.llm","position":{"x":1330,"y":180},"config":{"web_search":true}},
+    {"id":"gate","type":"evidence.gate","position":{"x":1080,"y":180},"config":{}},
+    {"id":"llm","type":"generation.llm","position":{"x":1330,"y":180},"config":{}},
     {"id":"citation","type":"citation.validate","position":{"x":1580,"y":180},"config":{}},
     {"id":"output","type":"answer.output","position":{"x":1830,"y":180},"config":{}}
   ],

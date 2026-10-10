@@ -1,6 +1,6 @@
 # 公开医疗资料 RAG 问答系统
 
-双页面医疗资料检索系统：Markdown/TXT/可提取文字 PDF → 自动分块 → BGE 中文向量 → Milvus HNSW_PQ + BM25 → RRF 融合和 BGE 重排 → Qwen Flash 的逐条引证问答，检索不足时可由生成阶段联网补充证据。FastAPI 后端以可注册 Node 和 DAG Workflow Engine 编排流程；React 前端提供问答与拖拽式工作流编辑器。
+双页面医疗资料检索系统：Markdown/TXT/可提取文字 PDF → 自动分块 → BGE 中文向量 → Milvus HNSW_PQ + BM25 → RRF 融合和 BGE 重排 → Qwen Flash 的逐条引证问答；检索不足时由生成阶段联网补充证据，这是每条工作流都内置的全局能力。FastAPI 后端以可注册 Node 和 DAG Workflow Engine 编排流程；React 前端提供问答与拖拽式工作流编辑器。
 
 > 仅用于公开资料检索与学习，不输入患者隐私，不替代医生诊断和治疗。引用 ID 与原文摘录的程序校验不能证明生成结论的医学正确性；关键结论应回看原资料。
 
@@ -25,7 +25,7 @@ npm --prefix frontend run build
 uvicorn medical_rag.api:app --app-dir src --reload
 ```
 
-同步生成请求显式设置 `enable_thinking=false`，避免 Qwen 默认思考模式在多段证据问答中超过等待时间；客户端超时上限为 120 秒。修改生成代码后，未启用 `--reload` 的后端需要重启才能生效。
+同步生成请求显式设置 `enable_thinking=false`，避免 Qwen 默认思考模式在多段证据问答中超过等待时间；客户端超时上限为 120 秒。修改生成代码后，未启用 `--reload` 的后端需要重启才能生效。问答页走流式接口 `POST /workflows/{id}/runs/stream`：后端用 `stream=True` 接收模型的 JSON 增量，按 claim 对象逐个增量解析并复用同一套逐字引用校验，只把已通过校验的结论即时推送；`/answers` 与整段生成的 `POST /workflows/{id}/runs` 行为不变。
 
 启动后端前，先等待 `standalone` 健康。
 
@@ -47,11 +47,15 @@ curl.exe http://127.0.0.1:8000/health
 
 ## 工作流与前端
 
-默认流程位于 `workflows/*.v*.json`：`medical-answer` 已发布两个版本，v2（当前生效）在证据门控和生成节点上开启了联网补充检索，并把引用校验的证据改接生成节点；v1 保留为不含联网的历史版本。`medical-answer-expanded` 走问题路由与扩展检索；`medical-search` 负责检索；`document-ingestion` 负责上传解析、分块、向量化和入库。现有 `/answers`、`/search`、`/documents` 经默认流程执行。`GET /nodes` 返回节点库的类型、分类、输入输出端口和配置 Schema；`GET /workflows` 只列已发布版本。编辑器可拖拽、连线、修改参数、复制或删除节点；校验后发布为不可覆盖的新版本，运行记录显示逐节点状态与耗时。草稿允许暂时不完整，但不能直接运行；问答页只使用已发布版本。工作流 JSON 不保存模型密钥；新增能力可注册新 Node 并连入工作流。
+默认流程位于 `workflows/*.v*.json`：`medical-answer` 已发布两个版本，v2（当前生效）把引用校验的证据改接生成节点；v1 保留为引用校验接证据门控的历史接线，同一次联网检索因证据未接过去而仍会拒答，可用来对照证据流向的影响。`medical-answer-expanded` 走问题路由与扩展检索；`medical-search` 负责检索；`document-ingestion` 负责上传解析、分块、向量化和入库。现有 `/answers`、`/search`、`/documents` 经默认流程执行。`GET /nodes` 返回节点库的类型、分类、输入输出端口和配置 Schema；`GET /workflows` 只列已发布版本。编辑器可拖拽、连线、修改参数、复制或删除节点；校验后发布为不可覆盖的新版本，运行记录显示逐节点状态与耗时。草稿允许暂时不完整，但不能直接运行；问答页只使用已发布版本。工作流 JSON 不保存模型密钥；新增能力可注册新 Node 并连入工作流。联网检索不属于可插拔节点，它是每条工作流都有的全局内置能力，见下节。
 
 问答页支持会话切换、本地浏览器历史、资料上传和引用原文面板。问答页默认收起工作流和证据数高级设置；回答按要点展示，引用编号可打开来源原文，不显示运行 ID。会话只存当前浏览器的 `localStorage`，不是服务器账户数据；不要输入患者隐私资料。编辑器的“运行已发布版”执行的是后端当前发布版本，尚未发布的画布修改不会参与运行。当前无用户鉴权，工作流编辑 API 也不能直接暴露到公网。
 
-工作流 API 为 `GET /nodes`、`GET/POST /workflows`、`GET/PUT /workflows/{id}`、`POST /workflows/{id}/validate`、`POST /workflows/{id}/runs` 和 `GET /runs/{run_id}`。例如：
+问答页用流式接口而不是整段接口：检索完成后先推送一个 `status` 事件（已检索到的证据条数、是否具备联网能力），前端据此把等待文案换成「已检索到 N 条证据，正在生成回答」，避免几十秒的生成期间界面看起来停住；随后每校验通过一条结论就推送一个 SSE `claim` 事件，前端边到达边渲染并同步给出可点开的引用；`done` 事件带回与整段生成完全一致的权威结果（`run_id`、`status`、`output`、`trace`），前端用它覆盖流式内容，所以预览与最终答案在正常情况下逐字一致，模型输出被截断或整篇校验不通过时也不会留下半截内容（覆盖成拒答）。`error` 事件只在请求被拒绝（空问题、未发布工作流）时出现，模型侧失败仍在 `done` 的 trace 里，与整段接口的失败语义一致。流式只作用于生成节点：DAG 仍按拓扑序执行，检索阶段不产生 `claim`，联网补充的 agent 轮次里带工具调用的那一轮内容不推送（只有确定不再调用工具的最终轮可以边写边校验）。逐条推送与最终答案共用 `MAX_CLAIMS` 截断与同一套逐字校验，因此两者条目与文字完全相同。
+
+生成提示词要求**每条结论只摘一句原文短句**，而不是整段证据：excerpt 越长，模型越容易在跨行或顺手改写时对不上原文，整条结论会被逐字校验丢掉——同一批证据下实测可展示结论从 1 条变成 4–6 条。因此「回答要点变少」先看检索到的证据块内容，而不是先怀疑流式链路。
+
+工作流 API 为 `GET /nodes`、`GET/POST /workflows`、`GET/PUT /workflows/{id}`、`POST /workflows/{id}/validate`、`POST /workflows/{id}/runs`、`POST /workflows/{id}/runs/stream`（`text/event-stream`，事件为 `status` / `claim` / `done` / `error`）和 `GET /runs/{run_id}`。例如：
 
 ```powershell
 curl.exe -H "Content-Type: application/json" -d '{"inputs":{"question":"高血压如何随访？","provider":"qwen","top_k":5}}' http://127.0.0.1:8000/workflows/medical-answer/runs
@@ -61,11 +65,13 @@ curl.exe -H "Content-Type: application/json" -d '{"inputs":{"question":"高血�
 
 ## 联网补充检索
 
-问答的生成阶段先自检检索质量，分三种情况决定是否触网：本地检索**没有命中**时用 Tavily 检索公开网页资料兜底生成；检索**内容模糊**（最高重排分低于 `CLEAR_EVIDENCE_THRESHOLD`，或证据少于 `MIN_CLEAR_EVIDENCE` 条）时先用原问题检索、再由模型改写检索词补充，网页内容与本地证据块一同进入提示词；检索**已经清晰**时直接依据本地资料作答，不提供联网工具。工具以可注册形式接入（`src/medical_rag/tools.py` 的 `Tool` 与 `ToolRegistry`），`tavily_search` 只暴露 `query` 参数，模型发起的工具轮次按 OpenAI function-calling 协议写回会话，最多 `MAX_AGENT_TOOL_CALLS` 轮。
+联网补充是**全局内置能力**，不属于任何一条工作流：`TAVILY_API_KEY` 配好后，`RagService` 在启动时把能力声明为 `capabilities = {"web_search": true}`，由 `WorkflowEngine` 注入每次运行的 `ExecutionContext`（`src/medical_rag/workflow/contracts.py` 的 `CAPABILITY_WEB_SEARCH` 与 `supports()`），节点只读取、不声明。因此已发布的 `medical-answer`、`medical-answer-expanded` 以及日后新建的工作流都天然具备联网能力，节点配置里没有 `web_search` / `allow_web_search` 这类开关，`/nodes` 也不会再返回它们（旧工作流若仍带这两个字段，发布校验按未知配置字段拒绝）。`TAVILY_API_KEY` 留空时工具集为空、能力为 `false`，门控退回原来的过早拒答，回答路径与不联网完全一致；离线评测走不联网的 `generator.answer(...)`，默认测试不产生外部请求。其余可调项：`TAVILY_BASE_URL`、`TAVILY_SEARCH_DEPTH`（`basic`／`advanced`）、`TAVILY_MAX_RESULTS`、`TAVILY_TIMEOUT_SECONDS`。能力默认生效后，只要检索未达到"清晰"标准就会实际产生 Tavily 计费请求。
 
-网页命中转成带来源的证据块（块 ID 形如 `web-…`，标题在 `filename`、网址在 `section`，正文按 `WEB_CONTENT_MAX_CHARS` 截断，同一网址只保留一条），因此仍受逐字引用校验约束：`citations[].origin` 为 `web` 的结论来自公开网页、未经本地资料核实，可信度低于知识库引用，不替代医生诊断。`TAVILY_API_KEY` 留空时工具集为空，所有流程与不联网时完全一致，默认测试与离线评测不产生外部请求；Tavily 故障统一映射为 `WEB_SEARCH_*` 错误码且不外泄上游响应体，工具失败只作为错误负载回给模型，不中断本次回答。
+节点侧只有两处读取这个能力：`evidence.gate` 在能力生效且过滤后无证据时不再拒答，把控制权交给生成阶段；`generation.llm` 把能力传给 `GroundedGenerator.generate(..., web_search=…)`。网页证据只存在于生成节点的输出里，因此引用校验必须接生成节点的 `evidence` 端口，否则联网取回的网页块进不了逐字校验。
 
-联网补充默认已开启在已发布的 `medical-answer` v2 上，`/answers` 与问答页都会走它；自行连线时把 `evidence.gate` 的 `allow_web_search` 与 `generation.llm` 的 `web_search` 都设为 `true` 即可。`TAVILY_API_KEY` 留空时工具集为空，门控退回原来的过早拒答，回答路径与不联网完全一致。其余可调项：`TAVILY_BASE_URL`、`TAVILY_SEARCH_DEPTH`（`basic`／`advanced`）、`TAVILY_MAX_RESULTS`、`TAVILY_TIMEOUT_SECONDS`。默认开启后，只要检索未达到"清晰"标准就会实际产生 Tavily 计费请求；离线评测仍走不联网的 `generator.answer(...)`。
+问答的生成阶段先自检检索质量，分三种情况决定是否触网：本地检索**没有命中**时用 Tavily 检索公开网页资料兜底生成；检索**内容模糊**（最高重排分低于 `CLEAR_EVIDENCE_THRESHOLD`，或证据少于 `MIN_CLEAR_EVIDENCE` 条）时先用原问题检索、再由模型改写检索词补充，网页内容与本地证据块一同进入提示词；检索**已经清晰**时直接依据本地资料作答，连工具都不提供给模型。工具以可注册形式接入（`src/medical_rag/tools.py` 的 `Tool` 与 `ToolRegistry`），`tavily_search` 只暴露 `query` 参数，模型发起的工具轮次按 OpenAI function-calling 协议写回会话，最多 `MAX_AGENT_TOOL_CALLS` 轮。
+
+网页命中转成带来源的证据块（块 ID 形如 `web-…`，标题在 `filename`、网址在 `section`，正文按 `WEB_CONTENT_MAX_CHARS` 截断，同一网址只保留一条），因此仍受逐字引用校验约束：`citations[].origin` 为 `web` 的结论来自公开网页、未经本地资料核实，可信度低于知识库引用，不替代医生诊断。Tavily 故障统一映射为 `WEB_SEARCH_*` 错误码且不外泄上游响应体，工具失败只作为错误负载回给模型，不中断本次回答。
 
 ## 检查与测试
 

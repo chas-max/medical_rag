@@ -89,13 +89,15 @@ def validate_workflow(
         if registered.category == "output":
             output_node_ids.append(node_id)
 
+    # 固定节点约束：输入与输出类别各至少保留一个实例，画布侧的常驻与自动补回
+    # 只是让这条规则更早暴露，发布/保存仍以这里为准。
     if not input_node_ids:
         issues.append(
-            ValidationIssue("MISSING_INPUT_NODE", "Workflow needs an input node")
+            ValidationIssue("MISSING_INPUT_NODE", "工作流必须保留固定的输入节点")
         )
     if not output_node_ids:
         issues.append(
-            ValidationIssue("MISSING_OUTPUT_NODE", "Workflow needs an output node")
+            ValidationIssue("MISSING_OUTPUT_NODE", "工作流必须保留固定的输出节点")
         )
 
     valid_inputs: set[tuple[str, str]] = set()

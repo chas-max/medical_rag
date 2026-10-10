@@ -377,6 +377,20 @@ a {
   color: #af7140;
   font-size: 10px;
 }
+.streaming-badge {
+  margin-left: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: #eaf4ee;
+  color: #2f6f53;
+  font-size: 10px;
+  animation: streaming-pulse 1.4s ease-in-out infinite;
+}
+@keyframes streaming-pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
 .citations {
   border-top: 1px solid #e7eee9;
   margin-top: 19px;
@@ -1248,6 +1262,12 @@ a {
 .answer-list li + li { margin-top: 10px; }
 .citation-ref { border: 0; background: none; color: #276a4e; cursor: pointer; padding: 2px 4px; font: inherit; font-weight: 700; }
 .citation-ref:focus-visible { outline: 2px solid #276a4e; border-radius: 4px; }
+/* 第二段：解释与延伸，视觉上弱于已核对结论，并明确标注它不是事实来源。 */
+.analysis { margin-top: 16px; padding: 12px 14px; border-left: 3px solid #cfe3d7; background: #f6faf8; border-radius: 0 8px 8px 0; }
+.analysis .small-label { display: block; margin-bottom: 6px; }
+.analysis-summary { margin: 0; color: #33513f; line-height: 1.85; font-size: 14px; }
+.analysis-list { margin: 8px 0 0; padding-left: 1.4em; color: #4a6b58; line-height: 1.8; font-size: 13px; }
+.analysis-list li + li { margin-top: 6px; }
 .advanced-settings { margin-bottom: 8px; font-size: 12px; color: #527862; }
 .advanced-settings summary { cursor: pointer; width: fit-content; padding: 6px 0; }
 .advanced-settings .settings-bar { padding-top: 8px; flex-wrap: wrap; }
@@ -1255,4 +1275,112 @@ a {
 @media (max-width: 700px) {
   .advanced-settings .settings-bar { gap: 10px; }
   .citation-ref { min-width: 28px; min-height: 28px; }
+}
+/* 固定节点：输入与输出常驻画布，视觉上区别于可自由增删的中间节点。 */
+.flow-node.fixed {
+  border-color: #b9d8c6;
+  box-shadow: 0 5px 19px #23482d16, inset 0 0 0 1px #e4f1e8;
+}
+.flow-node-lock {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #3d7a5b;
+  background: #e8f4ec;
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+.palette-fixed {
+  margin-left: auto;
+  font-size: 9px;
+  font-weight: 700;
+  color: #4b8468;
+  background: #eaf4ed;
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+.palette-group button:disabled {
+  opacity: 0.55;
+  cursor: default;
+  background: transparent;
+}
+.inspector-fixed {
+  margin: 12px 0 0;
+  font-size: 10px;
+  line-height: 1.7;
+  color: #3f7a5c;
+  background: #eef7f1;
+  border: 1px solid #d6eade;
+  border-radius: 7px;
+  padding: 8px 9px;
+}
+.inspector-buttons button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.editor-notice.fixed-notice {
+  color: #3f7a5c;
+  background: #f1f8f3;
+  border-color: #d9ebde;
+}
+.fixed-notice button {
+  margin-left: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+/* 工作流切换的唯一入口，以及它的确认弹窗。 */
+.workflow-switch {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.switch-caption {
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: #9db3a4;
+  padding-left: 2px;
+}
+.confirm-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  background: #12372955;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+}
+.confirm-card {
+  width: min(420px, 100%);
+  background: #fff;
+  border-radius: 13px;
+  box-shadow: 0 18px 48px #12372933;
+  padding: 24px 24px 20px;
+}
+.confirm-card h2 {
+  font-size: 16px;
+  margin: 8px 0 12px;
+  color: #24493a;
+}
+.confirm-card ul {
+  margin: 0 0 18px;
+  padding-left: 1.2em;
+  color: #5c7a68;
+  font-size: 12px;
+  line-height: 1.8;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+@media (max-width: 700px) {
+  .workflow-switch {
+    min-width: 132px;
+  }
+  .confirm-card {
+    padding: 20px 16px 16px;
+  }
 }
