@@ -11,7 +11,8 @@ from openai import (APIConnectionError, APIStatusError, APITimeoutError,
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from medical_rag.config import Settings
-from medical_rag.generation import ABSTENTION, GroundedGenerator, OpenAITransport
+from medical_rag.generation import (ABSTENTION, GroundedGenerator, OpenAITransport,
+                                    completion_options, verify_connection)
 from medical_rag.types import ApiError, Chunk, Evidence
 
 
@@ -69,27 +70,56 @@ def test_transport_requires_provider_key_before_network():
         transport.complete("qwen", "system", "user")
 
 
-def test_transport_uses_only_configured_qwen_model():
-    models, options = [], []
+def test_transport_sends_any_provider_label_to_the_configured_model():
+    requests, clients = [], []
 
     class Completions:
         def create(self, **kwargs):
-            models.append(kwargs["model"])
+            requests.append(kwargs)
             return type("Response", (), {"choices": [type("Choice", (), {
                 "message": type("Message", (), {"content": "{}"})()})()]})()
 
     class Client:
         def __init__(self, **kwargs):
-            options.append(kwargs)
+            clients.append(kwargs)
             self.chat = type("Chat", (), {"completions": Completions()})()
 
     transport = OpenAITransport(Settings(qwen_api_key="key"), client_factory=Client)
     assert transport.complete("qwen", "system", "user") == "{}"
-    assert models == ["qwen3.8-flash"]
-    assert options[0]["max_retries"] == 0
-    with pytest.raises(ApiError) as rejected:
-        transport.complete("deepseek", "system", "user")
-    assert rejected.value.code == "INVALID_PROVIDER"
+    assert transport.complete("deepseek", "system", "user") == "{}"
+    assert [item["model"] for item in requests] == ["qwen3.8-flash", "qwen3.8-flash"]
+    assert clients[0]["max_retries"] == 0
+    # The Qwen endpoint keeps the thinking flag that keeps generation inside the timeout.
+    assert requests[0]["extra_body"] == {"enable_thinking": False}
+
+
+@pytest.mark.parametrize("model,url,sends_flag", [
+    ("qwen3.8-flash", "https://api.deepseek.com/v1", True),
+    ("deepseek-chat", "https://dashscope.aliyuncs.com/compatible-mode/v1", True),
+    ("Qwen3-32B-Instruct", "http://127.0.0.1:8001/v1", True),
+    ("deepseek-chat", "https://api.deepseek.com/v1", False),
+    ("gpt-4o-mini", "https://api.openai.com/v1", False),
+])
+def test_qwen_only_thinking_flag_follows_the_endpoint(model, url, sends_flag):
+    assert ("extra_body" in completion_options(model, url)) is sends_flag
+
+
+def test_configuration_probe_sends_the_same_options_as_generation():
+    requests = []
+
+    class Completions:
+        def create(self, **kwargs):
+            requests.append(kwargs)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="OK"))])
+
+    class Client:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=Completions())
+
+    verify_connection("gpt-4o-mini", "https://api.openai.com/v1", "key", client_factory=Client)
+    verify_connection("qwen3.8-flash", "https://api.openai.com/v1", "key", client_factory=Client)
+    assert requests[0]["max_tokens"] == 1 and "extra_body" not in requests[0]
+    assert requests[1]["extra_body"] == {"enable_thinking": False}
 
 
 @pytest.mark.parametrize("error_type,status,code,http_status", [

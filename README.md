@@ -25,7 +25,7 @@ npm --prefix frontend run build
 uvicorn medical_rag.api:app --app-dir src --reload
 ```
 
-同步生成请求显式设置 `enable_thinking=false`，避免 Qwen 默认思考模式在多段证据问答中超过等待时间；客户端超时上限为 120 秒。修改生成代码后，未启用 `--reload` 的后端需要重启才能生效。问答页走流式接口 `POST /workflows/{id}/runs/stream`：后端用 `stream=True` 接收模型的 JSON 增量，按 claim 对象逐个增量解析并复用同一套逐字引用校验，只把已通过校验的结论即时推送；`/answers` 与整段生成的 `POST /workflows/{id}/runs` 行为不变。
+同步生成请求对 Qwen 端点显式设置 `enable_thinking=false`，避免 Qwen 默认思考模式在多段证据问答中超过等待时间；客户端超时上限为 120 秒。该参数只在模型名以 `qwen`/`qwq` 开头或地址属于 DashScope 时发送，其他 OpenAI 兼容服务不会收到未知参数。修改生成代码后，未启用 `--reload` 的后端需要重启才能生效。问答页走流式接口 `POST /workflows/{id}/runs/stream`：后端用 `stream=True` 接收模型的 JSON 增量，按 claim 对象逐个增量解析并复用同一套逐字引用校验，只把已通过校验的结论即时推送；`/answers` 与整段生成的 `POST /workflows/{id}/runs` 行为不变。
 
 启动后端前，先等待 `standalone` 健康。
 
@@ -44,6 +44,21 @@ curl.exe http://127.0.0.1:8000/health
 ```
 
 `POST /documents` 还接受可选 `source_id` 字段。同一来源与相同内容重复上传返回 `duplicate=true`；同一来源不同内容替换旧块。问答返回 `answer`、`citations` 和 `abstained`，每条结论带检索块 ID。所有接口统一 `{success,data,error}`。问题无相关证据时不调用外部模型，返回资料不足。
+
+## 模型配置
+
+问答页顶栏右侧的齿轮按钮打开「设置」，左侧「模型配置」填入模型名称、Base URL 和 API Key。三项都填写后「确认并生效」才可用：后端先用这套配置向该服务发一次最小请求（`max_tokens=1`，20 秒超时），通过才保存成一条已配置模型并立刻切为当前使用，正在进行的进程无需重启；任一步失败（连通不上、Key 无权限、模型名不存在、被限流）都返回 `MODEL_CONFIG_*` 错误码并保持原配置，界面提示重填。
+
+每确认一条就存一条，列表里可以随时「切换」，切换不再探活、瞬时生效，行上显示上次校验时间。模型名与 Base URL 都相同的确认会更新那一条（例如只换 Key），不会堆出重复项；不同则新增一条，条目 ID 由模型名生成（非字母数字转 `-`，重名加 `-2`）。「移除」需要点两次；删掉的正是当前使用时，回到 `.env` 的默认模型而不是自动换成另一家厂商作答。`settings.json` 结构为 `{"model":{"active":"<id>","profiles":[…]}}`，保存明文 API Key，已在 `.gitignore` 中，不要提交；它覆盖 `.env` 里的 `QWEN_API_KEY` / `QWEN_BASE_URL` / `QWEN_MODEL`，路径可用 `SETTINGS_FILE` 改，删掉该文件即全部回落到 `.env`。API 为 `GET /settings/model`（列表与当前项，只回显掩码 Key）、`POST /settings/model`（校验并保存切换）、`POST /settings/model/select`（按 `profile_id` 切换）和 `DELETE /settings/model/{profile_id}`。设置弹窗的分区由 `frontend/src/settings/registry.ts` 驱动，后续新增设置项只需往该数组里追加一项并写对应组件；后端按分区存同一个 JSON（`SettingsStore.write_section`）。
+
+任何 OpenAI 兼容服务都能配进来（Qwen、DeepSeek、OpenAI、vLLM、Ollama 的 OpenAI 层等），不要求模型来自某一家。`/answers` 与 `POST /workflows/{id}/runs` 的 `provider` 字段现在只是记录标签，不再挑选密钥，任意非空字符串都接受，非字符串仍返回 `INVALID_PROVIDER`；真正决定用哪家的是「当前选中的那条 profile」，来自 `settings.json` 或 `.env`。`enable_thinking` 属于 Qwen 专有参数，只在模型名以 `qwen`/`qwq` 开头或地址含 `dashscope`/`aliyuncs`/`tongyi` 时随请求发送，自检探活与正式生成共用同一判断，所以「校验通过」仍等价于「能作答」；自建 Qwen 网关若用了别的名字，请把模型名保持 `qwen` 前缀，否则思考链不会被关掉。
+
+```powershell
+curl.exe http://127.0.0.1:8000/settings/model
+curl.exe -H "Content-Type: application/json" -d '{"model_name":"qwen3.8-flash","base_url":"https://dashscope.aliyuncs.com/compatible-mode/v1","api_key":"sk-..."}' http://127.0.0.1:8000/settings/model
+curl.exe -H "Content-Type: application/json" -d '{"profile_id":"qwen3-8-flash"}' http://127.0.0.1:8000/settings/model/select
+curl.exe -X DELETE http://127.0.0.1:8000/settings/model/deepseek-chat
+```
 
 ## 工作流与前端
 

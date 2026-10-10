@@ -46,19 +46,23 @@ def test_cli_defaults_both_providers_to_qwen(tmp_path):
     assert report["config"]["judge_provider"] == "qwen"
 
 
-def test_cli_rejects_each_legacy_provider_before_initialization(tmp_path):
+def test_cli_records_any_provider_label_in_the_report(tmp_path):
     dataset = tmp_path / "dataset.jsonl"
+    output = tmp_path / "report.json"
     dataset.write_text('{"question":"问题","relevant_chunk_ids":["id"]}', encoding="utf-8")
     calls = []
 
-    def factory(*args):
-        calls.append(args)
+    def factory(settings, answer_provider, judge_provider):
+        calls.append((answer_provider, judge_provider))
         return Service(), Judge()
 
-    prefix = ["--dataset", str(dataset), "--output", str(tmp_path / "report.json")]
-    assert main(prefix + ["--answer-provider", "deepseek"], factory=factory) == 2
-    assert main(prefix + ["--judge-provider", "deepseek"], factory=factory) == 2
-    assert calls == []
+    prefix = ["--dataset", str(dataset), "--output", str(output)]
+    assert main(prefix + ["--answer-provider", "deepseek", "--judge-provider", "kimi"],
+                factory=factory) == 0
+    assert calls == [("deepseek", "kimi")]
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["config"] == {"top_k": 5, "answer_provider": "deepseek",
+                                "judge_provider": "kimi", "judge_model": "judge"}
 
 
 def test_cli_validates_before_factory(tmp_path):

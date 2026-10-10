@@ -46,15 +46,7 @@ def test_unsupported_upload_is_rejected():
     assert response.json()["error"]["code"] == "UNSUPPORTED_FORMAT"
 
 
-def test_unknown_provider_is_rejected():
-    response = TestClient(create_app(service=FakeService())).post(
-        "/answers", json={"question": "什么是高血压？", "provider": "other"}
-    )
-    assert response.status_code == 422
-    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
-
-
-def test_default_answer_uses_qwen_and_deepseek_is_rejected():
+def test_any_provider_label_reaches_the_answer_service():
     calls = []
 
     class CaptureService(FakeService):
@@ -64,10 +56,11 @@ def test_default_answer_uses_qwen_and_deepseek_is_rejected():
 
     api = TestClient(create_app(service=CaptureService()))
     assert api.post("/answers", json={"question": "高血压"}).status_code == 200
-    assert calls == ["qwen"]
-    rejected = api.post("/answers", json={"question": "高血压", "provider": "deepseek"})
-    assert rejected.status_code == 422
-    assert rejected.json()["error"]["code"] == "VALIDATION_ERROR"
+    assert api.post("/answers", json={"question": "高血压", "provider": "deepseek"}).status_code == 200
+    assert calls == ["qwen", "deepseek"]
+    malformed = api.post("/answers", json={"question": "高血压", "provider": 7})
+    assert malformed.status_code == 422
+    assert malformed.json()["error"]["code"] == "VALIDATION_ERROR"
 
 
 def test_default_top_k_uses_configuration(monkeypatch):

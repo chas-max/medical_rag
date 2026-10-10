@@ -12,6 +12,9 @@ class Settings(BaseSettings):
     milvus_uri: str = "http://localhost:19530"
     milvus_token: str = ""
     collection_name: str = "medical_chunks"
+    # Where the UI-written settings live. `.env` stays read-only so a configured
+    # model survives restarts without anyone editing secrets into the env file.
+    settings_file: str = "settings.json"
     qwen_api_key: str = ""
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     qwen_model: str = "qwen3.8-flash"

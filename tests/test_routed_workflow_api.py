@@ -30,7 +30,7 @@ def test_expanded_workflow_is_listed_and_rejects_invalid_query(tmp_path):
     assert invalid_top_k.json()["error"]["code"] == "INVALID_QUERY"
     invalid_provider = api.post(
         "/workflows/medical-answer-expanded/runs",
-        json={"inputs": {"question": "高血压", "provider": "other"}},
+        json={"inputs": {"question": "高血压", "provider": 7}},
     )
     assert invalid_provider.status_code == 422
     assert invalid_provider.json()["error"]["code"] == "INVALID_PROVIDER"

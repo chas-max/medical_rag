@@ -4,7 +4,6 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
 
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -17,6 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.concurrency import run_in_threadpool
 
 from .config import Settings
+from .settings_store import ModelSettings, SettingsStore
 from .types import ApiError
 from .workflow.definition import WorkflowDefinition, WorkflowRunRequest
 
@@ -27,7 +27,20 @@ class SearchRequest(BaseModel):
 
 
 class AnswerRequest(SearchRequest):
-    provider: Literal["qwen"] = "qwen"
+    # A record label only: one endpoint is configured at a time, so any name is accepted.
+    provider: str = "qwen"
+
+
+class ModelConfigRequest(BaseModel):
+    """Plain strings on purpose: an incomplete form gets its own error code, not a 422 about schemas."""
+
+    model_name: str = ""
+    base_url: str = ""
+    api_key: str = ""
+
+
+class ModelProfileRequest(BaseModel):
+    profile_id: str = ""
 
 
 def _success(value: object) -> dict:
@@ -43,9 +56,12 @@ def _event_frame(event: dict) -> str:
     return f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
 
 
-def create_app(service: object | None = None, frontend_dist: Path | None = None) -> FastAPI:
+def create_app(service: object | None = None, frontend_dist: Path | None = None,
+               settings_store: SettingsStore | None = None) -> FastAPI:
     settings = Settings()
     active_service = service
+    model_settings = ModelSettings(settings, settings_store)
+    model_settings.apply_saved()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -91,6 +107,26 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None)
     @app.get("/health")
     def health():
         return _success(_service().health())
+
+    @app.get("/settings/model")
+    def model_config():
+        return _success(model_settings.current())
+
+    @app.post("/settings/model")
+    async def confirm_model_config(payload: ModelConfigRequest):
+        # Confirmation probes the endpoint first, so it runs off the event loop like the
+        # workflow routes rather than stalling every other request for up to 20 seconds.
+        return _success(await run_in_threadpool(model_settings.confirm, payload.model_name,
+                                                 payload.base_url, payload.api_key))
+
+    @app.post("/settings/model/select")
+    def select_model_profile(payload: ModelProfileRequest):
+        # Switching a stored profile touches no network: it was proven when confirmed.
+        return _success(model_settings.select(payload.profile_id))
+
+    @app.delete("/settings/model/{profile_id}")
+    def delete_model_profile(profile_id: str):
+        return _success(model_settings.remove(profile_id))
 
     @app.get("/documents")
     def documents():

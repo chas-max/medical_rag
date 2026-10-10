@@ -103,11 +103,12 @@ class WebTransport:
             {"chunk_id": "web-x", "excerpt": "应每月随访一次"}]}]})
 
 
-def test_query_input_defaults_to_qwen_and_rejects_deepseek():
+def test_query_input_defaults_to_qwen_and_passes_any_vendor_label():
     context = ExecutionContext("run", "medical-answer", {})
     assert query_input({"question": "高血压"}, {}, context)["provider"] == "qwen"
-    with pytest.raises(ValueError, match="不支持的生成模型厂商"):
-        query_input({"question": "高血压", "provider": "deepseek"}, {}, context)
+    assert query_input({"question": "高血压", "provider": " deepseek "}, {}, context)["provider"] == "deepseek"
+    with pytest.raises(ValueError, match="provider"):
+        query_input({"question": "高血压", "provider": 7}, {}, context)
 
 
 def test_default_graphs_are_valid():

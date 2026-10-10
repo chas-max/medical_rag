@@ -56,14 +56,18 @@ def test_workflow_run_and_lookup_use_envelope(tmp_path):
     assert api.get("/runs/missing").status_code == 404
 
 
-def test_workflow_defaults_to_qwen_and_rejects_deepseek(tmp_path):
+def test_workflow_defaults_to_qwen_and_accepts_any_provider_label(tmp_path):
     api, _ = client(tmp_path)
     accepted = api.post("/workflows/medical-answer/runs", json={"inputs": {"question": "高血压"}})
     assert accepted.status_code == 200
-    rejected = api.post("/workflows/medical-answer/runs", json={"inputs": {
+    relabelled = api.post("/workflows/medical-answer/runs", json={"inputs": {
         "question": "高血压", "provider": "deepseek"}})
-    assert rejected.status_code == 422
-    assert rejected.json()["error"]["code"] == "INVALID_PROVIDER"
+    assert relabelled.status_code == 200
+    assert relabelled.json()["data"]["status"] == "success"
+    malformed = api.post("/workflows/medical-answer/runs", json={"inputs": {
+        "question": "高血压", "provider": 7}})
+    assert malformed.status_code == 422
+    assert malformed.json()["error"]["code"] == "INVALID_PROVIDER"
 
 
 def test_model_rate_limit_stays_safe_in_both_answer_routes(tmp_path):

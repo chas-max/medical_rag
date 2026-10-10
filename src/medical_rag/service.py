@@ -77,8 +77,11 @@ class RagService:
             top_k = inputs.get("top_k", self.settings.top_k)
             if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 20:
                 raise ApiError("INVALID_QUERY", "top_k 必须在 1 到 20 之间", 422)
-            if inputs.get("provider", "qwen") != "qwen":
-                raise ApiError("INVALID_PROVIDER", "不支持的生成模型厂商", 422)
+            # provider records which vendor the operator configured; it selects no credentials,
+            # so any name is allowed but a usable string keeps the run from failing mid-flight.
+            provider = inputs.get("provider", "qwen")
+            if not isinstance(provider, str) or not provider.strip():
+                raise ApiError("INVALID_PROVIDER", "provider 需要是非空字符串", 422)
             inputs = {**inputs, "top_k": top_k}
         self.last_workflow_id = workflow_id
         result = await self.engine.run(definition, inputs, emit=emit)
@@ -93,7 +96,7 @@ class RagService:
             if code == "NODE_EXECUTION_ERROR":
                 code = "DEPENDENCY_ERROR"
             status = {"MODEL_RATE_LIMITED": 429, "MODEL_UPSTREAM_ERROR": 502}.get(
-                code, 422 if code in ("INVALID_DOCUMENT", "INVALID_SOURCE", "INVALID_QUERY", "INVALID_PROVIDER") else 503
+                code, 422 if code in ("INVALID_DOCUMENT", "INVALID_SOURCE", "INVALID_QUERY") else 503
             )
             raise ApiError(code, error.get("message", "检索或模型服务不可用"), status)
         return result.output

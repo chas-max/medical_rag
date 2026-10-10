@@ -1,3 +1,5 @@
+import { base, json, request } from "./client";
+
 export interface NodeMetadata {
   type: string;
   title: string;
@@ -113,36 +115,6 @@ export type StreamEvent =
   | { event: "analysis"; data: AnalysisPayload }
   | { event: "done"; data: RunResult }
   | { event: "error"; data: { code: string; message: string; status?: number } };
-
-const base = import.meta.env.DEV ? "/api" : "";
-
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  let response: Response;
-  try {
-    response = await fetch(`${base}${path}`, init);
-  } catch {
-    throw new Error("无法连接服务，请确认后端已经启动");
-  }
-  let envelope: {
-    success: boolean;
-    data: T;
-    error: { message: string } | null;
-  };
-  try {
-    envelope = await response.json();
-  } catch {
-    throw new Error("服务返回了无法解析的响应");
-  }
-  if (!response.ok || !envelope.success)
-    throw new Error(envelope.error?.message || "请求失败");
-  return envelope.data;
-}
-
-const json = (value: unknown): RequestInit => ({
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  body: JSON.stringify(value),
-});
 
 function parseFrame(block: string): { event: string; data: unknown } | null {
   let name = "message";

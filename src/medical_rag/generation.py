@@ -90,7 +90,7 @@ def _merge_evidence(base: list[Evidence], extra: list[Evidence]) -> list[Evidenc
 def _model_error(error: Exception) -> ApiError:
     """Map an OpenAI failure onto a safe code; upstream bodies never escape."""
     if isinstance(error, (AuthenticationError, PermissionDeniedError)):
-        return ApiError("MODEL_AUTH_FAILED", "生成模型认证或权限不足，请检查 Qwen 配置", 503)
+        return ApiError("MODEL_AUTH_FAILED", "生成模型认证或权限不足，请检查模型配置", 503)
     if isinstance(error, RateLimitError):
         return ApiError("MODEL_RATE_LIMITED", "生成模型请求过于频繁，请稍后重试", 429)
     if isinstance(error, (APITimeoutError, APIConnectionError)):
@@ -98,8 +98,68 @@ def _model_error(error: Exception) -> ApiError:
     return ApiError("MODEL_UPSTREAM_ERROR", "生成模型请求失败，请稍后重试", 502)
 
 
+QWEN_URL_MARKERS = ("dashscope", "aliyuncs", "tongyi")
+QWEN_MODEL_PREFIXES = ("qwen", "qwq")
+
+
+def is_qwen_endpoint(model: str, base_url: str) -> bool:
+    """Recognise the endpoints that both accept and want the Qwen-only thinking flag.
+
+    Other OpenAI-compatible servers reject an unknown body parameter with a 400, so the
+    flag cannot be sent unconditionally once anything but Qwen is configurable.
+    """
+    url, name = base_url.lower(), model.lower()
+    return any(marker in url for marker in QWEN_URL_MARKERS) or name.startswith(QWEN_MODEL_PREFIXES)
+
+
+def completion_options(model: str, base_url: str) -> dict:
+    """The per-endpoint request options shared by generation and the configuration probe.
+
+    qwen3.8-flash 默认开启思维链：带证据的完整生成实测约 163 s，会撞穿客户端超时并对外报
+    MODEL_UNAVAILABLE（"生成功能不可用"）。本节点的任务是结构化抽取 + 逐字引用，思考链并非
+    必需；关闭后同一请求实测约 19 s。探活用同一份选项，所以"校验通过"仍等价于"能作答"。
+    """
+    if is_qwen_endpoint(model, base_url):
+        return {"extra_body": {"enable_thinking": False}}
+    return {}
+
+
 def _messages(system: str, user: str) -> list[dict]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+VERIFY_TIMEOUT_SECONDS = 20.0
+
+
+def verify_connection(model: str, base_url: str, api_key: str,
+                      client_factory: object | None = None) -> None:
+    """Ask the endpoint for one token, so a bad configuration fails here rather than in an answer.
+
+    The request sends the same options as ``OpenAITransport._create``, so a
+    configuration that passes here cannot be rejected later on connectivity or
+    parameter grounds. Upstream bodies stay hidden; only our own codes surface.
+    """
+    factory = client_factory
+    if factory is None:
+        from openai import OpenAI
+
+        factory = OpenAI
+    client = factory(api_key=api_key, base_url=base_url, timeout=VERIFY_TIMEOUT_SECONDS,
+                     max_retries=0)
+    try:
+        client.chat.completions.create(model=model, messages=_messages("连通性自检，不要解释。", "只回复 OK"),
+                                       temperature=0, max_tokens=1, **completion_options(model, base_url))
+    except (AuthenticationError, PermissionDeniedError) as error:
+        raise ApiError("MODEL_CONFIG_AUTH_FAILED", "API Key 无效，或该 Key 没有此模型的访问权限，请重新填写", 422) from error
+    except RateLimitError as error:
+        raise ApiError("MODEL_CONFIG_RATE_LIMITED", "该 API Key 正在限流，配置未生效，请稍后重试", 422) from error
+    except (APITimeoutError, APIConnectionError) as error:
+        raise ApiError("MODEL_CONFIG_UNREACHABLE", "无法连接该 Base URL（超时或网络不可达），请核对地址后重新填写", 422) from error
+    except APIStatusError as error:
+        if error.status_code == 404:
+            raise ApiError("MODEL_CONFIG_MODEL_NOT_FOUND", f"该服务上不存在模型 {model}，请重新填写模型名称", 422) from error
+        raise ApiError("MODEL_CONFIG_REJECTED",
+                       f"模型服务拒绝了自检请求（HTTP {error.status_code}），请检查三项配置后重试", 422) from error
 
 
 class OpenAITransport:
@@ -174,11 +234,9 @@ class OpenAITransport:
         return self._create(provider, messages, **options)
 
     def _create(self, provider: str, messages: list[dict], **options) -> object:
-        if provider != "qwen":
-            raise ApiError("INVALID_PROVIDER", "不支持的生成模型厂商", 422)
         api_key = self.settings.qwen_api_key
         if not api_key:
-            raise ApiError("MODEL_NOT_CONFIGURED", "Qwen API Key 未配置", 503)
+            raise ApiError("MODEL_NOT_CONFIGURED", "模型 API Key 未配置", 503)
         factory = self.client_factory
         if factory is None:
             from openai import OpenAI
@@ -187,13 +245,13 @@ class OpenAITransport:
         client = factory(api_key=api_key, base_url=self.settings.qwen_base_url,
                          timeout=120.0, max_retries=0)
         try:
+            # timeout 上限 120 s 兜底：Qwen 端点已由 completion_options 关掉思维链，
+            # 非 Qwen 服务没有那个开关，只能靠超时守边。
             return client.chat.completions.create(model=self.settings.qwen_model, messages=messages,
                                                  temperature=0,
-                                                 # qwen3.8-flash 默认开启思维链：带证据的完整生成实测约 163 s，
-                                                 # 会撞穿客户端超时并对外报 MODEL_UNAVAILABLE（"生成功能不可用"）。
-                                                 # 本节点的任务是结构化抽取 + 逐字引用，思考链并非必需；
-                                                 # 关闭后同一请求实测约 19 s。timeout 提高到 120 s 作兜底。
-                                                 extra_body={"enable_thinking": False}, **options)
+                                                 **completion_options(self.settings.qwen_model,
+                                                                      self.settings.qwen_base_url),
+                                                 **options)
         except (AuthenticationError, PermissionDeniedError, RateLimitError, APITimeoutError,
                 APIConnectionError, APIStatusError) as error:
             raise _model_error(error) from error
