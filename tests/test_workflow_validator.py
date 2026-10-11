@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from medical_rag.workflow.contracts import ExecutionContext, NodeResult
+from medical_rag.workflow.contracts import ExecutionContext, NodeResult, PortSpec
 from medical_rag.workflow.definition import (
     WorkflowDefinition,
     WorkflowEdge,
@@ -15,9 +15,11 @@ class StubNode:
     type: str
     title: str
     category: str
-    inputs: dict[str, str] = field(default_factory=dict)
+    inputs: dict[str, str | PortSpec] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
     config_schema: dict[str, object] = field(default_factory=dict)
+    tags: frozenset[str] = frozenset()
+    shared_producers: tuple[tuple[str, str], ...] = ()
 
     async def execute(
         self,
@@ -301,3 +303,201 @@ def test_validator_reports_duplicate_node_and_edge_ids_stably() -> None:
         (issue.code, issue.node_id, issue.edge_id, issue.message) for issue in first
     ] == [(issue.code, issue.node_id, issue.edge_id, issue.message) for issue in second]
     assert {issue.code for issue in first} >= {"DUPLICATE_NODE_ID", "DUPLICATE_EDGE_ID"}
+
+
+ANSWER_TYPES = {
+    "query": "query.input",
+    "dense": "retrieval.dense",
+    "gate": "evidence.gate",
+    "generation": "generation.llm",
+    "citation": "citation.validate",
+    "output": "answer.output",
+    "rewrite": "question.rewrite",
+    "decompose": "question.decompose",
+    "multi": "retrieval.multi",
+}
+
+
+def nodes_named(*names: str) -> list[dict[str, object]]:
+    return [{"id": name, "type": ANSWER_TYPES[name]} for name in names]
+
+
+def gated_registry() -> NodeRegistry:
+    """A retrieval chain plus a guarded generation step, mirroring the answer nodes."""
+    return make_registry(
+        StubNode("query.input", "Query", "input", outputs={"question": "string"}),
+        StubNode("retrieval.dense", "Dense", "retrieval", inputs={"question": "string"},
+                 outputs={"evidence": "evidence_list"}),
+        StubNode("evidence.gate", "Gate", "evidence",
+                 inputs={"evidence": "evidence_list"}, outputs={"evidence": "evidence_list"},
+                 tags=frozenset({"evidence.gated"})),
+        StubNode("generation.llm", "Generation", "generation",
+                 inputs={"question": "string",
+                         "evidence": PortSpec("evidence", "evidence_list",
+                                              requires_tag="evidence.gated")},
+                 outputs={"draft": "string", "evidence": "evidence_list"}),
+        StubNode("citation.validate", "Citation", "citation",
+                 inputs={"draft": "string", "evidence": "evidence_list"},
+                 outputs={"answer": "answer"}, tags=frozenset({"answer.cited"}),
+                 shared_producers=(("draft", "evidence"),)),
+        StubNode("answer.output", "Answer", "output",
+                 inputs={"answer": PortSpec("answer", "answer", requires_tag="answer.cited")}),
+    )
+
+
+def chain(*connections: tuple[str, str, str, str]) -> list[dict[str, str]]:
+    return [
+        {"id": f"{source}-{target}-{index}", "source": source, "source_port": source_port,
+         "target": target, "target_port": target_port}
+        for index, (source, source_port, target, target_port) in enumerate(connections)
+    ]
+
+
+SAFE_CHAIN = chain(
+    ("query", "question", "generation", "question"),
+    ("query", "question", "dense", "question"),
+    ("dense", "evidence", "gate", "evidence"),
+    ("gate", "evidence", "generation", "evidence"),
+    ("generation", "draft", "citation", "draft"),
+    ("generation", "evidence", "citation", "evidence"),
+    ("citation", "answer", "output", "answer"),
+)
+
+
+def test_declared_guards_are_satisfied_by_the_guarded_chain() -> None:
+    definition = make_definition(
+        nodes_named("query", "dense", "gate", "generation", "citation", "output"), SAFE_CHAIN)
+
+    assert validate_workflow(definition, gated_registry()) == []
+
+
+def test_tag_requirement_rejects_evidence_that_bypasses_the_guard() -> None:
+    """重排/fusion 换成别的节点都行，但证据绕过门控就必须拒绝。"""
+    definition = make_definition(
+        nodes_named("query", "dense", "gate", "generation", "citation", "output"),
+        chain(
+            ("query", "question", "generation", "question"),
+            ("query", "question", "dense", "question"),
+            ("dense", "evidence", "gate", "evidence"),
+            # 门控存在于图里，却不在通往 generation.evidence 的路径上。
+            ("dense", "evidence", "generation", "evidence"),
+            ("generation", "draft", "citation", "draft"),
+            ("generation", "evidence", "citation", "evidence"),
+            ("citation", "answer", "output", "answer"),
+        ),
+    )
+
+    issues = validate_workflow(definition, gated_registry())
+
+    assert {issue.code for issue in issues} == {"UNSAFE_ANSWER_FLOW"}
+    assert next(issue for issue in issues).node_id == "generation"
+
+
+def test_optional_ports_may_stay_unconnected() -> None:
+    registry = make_registry(
+        StubNode("query.input", "Query", "input", outputs={"question": "string"}),
+        StubNode("question.rewrite", "Rewrite", "question",
+                 inputs={"question": "string",
+                         "route": PortSpec("route", "string", optional=True)},
+                 outputs={"value": "string"}),
+        StubNode("answer.output", "Answer", "output", inputs={"value": "string"}),
+    )
+    definition = make_definition(nodes_named("query", "rewrite", "output"),
+                                 chain(("query", "question", "rewrite", "question"),
+                                       ("rewrite", "value", "output", "value")))
+
+    assert validate_workflow(definition, registry) == []
+
+
+def test_plain_ports_take_one_edge_while_collect_ports_gather() -> None:
+    registry = make_registry(
+        StubNode("query.input", "Query", "input", outputs={"question": "string"}),
+        StubNode("retrieval.one", "One", "retrieval", inputs={"question": "string"},
+                 outputs={"value": "string"}),
+        StubNode("retrieval.two", "Two", "retrieval", inputs={"question": "string"},
+                 outputs={"value": "string"}),
+        StubNode("join.plain", "Plain", "output", inputs={"values": "string"}),
+        StubNode("join.collect", "Collect", "output",
+                 inputs={"values": PortSpec("values", "string", collect=True)}),
+    )
+    fan_in = chain(("query", "question", "one", "question"),
+                   ("query", "question", "two", "question"))
+    shared = chain(("one", "value", "join", "values"), ("two", "value", "join", "values"))
+
+    plain = validate_workflow(
+        make_definition([{"id": "query", "type": "query.input"},
+                         {"id": "one", "type": "retrieval.one"},
+                         {"id": "two", "type": "retrieval.two"},
+                         {"id": "join", "type": "join.plain"}], fan_in + shared),
+        registry,
+    )
+    collect = validate_workflow(
+        make_definition([{"id": "query", "type": "query.input"},
+                         {"id": "one", "type": "retrieval.one"},
+                         {"id": "two", "type": "retrieval.two"},
+                         {"id": "join", "type": "join.collect"}], fan_in + shared),
+        registry,
+    )
+
+    assert {issue.code for issue in plain} == {"MULTI_INPUT_EDGE"}
+    assert collect == []
+
+
+def test_collect_port_accepts_a_list_producer_of_the_same_item_type() -> None:
+    registry = make_registry(
+        StubNode("query.input", "Query", "input", outputs={"question": "string"}),
+        StubNode("question.decompose", "Decompose", "question", inputs={"question": "string"},
+                 outputs={"values": "list<string>"}),
+        StubNode("retrieval.multi", "Multi", "retrieval",
+                 inputs={"queries": PortSpec("queries", "string", collect=True)},
+                 outputs={"evidence": "evidence_list"}),
+        StubNode("answer.output", "Answer", "output", inputs={"evidence": "evidence_list"}),
+    )
+    definition = make_definition(nodes_named("query", "decompose", "multi", "output"),
+                                 chain(("query", "question", "decompose", "question"),
+                                       ("decompose", "values", "multi", "queries"),
+                                       ("multi", "evidence", "output", "evidence")))
+
+    assert validate_workflow(definition, registry) == []
+
+
+def test_draft_and_evidence_must_come_from_the_same_producer() -> None:
+    """引用校验只能校验生成节点真正见过的那份证据，否则联网补充的网页块会绕过逐字校验。"""
+    split = make_definition(
+        nodes_named("query", "dense", "gate", "generation", "citation", "output"),
+        chain(
+            ("query", "question", "generation", "question"),
+            ("query", "question", "dense", "question"),
+            ("dense", "evidence", "gate", "evidence"),
+            ("gate", "evidence", "generation", "evidence"),
+            ("generation", "draft", "citation", "draft"),
+            ("gate", "evidence", "citation", "evidence"),
+            ("citation", "answer", "output", "answer"),
+        ),
+    )
+
+    issues = validate_workflow(split, gated_registry())
+
+    assert [issue.code for issue in issues] == ["PROVENANCE_MISMATCH"]
+    assert issues[0].node_id == "citation"
+
+
+def test_activation_must_reference_a_declared_input_port() -> None:
+    registry = make_registry(
+        StubNode("query.input", "Query", "input", outputs={"question": "string"}),
+        StubNode("question.rewrite", "Rewrite", "question", inputs={"question": "string"},
+                 outputs={"value": "string"}),
+        StubNode("answer.output", "Answer", "output", inputs={"value": "string"}),
+    )
+    definition = make_definition(
+        [{"id": "query", "type": "query.input"},
+         {"id": "rewrite", "type": "question.rewrite",
+          "activation": {"port": "route", "equals": "rewrite"}},
+         {"id": "output", "type": "answer.output"}],
+        chain(("query", "question", "rewrite", "question"),
+              ("rewrite", "value", "output", "value")),
+    )
+
+    issues = validate_workflow(definition, registry)
+
+    assert [(issue.code, issue.node_id) for issue in issues] == [("INVALID_ACTIVATION", "rewrite")]

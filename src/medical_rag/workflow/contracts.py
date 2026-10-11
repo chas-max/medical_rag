@@ -1,11 +1,12 @@
 """Runtime contracts shared by workflow nodes and the execution engine."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, Protocol, Union
 
-NodeTraceStatus = Literal["pending", "running", "success", "skipped", "failed"]
-NodeResultStatus = Literal["success", "skipped", "failed"]
+NodeTraceStatus = Literal["pending", "running", "success", "skipped", "inactive", "halt",
+                          "failed"]
+NodeResultStatus = Literal["success", "skipped", "failed", "halt"]
 
 # 全局内置能力：由运行时决定，节点只读取，不再由工作流或单个节点配置。
 CAPABILITY_WEB_SEARCH = "web_search"
@@ -24,9 +25,75 @@ StreamEvent = dict[str, object]
 StreamEmitter = Callable[[StreamEvent], None]
 
 
+@dataclass(frozen=True)
+class PortSpec:
+    """One input port: its dtype plus how many producers may connect to it.
+
+    ``optional`` ports may stay unconnected, which is what lets a node be deleted
+    from a graph without breaking its consumers. ``collect`` ports accept any
+    number of edges and receive them as a list, so fan-in is a declared property
+    of the port instead of an accident of how many edges happen to be wired.
+    """
+
+    name: str
+    dtype: str
+    optional: bool = False
+    collect: bool = False
+    requires_tag: str | None = None
+
+
+DeclaredPort = Union[str, PortSpec]
+
+
+def list_item(dtype: str) -> str | None:
+    """Return ``T`` for a ``list<T>`` dtype, else ``None``."""
+    if dtype.startswith("list<") and dtype.endswith(">"):
+        return dtype[len("list<"):-1]
+    return None
+
+
+def port_accepts(source_dtype: str, target: PortSpec) -> bool:
+    """Check one edge's types, allowing a collect port to swallow ``list<T>`` producers."""
+    if source_dtype == target.dtype:
+        return True
+    return target.collect and list_item(source_dtype) == target.dtype
+
+
+def port_spec(name: str, declared: DeclaredPort) -> PortSpec:
+    """Read a bare dtype string as the shorthand for a required single-value port."""
+    if isinstance(declared, PortSpec):
+        return declared
+    return PortSpec(name=name, dtype=declared)
+
+
+def port_specs(ports: Mapping[str, DeclaredPort]) -> dict[str, PortSpec]:
+    return {name: port_spec(name, declared) for name, declared in ports.items()}
+
+
+def node_inputs(node: "Node") -> dict[str, PortSpec]:
+    return port_specs(node.inputs)
+
+
+def node_tags(node: "Node") -> frozenset[str]:
+    """Capabilities a node's outputs vouch for, used by port ``requires_tag``."""
+    return frozenset(getattr(node, "tags", ()))
+
+
+def node_shared_producers(node: "Node") -> tuple[tuple[str, str], ...]:
+    """Port pairs that must be fed by the same producer node."""
+    return tuple(tuple(pair) for pair in getattr(node, "shared_producers", ()))
+
+
 def supports(capabilities: dict[str, bool] | None, name: str) -> bool:
     """Report whether a global capability is active for the current run."""
     return bool((capabilities or {}).get(name))
+
+
+@dataclass(frozen=True)
+class Halt:
+    """A handler's way of saying: publish these outputs and prune my subtree."""
+
+    outputs: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -60,7 +127,7 @@ class Node(Protocol):
     type: str
     title: str
     category: str
-    inputs: dict[str, str]
+    inputs: dict[str, DeclaredPort]
     outputs: dict[str, str]
     config_schema: dict[str, object]
 

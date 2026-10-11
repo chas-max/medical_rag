@@ -62,7 +62,7 @@ curl.exe -X DELETE http://127.0.0.1:8000/settings/model/deepseek-chat
 
 ## 工作流与前端
 
-默认流程位于 `workflows/*.v*.json`：`medical-answer` 已发布两个版本，v2（当前生效）把引用校验的证据改接生成节点；v1 保留为引用校验接证据门控的历史接线，同一次联网检索因证据未接过去而仍会拒答，可用来对照证据流向的影响。`medical-answer-expanded` 走问题路由与扩展检索；`medical-search` 负责检索；`document-ingestion` 负责上传解析、分块、向量化和入库。现有 `/answers`、`/search`、`/documents` 经默认流程执行。`GET /nodes` 返回节点库的类型、分类、输入输出端口和配置 Schema；`GET /workflows` 只列已发布版本。编辑器可拖拽、连线、修改参数、复制或删除节点；校验后发布为不可覆盖的新版本，运行记录显示逐节点状态与耗时。草稿允许暂时不完整，但不能直接运行；问答页只使用已发布版本。工作流 JSON 不保存模型密钥；新增能力可注册新 Node 并连入工作流。联网检索不属于可插拔节点，它是每条工作流都有的全局内置能力，见下节。
+默认流程位于 `workflows/*.v*.json`：`medical-answer` 的 v2（当前生效）把引用校验的证据改接生成节点；v1 保留同样的历史接线但降为草稿，作为"证据流向接错"的反例——这种接线现在会被校验器以 `PROVENANCE_MISMATCH` 直接拒绝，它仍可由引擎直接执行来复现"联网检索到了补充证据、结论却依旧被拒"的效果（见 `tests/test_workflow_nodes.py`）。`medical-answer-expanded` 用节点实例上的 `activation` 做问题路由，`merge.collect` 合流后交给 `retrieval.multi` 多路检索；`medical-answer-decompose` 是"不路由、只用问题分解"的形态（原问题与两个子问题各走一路检索）；`medical-answer-direct` 则完全没有提前检索，也没有重排和融合，直连问答；`medical-search` 负责检索；`document-ingestion` 负责上传解析、分块、向量化和入库。检索前处理的可插拔来自三件事：输入端口可以声明为 `optional`（不连线也能发布）、`collect`（任意多个上游收成列表）、路由写在图上的 `activation` 而不是节点代码里；`question.select` 与 `retrieval.expanded` 这类"把几种策略焊在一起"的节点因此被删除，HyDE 等改写节点的输出就是普通 `string`／`list<string>`。现有 `/answers`、`/search`、`/documents` 经默认流程执行。`GET /nodes` 返回节点库的类型、分类、输入输出端口和配置 Schema；输入端口还带 `optional`（可不连线）、`collect`（可接多条边并收成列表）、`requires_tag`（上游必经的安全环节），节点另有 `tags` 与 `shared_producers`（两端口的值必须来自同一节点）。`GET /workflows` 只列已发布版本。编辑器可拖拽、连线、修改参数、复制或删除节点；节点实例还可以声明 `activation`（某个入参等于指定值时才执行），这就是问题路由的开关——不想要路由就把 router 节点删掉，被选中的分支由 `collect` 端口汇聚；属性面板底部的「执行条件（路由）」负责编辑它，`optional` 端口在节点上画成空心把手，未选中的分支在运行记录里显示为 `inactive`。节点返回 `halt` 时引擎剪掉它的整棵下游子树并把这份结果作为运行输出（证据门控的拒答走的就是这条路）。校验后发布为不可覆盖的新版本，运行记录显示逐节点状态与耗时（新增 `inactive`、`halt` 两种状态）。草稿允许暂时不完整，但不能直接运行；问答页只使用已发布版本。工作流 JSON 不保存模型密钥；新增能力可注册新 Node 并连入工作流。联网检索不属于可插拔节点，它是每条工作流都有的全局内置能力，见下节。节点解耦契约的完整设计见 `docs/decoupled-workflow-nodes.md`。
 
 问答页支持会话切换、本地浏览器历史、资料上传和引用原文面板。问答页默认收起工作流和证据数高级设置；回答按要点展示，引用编号可打开来源原文，不显示运行 ID。会话只存当前浏览器的 `localStorage`，不是服务器账户数据；不要输入患者隐私资料。编辑器的“运行已发布版”执行的是后端当前发布版本，尚未发布的画布修改不会参与运行。当前无用户鉴权，工作流编辑 API 也不能直接暴露到公网。
 
@@ -70,7 +70,7 @@ curl.exe -X DELETE http://127.0.0.1:8000/settings/model/deepseek-chat
 
 生成提示词要求**每条结论只摘一句原文短句**，而不是整段证据：excerpt 越长，模型越容易在跨行或顺手改写时对不上原文，整条结论会被逐字校验丢掉——同一批证据下实测可展示结论从 1 条变成 4–6 条。因此「回答要点变少」先看检索到的证据块内容，而不是先怀疑流式链路。
 
-工作流 API 为 `GET /nodes`、`GET/POST /workflows`、`GET/PUT /workflows/{id}`、`POST /workflows/{id}/validate`、`POST /workflows/{id}/runs`、`POST /workflows/{id}/runs/stream`（`text/event-stream`，事件为 `status` / `claim` / `done` / `error`）和 `GET /runs/{run_id}`。例如：
+工作流 API 为 `GET /nodes`、`GET/POST /workflows`、`GET/PUT /workflows/{id}`、`POST /workflows/{id}/validate`、`GET /workflows/{id}/run-schema`、`POST /workflows/{id}/runs`、`POST /workflows/{id}/runs/stream`（`text/event-stream`，事件为 `status` / `claim` / `done` / `error`）和 `GET /runs/{run_id}`。`run-schema` 由图推导：输入节点的每个输出端口就是一个运行入参，`required` 取决于该端口是否被下游连线用掉，服务层不再按工作流 ID 维护字段白名单（入参校验写在 `query.input` 节点里，它抛出 `INVALID_QUERY`／`INVALID_PROVIDER` 后由服务层映射回 422）。例如：
 
 ```powershell
 curl.exe -H "Content-Type: application/json" -d '{"inputs":{"question":"高血压如何随访？","provider":"qwen","top_k":5}}' http://127.0.0.1:8000/workflows/medical-answer/runs

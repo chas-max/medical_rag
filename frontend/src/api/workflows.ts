@@ -1,11 +1,27 @@
 import { base, json, request } from "./client";
 
+/**
+ * One input port. `optional` ports may stay unconnected, `collect` ports accept
+ * several edges and receive them as a list, and `requires_tag` names a safety
+ * step every path into this port must pass through.
+ */
+export interface PortInfo {
+  dtype: string;
+  optional: boolean;
+  collect: boolean;
+  requires_tag: string | null;
+}
+
 export interface NodeMetadata {
   type: string;
   title: string;
   category: string;
-  inputs: Record<string, string>;
+  inputs: Record<string, PortInfo>;
   outputs: Record<string, string>;
+  /** 该节点为其输出背书的安全环节。 */
+  tags?: string[];
+  /** 这些端口的值必须来自同一个上游节点。 */
+  shared_producers?: [string, string][];
   /** 输入/输出类节点常驻工作流，画布上不可随手删除。 */
   fixed?: boolean;
   /** 同类别缺失时由编辑器补回的规范节点。 */
@@ -22,11 +38,18 @@ export interface NodeMetadata {
   >;
 }
 
+/** 节点实例级的路由条件：某个入参等于指定值时才执行。 */
+export interface NodeActivation {
+  port: string;
+  equals: string | number | boolean | null;
+}
+
 export interface WorkflowNode {
   id: string;
   type: string;
   position: { x: number; y: number };
   config: Record<string, string | number | boolean | null>;
+  activation?: NodeActivation | null;
 }
 
 export interface WorkflowEdge {

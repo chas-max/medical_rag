@@ -2,7 +2,7 @@
   "id": "medical-answer",
   "name": "医疗资料问答",
   "version": 1,
-  "status": "published",
+  "status": "draft",
   "nodes": [
     {"id":"query","type":"query.input","position":{"x":80,"y":180},"config":{}},
     {"id":"dense","type":"retrieval.dense","position":{"x":330,"y":60},"config":{}},
@@ -17,8 +17,8 @@
   "edges": [
     {"id":"q-d","source":"query","source_port":"question","target":"dense","target_port":"question"},
     {"id":"q-b","source":"query","source_port":"question","target":"bm25","target_port":"question"},
-    {"id":"d-f","source":"dense","source_port":"evidence","target":"fusion","target_port":"dense"},
-    {"id":"b-f","source":"bm25","source_port":"evidence","target":"fusion","target_port":"bm25"},
+    {"id":"d-f","source":"dense","source_port":"evidence","target":"fusion","target_port":"sources"},
+    {"id":"b-f","source":"bm25","source_port":"evidence","target":"fusion","target_port":"sources"},
     {"id":"f-r","source":"fusion","source_port":"evidence","target":"rerank","target_port":"evidence"},
     {"id":"q-r","source":"query","source_port":"question","target":"rerank","target_port":"question"},
     {"id":"q-k","source":"query","source_port":"top_k","target":"rerank","target_port":"top_k"},

@@ -19,8 +19,10 @@ def _stream_events(payload: dict) -> list[dict]:
     return [{"event": "claim", "data": payload}]
 
 
-def draft(inputs: dict, config: dict, context: ExecutionContext, generator: object) -> dict:
+def draft(inputs: dict, config: dict, context: ExecutionContext, generator: object,
+          default_provider: str) -> dict:
     web_search = supports(context.capabilities, CAPABILITY_WEB_SEARCH)
+    provider = inputs.get("provider") or default_provider
     emit = context.emit
     if emit is not None:
         # 生成一段带证据的回答要十几到几十秒，先把检索结果数量推给前端，
@@ -39,10 +41,10 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
         # 于是弱证据不补充检索、检索落空也不再交给生成阶段兜底（状态帧却还写着 true）。
         # draft() 只有本仓库的生成器提供；缺失时退回旧的 generate_stream 契约，后者只推结论。
         streamer = getattr(generator, "draft", None) or generator.generate_stream
-        result = streamer(inputs["question"], inputs["evidence"], inputs["provider"],
+        result = streamer(inputs["question"], inputs["evidence"], provider,
                           web_search=web_search, on_claim=publish)
     else:
-        result = generator.generate(inputs["question"], inputs["evidence"], inputs["provider"],
+        result = generator.generate(inputs["question"], inputs["evidence"], provider,
                                     web_search=web_search)
     # Web hits are evidence only for this node, so citation checking must see the same set.
     return {"draft": result["draft"], "evidence": result["evidence"]}

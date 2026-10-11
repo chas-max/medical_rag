@@ -1,9 +1,12 @@
-"""Qwen-routed user-question transformations; generated text is never evidence."""
+"""Question transformations; generated text is never evidence.
+
+每个节点都只做一件事，并且不感知路由：要不要走某条改写分支由图上的
+`activation` 决定，几个分支的结果如何合流由 `merge.collect` 决定。
+"""
 
 import json
 
-from ..contracts import ExecutionContext, NodeResult
-from .base import BuiltinNode
+from ..contracts import ExecutionContext
 
 ROUTES = frozenset({"direct", "rewrite", "decompose", "hyde", "stepback"})
 PROMPTS = {
@@ -35,14 +38,17 @@ def _question(value: object) -> str | None:
     return clean if 0 < len(clean) <= 256 else None
 
 
-def _variant(questions: list[str], hypothetical: str | None = None) -> dict:
-    return {"variant": {"active": True, "questions": questions, "hypothetical": hypothetical}}
+def _provider(inputs: dict, default_provider: str) -> str:
+    """provider 是这次调用的配置，没连线时用运行默认值。"""
+    value = inputs.get("provider")
+    return value if isinstance(value, str) and value else default_provider
 
 
-def route_question(inputs: dict, config: dict, context: ExecutionContext, transport: object) -> dict[str, str]:
+def route_question(inputs: dict, config: dict, context: ExecutionContext, transport: object,
+                   default_provider: str) -> dict[str, str]:
     value = _complete(
         transport,
-        inputs["provider"],
+        _provider(inputs, default_provider),
         "将问题分类为 direct、rewrite、decompose、hyde、stepback 中唯一一类；"
         "清晰单一问题选 direct，多子目标选 decompose，含混表达选 rewrite，"
         "语义模拟检索选 hyde，需上位概念选 stepback。仅输出 JSON：{\"route\":\"...\"}。",
@@ -52,58 +58,37 @@ def route_question(inputs: dict, config: dict, context: ExecutionContext, transp
     return {"route": chosen if isinstance(chosen, str) and chosen in ROUTES else "direct"}
 
 
-def rewrite(inputs: dict, config: dict, context: ExecutionContext, transport: object) -> dict:
-    value = _complete(transport, inputs["provider"], PROMPTS["rewrite"], inputs["question"])
-    return _variant([_question(value.get("question")) or inputs["question"]])
+def rewrite(inputs: dict, config: dict, context: ExecutionContext, transport: object,
+            default_provider: str) -> dict:
+    value = _complete(transport, _provider(inputs, default_provider), PROMPTS["rewrite"],
+                      inputs["question"])
+    return {"query": _question(value.get("question")) or inputs["question"].strip()}
 
 
-def decompose(inputs: dict, config: dict, context: ExecutionContext, transport: object) -> dict:
-    value = _complete(transport, inputs["provider"], PROMPTS["decompose"], inputs["question"])
+def decompose(inputs: dict, config: dict, context: ExecutionContext, transport: object,
+              default_provider: str) -> dict:
+    value = _complete(transport, _provider(inputs, default_provider), PROMPTS["decompose"],
+                      inputs["question"])
     items = value.get("questions")
     questions = ([_question(item) for item in items]
                  if isinstance(items, list) and 1 <= len(items) <= 3 else [])
-    return _variant(questions if questions and all(questions) else [inputs["question"]])
+    if not questions or not all(questions):
+        return {"queries": [inputs["question"].strip()]}
+    return {"queries": questions}
 
 
-def hyde(inputs: dict, config: dict, context: ExecutionContext, transport: object) -> dict:
-    value = _complete(transport, inputs["provider"], PROMPTS["hyde"], inputs["question"])
+def hyde(inputs: dict, config: dict, context: ExecutionContext, transport: object,
+         default_provider: str) -> dict:
+    value = _complete(transport, _provider(inputs, default_provider), PROMPTS["hyde"],
+                      inputs["question"])
     text = value.get("hypothetical")
     if not isinstance(text, str) or not 0 < len(text.strip()) <= 600:
-        return _variant([inputs["question"]])
-    return _variant([], text.strip())
+        return {"query": inputs["question"].strip()}
+    return {"query": text.strip()}
 
 
-def stepback(inputs: dict, config: dict, context: ExecutionContext, transport: object) -> dict:
-    value = _complete(transport, inputs["provider"], PROMPTS["stepback"], inputs["question"])
-    return _variant([_question(value.get("question")) or inputs["question"]])
-
-
-class RoutedQuestionNode(BuiltinNode):
-    """Skip the unselected route and expose a typed inactive placeholder."""
-
-    async def execute(self, inputs: dict, config: dict, context: ExecutionContext) -> NodeResult:
-        if inputs["route"] != self.type.rsplit(".", 1)[-1]:
-            return NodeResult(
-                {"variant": {"active": False, "questions": [], "hypothetical": None}},
-                "skipped",
-            )
-        return await super().execute(inputs, config, context)
-
-
-def select(inputs: dict, config: dict, context: ExecutionContext) -> dict:
-    original = inputs["question"].strip()
-    route = inputs["route"]
-    selected = inputs[route] if route != "direct" else None
-    if route != "direct" and not selected["active"]:
-        raise ValueError("所选问题分支未生成结果")
-    questions = [original]
-    hypothetical = None
-    if selected is not None:
-        for question in selected["questions"]:
-            clean = question.strip()
-            if clean and clean not in questions:
-                questions.append(clean)
-        candidate = selected["hypothetical"]
-        if candidate is not None and candidate.strip() not in questions:
-            hypothetical = candidate.strip()
-    return {"query_plan": {"questions": questions, "hypothetical": hypothetical}}
+def stepback(inputs: dict, config: dict, context: ExecutionContext, transport: object,
+             default_provider: str) -> dict:
+    value = _complete(transport, _provider(inputs, default_provider), PROMPTS["stepback"],
+                      inputs["question"])
+    return {"query": _question(value.get("question")) or inputs["question"].strip()}

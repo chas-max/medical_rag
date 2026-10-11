@@ -5,7 +5,11 @@ from typing import Callable
 import pytest
 
 from medical_rag.types import ApiError
-from medical_rag.workflow.contracts import ExecutionContext, NodeResult
+from medical_rag.workflow.contracts import (
+    ExecutionContext,
+    NodeResult,
+    PortSpec,
+)
 from medical_rag.workflow.definition import (
     WorkflowDefinition,
     WorkflowEdge,
@@ -23,7 +27,7 @@ class FunctionalNode:
     type: str
     title: str
     category: str
-    inputs: dict[str, str] = field(default_factory=dict)
+    inputs: dict[str, str | PortSpec] = field(default_factory=dict)
     outputs: dict[str, str] = field(default_factory=dict)
     config_schema: dict[str, object] = field(default_factory=dict)
     function: NodeFunction | None = None
@@ -235,13 +239,13 @@ async def test_engine_skips_node_when_required_upstream_output_is_absent() -> No
 
 
 @pytest.mark.asyncio
-async def test_engine_skips_generation_after_evidence_gate_abstains() -> None:
+async def test_engine_prunes_downstream_when_a_node_halts() -> None:
     order: list[str] = []
 
-    def result_for(name: str, outputs: dict[str, object]) -> NodeFunction:
+    def result_for(name: str, outputs: dict[str, object], status: str = "success") -> NodeFunction:
         def execute(inputs: dict[str, object], context: ExecutionContext) -> NodeResult:
             order.append(name)
-            return NodeResult(outputs=outputs, status="success")
+            return NodeResult(outputs=outputs, status=status)
 
         return execute
 
@@ -259,7 +263,7 @@ async def test_engine_skips_generation_after_evidence_gate_abstains() -> None:
             "evidence",
             inputs={"question": "string"},
             outputs={"answer": "string", "abstained": "boolean"},
-            function=result_for("gate", {"answer": "资料不足", "abstained": True}),
+            function=result_for("gate", {"answer": "资料不足", "abstained": True}, "halt"),
         ),
         FunctionalNode(
             "generation.llm",
@@ -507,7 +511,7 @@ async def test_engine_collects_multiple_edges_into_a_list_for_the_same_port() ->
             "join.node",
             "Join",
             "output",
-            inputs={"values": "string"},
+            inputs={"values": PortSpec("values", "string", collect=True)},
             function=lambda inputs, context: NodeResult(
                 outputs={"values": inputs["values"]}, status="success"
             ),
@@ -558,7 +562,8 @@ async def test_engine_collects_multiple_edges_into_a_list_for_the_same_port() ->
 
 
 @pytest.mark.asyncio
-async def test_engine_skips_join_when_any_required_fan_in_value_is_absent() -> None:
+async def test_collect_port_receives_whatever_its_producers_published() -> None:
+    """A collect join runs on the branches that produced values; absence is not a stall."""
     called: list[str] = []
     registry = make_registry(
         FunctionalNode(
@@ -586,13 +591,13 @@ async def test_engine_skips_join_when_any_required_fan_in_value_is_absent() -> N
             "retrieval",
             inputs={"question": "string"},
             outputs={"value": "string"},
-            function=lambda inputs, context: NodeResult(outputs={}, status="success"),
+            function=lambda inputs, context: NodeResult(outputs={}, status="skipped"),
         ),
         FunctionalNode(
             "join.node",
             "Join",
             "output",
-            inputs={"values": "string"},
+            inputs={"values": PortSpec("values", "string", collect=True)},
             function=lambda inputs, context: called.append("join")
             or NodeResult(outputs={"values": inputs["values"]}, status="success"),
         ),
@@ -638,68 +643,325 @@ async def test_engine_skips_join_when_any_required_fan_in_value_is_absent() -> N
 
     result = await WorkflowEngine(registry).run(definition, {"question": "q"})
 
-    assert called == []
-    assert result.trace_by_node("join").status == "skipped"
+    assert called == ["join"]
+    assert result.output == {"values": ["one"]}
 
 
 @pytest.mark.asyncio
-async def test_explicit_skipped_result_can_supply_join_placeholder() -> None:
+async def test_skipped_node_publishes_nothing_and_optional_ports_absorb_the_gap() -> None:
+    """skipped 不再发布占位输出：缺口由 optional/collect 端口吸收。"""
     registry = make_registry(
         FunctionalNode(
             "query.input",
             "Input",
             "input",
-            outputs={"route": "string"},
-            function=lambda inputs, context: NodeResult({"route": "direct"}, "success"),
+            outputs={"question": "string"},
+            function=lambda inputs, context: NodeResult({"question": "q"}, "success"),
         ),
         FunctionalNode(
-            "branch.skip",
-            "Skip",
+            "question.hyde",
+            "Hyde",
             "question",
-            inputs={"route": "string"},
-            outputs={"variant": "query_variant"},
+            inputs={"question": "string"},
+            outputs={"query": "string"},
+            function=lambda inputs, context: NodeResult({"query": "不该出现在下游"}, "skipped"),
+        ),
+        FunctionalNode(
+            "merge.collect",
+            "Merge",
+            "question",
+            inputs={"question": "string",
+                    "items": PortSpec("items", "string", optional=True, collect=True)},
+            outputs={"values": "list<string>"},
             function=lambda inputs, context: NodeResult(
-                {"variant": {"active": False}}, "skipped"
+                {"values": [inputs["question"], *inputs.get("items", [])]}, "success"
             ),
         ),
         FunctionalNode(
-            "join.node",
-            "Join",
+            "search.output",
+            "Search",
             "output",
-            inputs={"variant": "query_variant"},
-            outputs={"answer": "string"},
-            function=lambda inputs, context: NodeResult(
-                {"answer": "original" if not inputs["variant"]["active"] else "changed"},
-                "success",
-            ),
+            inputs={"values": "list<string>"},
+            outputs={"values": "list<string>"},
         ),
     )
     definition = make_definition(
         [
             {"id": "query", "type": "query.input"},
-            {"id": "branch", "type": "branch.skip"},
-            {"id": "join", "type": "join.node"},
+            {"id": "hyde", "type": "question.hyde"},
+            {"id": "merge", "type": "merge.collect"},
+            {"id": "output", "type": "search.output"},
         ],
         [
             {
                 "id": "e1",
                 "source": "query",
-                "source_port": "route",
-                "target": "branch",
-                "target_port": "route",
+                "source_port": "question",
+                "target": "hyde",
+                "target_port": "question",
             },
             {
                 "id": "e2",
-                "source": "branch",
-                "source_port": "variant",
-                "target": "join",
-                "target_port": "variant",
+                "source": "hyde",
+                "source_port": "query",
+                "target": "merge",
+                "target_port": "items",
+            },
+            {
+                "id": "e3",
+                "source": "query",
+                "source_port": "question",
+                "target": "merge",
+                "target_port": "question",
+            },
+            {
+                "id": "e4",
+                "source": "merge",
+                "source_port": "values",
+                "target": "output",
+                "target_port": "values",
             },
         ],
     )
 
-    result = await WorkflowEngine(registry).run(definition, {})
+    result = await WorkflowEngine(registry).run(definition, {"question": "q"})
 
-    assert result.output == {"answer": "original"}
-    assert result.trace_by_node("branch").status == "skipped"
-    assert result.trace_by_node("join").status == "success"
+    assert result.status == "success"
+    assert result.trace_by_node("hyde").status == "skipped"
+    assert result.output == {"values": ["q"]}
+
+
+@pytest.mark.asyncio
+async def test_activation_decides_the_branch_and_inactive_nodes_do_not_run() -> None:
+    """路由条件写在图上：不匹配的节点既不执行，也不向下游发布任何值。"""
+    order: list[str] = []
+
+    def record(name: str, outputs: dict[str, object]) -> NodeFunction:
+        def execute(inputs: dict[str, object], context: ExecutionContext) -> NodeResult:
+            order.append(name)
+            return NodeResult(outputs=outputs, status="success")
+
+        return execute
+
+    registry = make_registry(
+        FunctionalNode("query.input", "Query", "input", outputs={"question": "string"},
+                       function=record("query", {"question": "q"})),
+        FunctionalNode("question.router", "Router", "question", inputs={"question": "string"},
+                       outputs={"route": "selector"}, function=record("router", {"route": "rewrite"})),
+        FunctionalNode("question.rewrite", "Rewrite", "question",
+                       inputs={"question": "string",
+                               "route": PortSpec("route", "selector", optional=True)},
+                       outputs={"value": "string"}, function=record("rewrite", {"value": "改写问题"})),
+        FunctionalNode("question.hyde", "Hyde", "question",
+                       inputs={"question": "string",
+                               "route": PortSpec("route", "selector", optional=True)},
+                       outputs={"value": "string"}, function=record("hyde", {"value": "模拟答案"})),
+        FunctionalNode("merge.first_active", "Merge", "question",
+                       inputs={"question": "string",
+                               "candidates": PortSpec("candidates", "string", optional=True,
+                                                      collect=True)},
+                       outputs={"query": "string"},
+                       function=lambda inputs, context: NodeResult(
+                           outputs={"query": (inputs.get("candidates") or [inputs["question"]])[0]},
+                           status="success")),
+        FunctionalNode("search.output", "Search", "output", inputs={"query": "string"},
+                       outputs={"query": "string"}),
+    )
+    definition = WorkflowDefinition(
+        id="demo", name="Demo", version=1, status="draft",
+        nodes=[
+            WorkflowNode(id="query", type="query.input"),
+            WorkflowNode(id="router", type="question.router"),
+            WorkflowNode(id="rewrite", type="question.rewrite",
+                         activation={"port": "route", "equals": "rewrite"}),
+            WorkflowNode(id="hyde", type="question.hyde",
+                         activation={"port": "route", "equals": "hyde"}),
+            WorkflowNode(id="merge", type="merge.first_active"),
+            WorkflowNode(id="output", type="search.output"),
+        ],
+        edges=[
+            WorkflowEdge(id="q-r", source="query", source_port="question",
+                         target="router", target_port="question"),
+            WorkflowEdge(id="q-w", source="query", source_port="question",
+                         target="rewrite", target_port="question"),
+            WorkflowEdge(id="q-h", source="query", source_port="question",
+                         target="hyde", target_port="question"),
+            WorkflowEdge(id="r-w", source="router", source_port="route",
+                         target="rewrite", target_port="route"),
+            WorkflowEdge(id="r-h", source="router", source_port="route",
+                         target="hyde", target_port="route"),
+            WorkflowEdge(id="q-m", source="query", source_port="question",
+                         target="merge", target_port="question"),
+            WorkflowEdge(id="w-m", source="rewrite", source_port="value",
+                         target="merge", target_port="candidates"),
+            WorkflowEdge(id="h-m", source="hyde", source_port="value",
+                         target="merge", target_port="candidates"),
+            WorkflowEdge(id="m-o", source="merge", source_port="query",
+                         target="output", target_port="query"),
+        ],
+    )
+
+    result = await WorkflowEngine(registry).run(definition, {"question": "q"})
+
+    assert result.status == "success"
+    assert order == ["query", "router", "rewrite"]
+    assert result.trace_by_node("hyde").status == "inactive"
+    assert result.trace_by_node("rewrite").status == "success"
+    # 只有被选中的分支向汇聚端口贡献了一个值，未被选中的分支什么都不会发布。
+    assert result.output == {"query": "改写问题"}
+
+
+@pytest.mark.asyncio
+async def test_unconnected_optional_port_still_runs_the_node() -> None:
+    registry = make_registry(
+        FunctionalNode("query.input", "Query", "input", outputs={"question": "string"}),
+        FunctionalNode(
+            "question.rewrite", "Rewrite", "question",
+            inputs={"question": "string", "route": PortSpec("route", "selector", optional=True)},
+            outputs={"value": "string"},
+            function=lambda inputs, context: NodeResult(
+                outputs={"value": f"{inputs['question']}:{inputs.get('route')}"}, status="success"),
+        ),
+        FunctionalNode("search.output", "Search", "output", inputs={"value": "string"},
+                       outputs={"value": "string"}),
+    )
+    definition = make_definition(
+        [
+            {"id": "query", "type": "query.input"},
+            {"id": "rewrite", "type": "question.rewrite"},
+            {"id": "output", "type": "search.output"},
+        ],
+        [
+            {"id": "e1", "source": "query", "source_port": "question",
+             "target": "rewrite", "target_port": "question"},
+            {"id": "e2", "source": "rewrite", "source_port": "value",
+             "target": "output", "target_port": "value"},
+        ],
+    )
+
+    result = await WorkflowEngine(registry).run(definition, {"question": "q"})
+
+    assert result.status == "success"
+    assert result.output == {"value": "q:None"}
+
+
+@pytest.mark.asyncio
+async def test_collect_port_flattens_a_list_producer_into_items() -> None:
+    registry = make_registry(
+        FunctionalNode("query.input", "Query", "input", outputs={"question": "string"}),
+        FunctionalNode("question.decompose", "Decompose", "question", inputs={"question": "string"},
+                       outputs={"values": "list<string>"},
+                       function=lambda inputs, context: NodeResult(
+                           outputs={"values": ["a", "b"]}, status="success")),
+        FunctionalNode("merge.collect", "Merge", "question",
+                       inputs={"items": PortSpec("items", "string", collect=True)},
+                       outputs={"value": "string"},
+                       function=lambda inputs, context: NodeResult(
+                           outputs={"value": "|".join(inputs["items"])}, status="success")),
+        FunctionalNode("search.output", "Search", "output", inputs={"value": "string"},
+                       outputs={"value": "string"}),
+    )
+    definition = make_definition(
+        [
+            {"id": "query", "type": "query.input"},
+            {"id": "decompose", "type": "question.decompose"},
+            {"id": "merge", "type": "merge.collect"},
+            {"id": "output", "type": "search.output"},
+        ],
+        [
+            {"id": "e1", "source": "query", "source_port": "question",
+             "target": "decompose", "target_port": "question"},
+            {"id": "e2", "source": "decompose", "source_port": "values",
+             "target": "merge", "target_port": "items"},
+            {"id": "e3", "source": "merge", "source_port": "value",
+             "target": "output", "target_port": "value"},
+        ],
+    )
+
+    result = await WorkflowEngine(registry).run(definition, {"question": "q"})
+
+    assert result.output == {"value": "a|b"}
+
+
+@pytest.mark.asyncio
+async def test_collect_port_orders_values_by_execution_not_edge_order() -> None:
+    registry = make_registry(
+        FunctionalNode("query.input", "Query", "input", outputs={"question": "string"},
+                       function=lambda inputs, context: NodeResult(
+                           outputs={"question": "q"}, status="success")),
+        FunctionalNode("branch.first", "First", "transform", inputs={"question": "string"},
+                       outputs={"value": "string"},
+                       function=lambda inputs, context: NodeResult(outputs={"value": "first"},
+                                                                   status="success")),
+        FunctionalNode("branch.second", "Second", "transform", inputs={"prior": "string"},
+                       outputs={"value": "string"},
+                       function=lambda inputs, context: NodeResult(outputs={"value": "second"},
+                                                                   status="success")),
+        FunctionalNode("join.node", "Join", "output",
+                       inputs={"values": PortSpec("values", "string", collect=True)}),
+    )
+    definition = make_definition(
+        [
+            {"id": "query", "type": "query.input"},
+            {"id": "second", "type": "branch.second"},
+            {"id": "first", "type": "branch.first"},
+            {"id": "join", "type": "join.node"},
+        ],
+        # second 排在 first 之后执行，但它的连线写在 JSON 前面；
+        # 汇聚端口按执行次序收值，而不是按连线的书写次序。
+        [
+            {"id": "e1", "source": "query", "source_port": "question",
+             "target": "first", "target_port": "question"},
+            {"id": "f-s", "source": "first", "source_port": "value",
+             "target": "second", "target_port": "prior"},
+            {"id": "s-j", "source": "second", "source_port": "value",
+             "target": "join", "target_port": "values"},
+            {"id": "f-j", "source": "first", "source_port": "value",
+             "target": "join", "target_port": "values"},
+        ],
+    )
+
+    result = await WorkflowEngine(registry).run(definition, {"question": "q"})
+
+    assert result.output == {"values": ["first", "second"]}
+
+
+@pytest.mark.asyncio
+async def test_halt_prunes_only_the_halting_nodes_downstream() -> None:
+    registry = make_registry(
+        FunctionalNode("query.input", "Query", "input", outputs={"question": "string"}),
+        FunctionalNode("evidence.gate", "Gate", "evidence", inputs={"question": "string"},
+                       outputs={"answer": "string"},
+                       function=lambda inputs, context: NodeResult(
+                           outputs={"answer": "现有资料不足"}, status="halt")),
+        FunctionalNode("answer.output", "Output", "output", inputs={"answer": "string"},
+                       outputs={"answer": "string"}),
+        FunctionalNode("audit.record", "Audit", "audit", inputs={"question": "string"},
+                       outputs={"recorded": "boolean"},
+                       function=lambda inputs, context: NodeResult(
+                           outputs={"recorded": True}, status="success")),
+    )
+    definition = make_definition(
+        [
+            {"id": "query", "type": "query.input"},
+            {"id": "gate", "type": "evidence.gate"},
+            {"id": "output", "type": "answer.output"},
+            {"id": "audit", "type": "audit.record"},
+        ],
+        [
+            {"id": "q-g", "source": "query", "source_port": "question",
+             "target": "gate", "target_port": "question"},
+            {"id": "g-o", "source": "gate", "source_port": "answer",
+             "target": "output", "target_port": "answer"},
+            {"id": "q-a", "source": "query", "source_port": "question",
+             "target": "audit", "target_port": "question"},
+        ],
+    )
+
+    result = await WorkflowEngine(registry).run(definition, {"question": "q"})
+
+    assert result.status == "success"
+    assert result.output == {"answer": "现有资料不足"}
+    assert result.trace_by_node("gate").status == "halt"
+    assert result.trace_by_node("output").status == "skipped"
+    assert result.trace_by_node("audit").status == "success"

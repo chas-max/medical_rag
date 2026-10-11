@@ -77,7 +77,7 @@ def test_expanded_workflow_routes_one_branch_and_preserves_cited_answer(
     assert len(transport.calls) == (2 if chosen == "direct" else 3)
     for name in ("rewrite", "decompose", "hyde", "stepback"):
         trace = next(item for item in data["trace"] if item["node_id"] == name)
-        assert trace["status"] == ("success" if name == chosen else "skipped")
+        assert trace["status"] == ("success" if name == chosen else "inactive")
     old = api.post("/answers", json={"question": "高血压"})
     assert old.status_code == 200
     assert service.last_workflow_id == "medical-answer"

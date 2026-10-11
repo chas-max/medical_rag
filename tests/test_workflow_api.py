@@ -44,6 +44,20 @@ def test_node_catalog_marks_input_and_output_nodes_fixed(tmp_path):
     }
 
 
+def test_run_schema_is_derived_from_the_graph(tmp_path):
+    """运行入参不再是按工作流 ID 写死的字段表：图上没连线的入参就不是必填。"""
+    api, _ = client(tmp_path)
+    wired = api.get("/workflows/medical-answer/run-schema").json()["data"]
+    direct = api.get("/workflows/medical-answer-direct/run-schema").json()["data"]
+
+    assert [(item["name"], item["dtype"], item["required"]) for item in wired] == [
+        ("provider", "string", True), ("question", "string", True), ("top_k", "integer", True)]
+    assert [(item["name"], item["required"]) for item in direct] == [
+        ("provider", False), ("question", True), ("top_k", False)]
+    assert {item["node_id"] for item in direct} == {"query"}
+    assert api.get("/workflows/does-not-exist/run-schema").json()["error"]["code"] == "WORKFLOW_NOT_FOUND"
+
+
 def test_workflow_run_and_lookup_use_envelope(tmp_path):
     api, service = client(tmp_path)
     response = api.post("/workflows/medical-answer/runs", json={"inputs": {

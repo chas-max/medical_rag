@@ -7,10 +7,14 @@ import pytest
 from medical_rag.config import Settings
 from medical_rag.generation import GroundedGenerator
 from medical_rag.tools import ToolRegistry, tavily_search_tool
-from medical_rag.types import Chunk, Evidence
+from medical_rag.types import ApiError, Chunk, Evidence
 from medical_rag.web_search import WebPage
 from medical_rag.workflow.bootstrap import build_registry
-from medical_rag.workflow.contracts import CAPABILITY_WEB_SEARCH, ExecutionContext
+from medical_rag.workflow.contracts import (
+    CAPABILITY_WEB_SEARCH,
+    ExecutionContext,
+    node_inputs,
+)
 from medical_rag.workflow.engine import WorkflowEngine
 from medical_rag.workflow.nodes import generation as generation_node
 from medical_rag.workflow.nodes.input import query_input
@@ -106,9 +110,13 @@ class WebTransport:
 def test_query_input_defaults_to_qwen_and_passes_any_vendor_label():
     context = ExecutionContext("run", "medical-answer", {})
     assert query_input({"question": "高血压"}, {}, context)["provider"] == "qwen"
+    # provider 只记录运维配了哪一档模型，不再挑凭据：任何非空名字都放行，顺带去首尾空白。
     assert query_input({"question": "高血压", "provider": " deepseek "}, {}, context)["provider"] == "deepseek"
-    with pytest.raises(ValueError, match="provider"):
-        query_input({"question": "高血压", "provider": 7}, {}, context)
+    # 入参错误由节点自己声明成请求类错误，服务层才能不靠工作流 ID 白名单回 422。
+    for unusable in (7, "   "):
+        with pytest.raises(ApiError, match="provider 需要是非空字符串") as error:
+            query_input({"question": "高血压", "provider": unusable}, {}, context)
+        assert (error.value.code, error.value.status) == ("INVALID_PROVIDER", 422)
 
 
 def test_default_graphs_are_valid():
@@ -120,16 +128,85 @@ def test_default_graphs_are_valid():
         assert validate_workflow(graph, registry) == []
 
 
-def test_expanded_graph_registers_and_validates_without_changing_defaults():
+def test_history_graph_is_rejected_for_splitting_draft_and_evidence():
+    """v1 的接线让门控证据绕过生成节点：引用校验看不到联网补充的块，现在被校验器直接拒绝。"""
     _, _, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    graph = repository.get("medical-answer-expanded")
-    assert graph.status == "published"
-    assert validate_workflow(graph, registry) == []
-    assert {"question.router", "question.rewrite", "question.decompose",
-            "question.hyde", "question.stepback", "question.select",
-            "retrieval.expanded"}.issubset({item["type"] for item in registry.metadata()})
-    assert repository.get("medical-answer").id == "medical-answer"
+    legacy = repository.get("medical-answer", 1)
+
+    assert [issue.code for issue in validate_workflow(legacy, registry)] == ["PROVENANCE_MISMATCH"]
+
+
+def test_the_three_pre_retrieval_shapes_all_publish():
+    """同一套节点表下，路由／静态单路／不做提前检索三种形态都能通过发布校验。"""
+    _, _, registry = setup()
+    repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
+    for workflow_id in ("medical-answer-expanded", "medical-answer-decompose",
+                        "medical-answer-direct", "medical-answer", "medical-search"):
+        graph = repository.get(workflow_id)
+        assert graph.status == "published", workflow_id
+        assert validate_workflow(graph, registry) == [], workflow_id
+
+
+def test_decompose_graph_retrieves_for_the_original_and_every_sub_question():
+    """静态单路形态实际跑通：分解出的子问题各自参与检索，不经过任何路由节点。"""
+    store, _, _ = setup()
+    store.chunks = [Chunk("c1", "d1", "guide.md", "高血压患者应规律随访。", "guide.md", "", 1, 0)]
+
+    class Transport2:
+        def complete(self, provider, system, user):
+            if "evidence" in json.loads(user):
+                return json.dumps({"claims": [{"text": "应规律随访", "citations": [
+                    {"chunk_id": "c1", "excerpt": "规律随访"}]}]})
+            return json.dumps({"questions": ["高血压随访频率？", "高血压随访内容？"]})
+
+    registry = build_registry(store, Embedder(), Reranker(), GroundedGenerator(Transport2()),
+                              Settings())
+    graph = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows").get(
+        "medical-answer-decompose")
+
+    result = asyncio.run(WorkflowEngine(registry).run(graph, {"question": "高血压", "top_k": 5}))
+
+    assert result.status == "success"
+    assert result.output["abstained"] is False
+    assert result.output["citations"][0]["excerpt"] == "规律随访"
+    # 原问题 + 两个子问题各走一次向量检索；连线数就是检索路数。
+    assert store.dense_calls == 3
+    assert result.trace_by_node("decompose").status == "success"
+
+
+def test_direct_graph_answers_without_rerank_or_fusion():
+    """不做提前检索的最小形态：dense 直接喂门控，不再有"门控证据必须来自重排"的限制。"""
+    store, transport, registry = setup()
+    store.chunks = [Chunk("c1", "d1", "guide.md", "高血压患者应规律随访。", "guide.md", "", 1, 0)]
+    graph = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows").get(
+        "medical-answer-direct")
+
+    result = asyncio.run(WorkflowEngine(registry).run(graph, {"question": "高血压", "top_k": 5}))
+
+    assert result.status == "success"
+    assert result.output["abstained"] is False
+    assert store.dense_calls == 1
+    assert transport.calls == 1
+
+
+def test_routing_is_a_graph_property_not_a_node_implementation():
+    _, _, registry = setup()
+    types = {item["type"] for item in registry.metadata()}
+    assert {"question.router", "question.rewrite", "question.decompose", "question.hyde",
+            "question.stepback", "merge.collect", "retrieval.multi"}.issubset(types)
+    assert not {"question.select", "retrieval.expanded"} & types
+
+    # 被路由的节点只暴露一个可不接的 selector 端口；节点自己不再认识路由。
+    rewrite = registry.get("question.rewrite")
+    route = node_inputs(rewrite)["route"]
+    assert (route.dtype, route.optional) == ("selector", True)
+
+    routed = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows").get(
+        "medical-answer-expanded")
+    assert [node.activation.equals for node in routed.nodes if node.activation] == [
+        "rewrite", "decompose", "hyde", "stepback"]
+    assert routed.nodes[2].activation.port == "route"
 
 
 def test_document_to_answer_workflow_and_duplicate():
@@ -279,7 +356,7 @@ def test_draft_node_gives_the_analysis_its_own_event_and_wire_shape():
     context = ExecutionContext("run", "w", {}, emit=emitted.append)
     result = generation_node.draft(
         {"question": "高血压", "provider": "qwen", "evidence": [Evidence(chunk, 0.9)]},
-        {}, context, FakeGenerator())
+        {}, context, FakeGenerator(), "qwen")
 
     assert result["draft"] == document
     assert [item["event"] for item in emitted] == ["status", "claim", "analysis"]
@@ -299,7 +376,7 @@ def test_draft_node_without_a_streaming_generator_stays_off_the_wire():
     emitted = []
     context = ExecutionContext("run", "w", {}, emit=emitted.append)
     generation_node.draft({"question": "高血压", "provider": "qwen", "evidence": []}, {}, context,
-                          PlainGenerator())
+                          PlainGenerator(), "qwen")
 
     assert [item["event"] for item in emitted] == ["status"]
 
@@ -308,7 +385,7 @@ def test_rrf_fuses_duplicate_chunks():
     store, _, registry = setup()
     chunk = Chunk("same", "d", "guide.md", "高血压", "guide.md", "", None, 0)
     result = asyncio.run(registry.get("retrieval.rrf").execute({
-        "dense": [Evidence(chunk, 0.7)], "bm25": [Evidence(chunk, 0.9)]},
+        "sources": [[Evidence(chunk, 0.7)], [Evidence(chunk, 0.9)]]},
         {"k": 60}, ExecutionContext("run", "w", {})))
     assert len(result.outputs["evidence"]) == 1
     assert result.outputs["evidence"][0].fused_score == 2 / 61

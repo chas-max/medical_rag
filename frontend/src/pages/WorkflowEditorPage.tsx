@@ -21,6 +21,7 @@ import {
   getWorkflows,
   saveWorkflow,
   validateWorkflow,
+  type NodeActivation,
   type NodeMetadata,
   type Workflow,
   type ValidationResult,
@@ -28,8 +29,8 @@ import {
 import WorkflowNode from "../components/workflow/WorkflowNode";
 import {
   autoLayout,
-  compatible,
   createGraphNode,
+  explainConnection,
   fixedSiblings,
   toGraph,
   toWorkflow,
@@ -44,15 +45,19 @@ import {
 const nodeTypes = { workflow: WorkflowNode };
 const categories: Record<string, string> = {
   input: "输入",
-  document: "文档处理",
+  question: "问题处理",
   retrieval: "检索",
   fusion: "融合",
   rerank: "重排",
   evidence: "证据安全",
   generation: "模型生成",
   citation: "引用校验",
+  document: "文档处理",
   output: "输出",
 };
+
+/** 已知分类的展示顺序；没列出来的新分类排在末尾，但仍然会出现在节点库里。 */
+const categoryOrder = Object.keys(categories);
 
 /** 需要用户显式确认的操作：切换工作流、删除固定节点。 */
 type ConfirmAction = {
@@ -79,6 +84,7 @@ function Editor() {
   const [busy, setBusy] = useState(false);
   const [traceOpen, setTraceOpen] = useState(true);
   const [notice, setNotice] = useState("");
+  const [connectHint, setConnectHint] = useState("");
   const [pendingWorkflow, setPendingWorkflow] = useState("");
   const [confirm, setConfirm] = useState<ConfirmAction | null>(null);
 
@@ -123,17 +129,22 @@ function Editor() {
   const selectedIsLastFixed = Boolean(
     selected && selectedMeta?.fixed && !fixedSiblings(selected, nodes),
   );
-  const grouped = useMemo(
-    () =>
-      Object.entries(categories)
-        .map(([key, title]) => ({
-          key,
-          title,
-          items: catalog.filter((item) => item.category === key),
-        }))
-        .filter((group) => group.items.length),
-    [catalog],
-  );
+  const selectedActivation = selected?.data.activation ?? null;
+  // 分组来自节点目录本身：后端新增一个分类（例如新的问题处理节点）就自动出现在画布里。
+  const grouped = useMemo(() => {
+    const keys = [...new Set(catalog.map((item) => item.category))];
+    const rank = (key: string) => {
+      const index = categoryOrder.indexOf(key);
+      return index < 0 ? categoryOrder.length : index;
+    };
+    return keys
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+      .map((key) => ({
+        key,
+        title: categories[key] || key,
+        items: catalog.filter((item) => item.category === key),
+      }));
+  }, [catalog]);
   const dirty = useMemo(() => {
     if (!original) return false;
     const current = toWorkflow(original, nodes, edges, original.status);
@@ -155,8 +166,10 @@ function Editor() {
   }, []);
   const onConnect = useCallback(
     (connection: Connection) => {
-      if (!compatible(connection, nodes, catalog, edges)) {
-        setError("端口类型不匹配、输入已连接或存在环路");
+      const reason = explainConnection(connection, nodes, catalog, edges);
+      if (reason) {
+        // 连线被拒必须当场说清楚：ReactFlow 的 isValidConnection 只会静默取消。
+        setConnectHint(reason);
         return;
       }
       setEdges((previous) =>
@@ -165,6 +178,7 @@ function Editor() {
           previous,
         ),
       );
+      setConnectHint("");
       setError("");
       changed();
     },
@@ -249,6 +263,18 @@ function Editor() {
               },
             }
           : node,
+      ),
+    );
+    changed();
+  }
+  /** 路由条件写在节点实例上，所以换端口或改期望值都不需要动节点类型。 */
+  function setActivation(
+    nodeId: string,
+    activation: NodeActivation | null,
+  ) {
+    setNodes((previous) =>
+      previous.map((node) =>
+        node.id === nodeId ? { ...node, data: { ...node.data, activation } } : node,
       ),
     );
     changed();
@@ -483,19 +509,7 @@ function Editor() {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
-              isValidConnection={(connection) =>
-                compatible(
-                  {
-                    source: connection.source,
-                    target: connection.target,
-                    sourceHandle: connection.sourceHandle || null,
-                    targetHandle: connection.targetHandle || null,
-                  },
-                  nodes,
-                  catalog,
-                  edges,
-                )
-              }
+              isValidConnection={() => true}
               onNodeClick={(_, node) => setSelectedId(node.id)}
               onPaneClick={() => setSelectedId(null)}
               minZoom={0.25}
@@ -512,6 +526,14 @@ function Editor() {
               />
             </ReactFlow>
           </div>
+          {connectHint && (
+            <p className="editor-notice connect-hint" role="status">
+              这条线连不上：{connectHint}
+              <button onClick={() => setConnectHint("")} aria-label="关闭连线提示">
+                ×
+              </button>
+            </p>
+          )}
           {traceOpen && (
             <div className="trace-panel">
               <div className="trace-heading">
@@ -660,6 +682,49 @@ function Editor() {
                 )
               ) : (
                 <p className="panel-hint">此节点无需额外配置</p>
+              )}
+              <div className="divider" />
+              <span className="field-title">执行条件（路由）</span>
+              <p className="panel-hint">
+                指定入参等于期望值时本节点才执行，未执行的分支在运行记录里是
+                inactive。不设置就是无条件执行——想完全不路由，删掉问题路由节点即可。
+              </p>
+              <label className="field-label">
+                端口
+                <select
+                  value={selectedActivation?.port ?? ""}
+                  onChange={(event) => {
+                    const port = event.target.value;
+                    setActivation(
+                      selected.id,
+                      port
+                        ? { port, equals: selectedActivation?.equals ?? "" }
+                        : null,
+                    );
+                  }}
+                >
+                  <option value="">不设置</option>
+                  {Object.entries(selectedMeta.inputs).map(([name, port]) => (
+                    <option key={name} value={name}>
+                      {name} · {port.dtype}
+                      {port.optional ? "（可不连线）" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedActivation && (
+                <label className="field-label">
+                  期望值
+                  <input
+                    value={String(selectedActivation.equals)}
+                    onChange={(event) =>
+                      setActivation(selected.id, {
+                        port: selectedActivation.port,
+                        equals: event.target.value,
+                      })
+                    }
+                  />
+                </label>
               )}
               <div className="divider" />
               <div className="inspector-buttons">

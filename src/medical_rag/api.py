@@ -178,6 +178,11 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
             raise ApiError("INVALID_WORKFLOW", "工作流 ID 与路径不一致", 422)
         return _success(_service().validate_workflow(definition))
 
+    @app.get("/workflows/{workflow_id}/run-schema")
+    def workflow_run_schema(workflow_id: str):
+        """运行入参由图推导：输入节点的输出端口就是这条工作流接受的字段。"""
+        return _success(_service().run_inputs_schema(workflow_id))
+
     @app.post("/workflows/{workflow_id}/runs")
     async def run_workflow(workflow_id: str, payload: WorkflowRunRequest):
         # Workflow nodes call synchronous Milvus/model clients. Run the whole

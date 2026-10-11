@@ -9,6 +9,7 @@ from medical_rag.workflow.contracts import (
     Node,
     NodeResult,
     NodeTrace,
+    PortSpec,
 )
 from medical_rag.workflow.definition import WorkflowDefinition, WorkflowNode
 from medical_rag.workflow.registry import NodeRegistry
@@ -19,11 +20,13 @@ class StubNode:
     type: str
     title: str
     category: str = "input"
-    inputs: dict[str, str] = field(default_factory=dict)
+    inputs: dict[str, str | PortSpec] = field(default_factory=dict)
     outputs: dict[str, str] = field(
         default_factory=lambda: {"question": "string"}
     )
     config_schema: dict[str, object] = field(default_factory=dict)
+    tags: frozenset[str] = frozenset()
+    shared_producers: tuple[tuple[str, str], ...] = ()
 
     async def execute(
         self,
@@ -46,6 +49,8 @@ def test_registry_exposes_stable_node_metadata() -> None:
             "category": "input",
             "inputs": {},
             "outputs": {"question": "string"},
+            "tags": [],
+            "shared_producers": [],
             "config_schema": {},
             "fixed": True,
             "canonical": True,
@@ -56,11 +61,39 @@ def test_registry_exposes_stable_node_metadata() -> None:
             "category": "output",
             "inputs": {},
             "outputs": {"question": "string"},
+            "tags": [],
+            "shared_producers": [],
             "config_schema": {},
             "fixed": True,
             "canonical": False,
         },
     ]
+
+
+def test_registry_metadata_describes_port_cardinality_and_requirements() -> None:
+    registry = NodeRegistry()
+    registry.register(
+        StubNode(
+            "merge.collect",
+            "汇聚",
+            "transform",
+            inputs={
+                "items": PortSpec("items", "string", collect=True),
+                "note": PortSpec("note", "string", optional=True),
+            },
+            outputs={"value": "string"},
+            tags=frozenset({"answer.cited"}),
+            shared_producers=(("draft", "evidence"),),
+        )
+    )
+
+    inputs = registry.metadata()[0]["inputs"]
+
+    assert inputs["items"] == {"dtype": "string", "optional": False,
+                               "collect": True, "requires_tag": None}
+    assert inputs["note"]["optional"] is True
+    assert registry.metadata()[0]["tags"] == ["answer.cited"]
+    assert registry.metadata()[0]["shared_producers"] == [["draft", "evidence"]]
 
 
 def test_registry_rejects_duplicate_types_and_unknown_types() -> None:
@@ -101,8 +134,11 @@ def test_registry_metadata_deep_copies_nested_node_metadata() -> None:
             "type": "query.input",
             "title": "问题输入",
             "category": "input",
-            "inputs": {"request": "object"},
+            "inputs": {"request": {"dtype": "object", "optional": False,
+                                   "collect": False, "requires_tag": None}},
             "outputs": {"question": "string"},
+            "tags": [],
+            "shared_producers": [],
             "config_schema": {"nested": {"limits": [1, 2]}},
             "fixed": True,
             "canonical": True,

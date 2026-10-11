@@ -571,7 +571,7 @@ it("shows retrieval progress while the answer is still being generated", async (
   expect(screen.queryByText(/正在生成回答/)).not.toBeInTheDocument();
 });
 
-it("shows only complete answer workflows in the chat selector", async () => {
+it("offers no workflow switcher on the chat page", async () => {
   vi.mocked(api.getWorkflows).mockResolvedValue([
     searchWorkflow,
     ingestionWorkflow,
@@ -583,18 +583,17 @@ it("shows only complete answer workflows in the chat selector", async () => {
       <App />
     </MemoryRouter>,
   );
-  const selector = await screen.findByRole("combobox", { name: "工作流" });
-  expect(selector).toHaveValue("medical-answer");
-  expect(screen.getByRole("option", { name: "医疗资料问答 · v1" })).toBeInTheDocument();
+  await waitFor(() => expect(api.getWorkflows).toHaveBeenCalled());
   expect(
-    screen.getByRole("option", { name: "路由式医疗资料问答 · v1" }),
-  ).toBeInTheDocument();
-  expect(screen.queryByRole("option", { name: "医疗资料检索 · v1" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("option", { name: "文档入库 · v1" })).not.toBeInTheDocument();
+    screen.queryByRole("combobox", { name: "工作流" }),
+  ).not.toBeInTheDocument();
+  expect(screen.queryByText(/医疗资料问答 · v/)).not.toBeInTheDocument();
+  expect(screen.queryByText(/暂无可用的回答工作流/)).not.toBeInTheDocument();
 });
 
-it("sends the next question through the workflow selected in chat", async () => {
+it("answers with the workflow published by the editor page", async () => {
   const user = userEvent.setup();
+  localStorage.setItem("zhiyuan-current-workflow-v1", "medical-answer-expanded");
   vi.mocked(api.getWorkflows).mockResolvedValue([workflow, expandedWorkflow]);
   vi.mocked(api.runWorkflow).mockResolvedValue({
     run_id: "expanded-run",
@@ -606,10 +605,6 @@ it("sends the next question through the workflow selected in chat", async () => 
     <MemoryRouter initialEntries={["/chat"]}>
       <App />
     </MemoryRouter>,
-  );
-  await user.selectOptions(
-    await screen.findByRole("combobox", { name: "工作流" }),
-    "medical-answer-expanded",
   );
   await user.type(
     screen.getByRole("textbox", { name: "输入医疗资料问题" }),
@@ -625,40 +620,49 @@ it("sends the next question through the workflow selected in chat", async () => 
   );
 });
 
-it("restores the workflow chosen on the editor page", async () => {
-  localStorage.setItem(
-    "zhiyuan-current-workflow-v1",
-    "medical-answer-expanded",
-  );
+it("points the editor link at the workflow chosen on the editor page", async () => {
+  localStorage.setItem("zhiyuan-current-workflow-v1", "medical-answer-expanded");
   vi.mocked(api.getWorkflows).mockResolvedValue([workflow, expandedWorkflow]);
   render(
     <MemoryRouter initialEntries={["/chat"]}>
       <App />
     </MemoryRouter>,
   );
-  expect(
-    await screen.findByRole("combobox", { name: "工作流" }),
-  ).toHaveValue("medical-answer-expanded");
+  expect(await screen.findByRole("link", { name: /查看工作流/ })).toHaveAttribute(
+    "href",
+    "/workflows/medical-answer-expanded",
+  );
 });
 
-it("publishes the workflow selected in chat to the editor page", async () => {
+it("drops a stale editor workflow id and falls back to the default answer flow", async () => {
   const user = userEvent.setup();
+  localStorage.setItem("zhiyuan-current-workflow-v1", "unpublished-draft");
   vi.mocked(api.getWorkflows).mockResolvedValue([workflow, expandedWorkflow]);
+  vi.mocked(api.runWorkflow).mockResolvedValue({
+    run_id: "fallback-run",
+    status: "success",
+    output: { answer: "默认回答", abstained: false, citations: [] },
+    trace: [],
+  });
   render(
     <MemoryRouter initialEntries={["/chat"]}>
       <App />
     </MemoryRouter>,
   );
-  await user.selectOptions(
-    await screen.findByRole("combobox", { name: "工作流" }),
-    "medical-answer-expanded",
+  await user.type(
+    screen.getByRole("textbox", { name: "输入医疗资料问题" }),
+    "默认流程问题",
+  );
+  await user.click(screen.getByRole("button", { name: "发送问题" }));
+  await waitFor(() =>
+    expect(api.runWorkflow).toHaveBeenCalledWith(
+      "medical-answer",
+      expect.objectContaining({ question: "默认流程问题" }),
+    ),
   );
   expect(localStorage.getItem("zhiyuan-current-workflow-v1")).toBe(
-    "medical-answer-expanded",
+    "medical-answer",
   );
-  expect(
-    screen.getByRole("link", { name: /工作流编辑器/ }),
-  ).toHaveAttribute("href", "/workflows/medical-answer-expanded");
 });
 
 it("does not send when no complete answer workflow is available", async () => {
@@ -668,7 +672,7 @@ it("does not send when no complete answer workflow is available", async () => {
       <App />
     </MemoryRouter>,
   );
-  expect(await screen.findByText("暂无可用的回答工作流")).toBeInTheDocument();
+  expect(await screen.findByText(/暂无可用的回答工作流/)).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "发送问题" })).toBeDisabled();
   expect(api.runWorkflow).not.toHaveBeenCalled();
 });

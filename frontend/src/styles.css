@@ -832,6 +832,14 @@ a {
 .flow-node.skipped {
   opacity: 0.68;
 }
+/* 未被 activation 选中的分支：虚线表示"这个节点本次什么都没做"。 */
+.flow-node.inactive {
+  border-style: dashed;
+  opacity: 0.6;
+}
+.flow-node.halt {
+  border-color: #d8a45c;
+}
 .flow-node-heading {
   display: flex;
   gap: 8px;
@@ -904,6 +912,15 @@ a {
 }
 .output-port .react-flow__handle {
   right: -4px;
+}
+/* 可选端口是空心的：不连线也能发布，这是"节点可以整体删掉"的视觉提示。 */
+.input-port.port-optional .react-flow__handle {
+  background: #fff;
+  border: 1px dashed #9db8a6;
+}
+.input-port.port-collect small::after {
+  content: " ⇉";
+  color: #4d8a68;
 }
 .node-run-status {
   font-size: 8px;
@@ -1009,6 +1026,12 @@ a {
 }
 .trace-dot.skipped {
   background: #dfb75a;
+}
+.trace-dot.inactive {
+  background: #b9c6d6;
+}
+.trace-dot.halt {
+  background: #d8a45c;
 }
 .trace-error {
   color: #c16a55;
@@ -1330,6 +1353,19 @@ a {
   border-color: #d9ebde;
 }
 .fixed-notice button {
+  margin-left: 8px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+}
+/* 连线被拒的原因条：贴在画布下方，不靠展开校验记录才能看到。 */
+.editor-notice.connect-hint {
+  color: #a8473f;
+  background: #fdf2f0;
+  border-color: #f2d8d4;
+}
+.connect-hint button {
   margin-left: 8px;
   border: 0;
   background: transparent;

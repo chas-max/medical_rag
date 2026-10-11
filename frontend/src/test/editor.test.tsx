@@ -1,4 +1,4 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
@@ -108,6 +108,15 @@ const expandedWorkflow: api.Workflow = {
   id: "medical-answer-expanded",
   name: "路由式医疗资料问答",
 };
+// 路由条件写在节点实例上，所以这里只需要一个可被选中的 rewrite 节点。
+const routedWorkflow: api.Workflow = {
+  id: "medical-answer-routed",
+  name: "路由试验工作流",
+  version: 1,
+  status: "draft",
+  nodes: [answerNode("query", "query.input"), answerNode("rewrite", "question.rewrite")],
+  edges: [answerEdge("query", "rewrite")],
+};
 const searchWorkflow: api.Workflow = {
   ...answerWorkflow,
   id: "medical-search",
@@ -126,6 +135,12 @@ const ingestionWorkflow: api.Workflow = {
   nodes: [answerNode("input", "document.input")],
   edges: [],
 };
+const port = (dtype: string): api.PortInfo => ({
+  dtype,
+  optional: false,
+  collect: false,
+  requires_tag: null,
+});
 const catalog: api.NodeMetadata[] = [
   {
     type: "query.input",
@@ -134,14 +149,85 @@ const catalog: api.NodeMetadata[] = [
     inputs: {},
     outputs: { question: "string" },
     config_schema: {},
+    fixed: true,
+    canonical: true,
   },
   {
     type: "retrieval.dense",
     title: "向量检索",
     category: "retrieval",
-    inputs: { question: "string" },
+    inputs: { question: port("string") },
     outputs: { evidence: "evidence_list" },
     config_schema: { top_k: { type: "integer", default: 20, minimum: 1 } },
+  },
+  {
+    type: "audit.record",
+    title: "运行留痕",
+    category: "audit",
+    inputs: { question: port("string") },
+    outputs: { recorded: "boolean" },
+    config_schema: {},
+  },
+  {
+    type: "question.rewrite",
+    title: "问题重写",
+    category: "question",
+    inputs: {
+      question: port("string"),
+      provider: { ...port("string"), optional: true },
+      route: { ...port("selector"), optional: true },
+    },
+    outputs: { query: "string" },
+    config_schema: {},
+  },
+  {
+    type: "evidence.gate",
+    title: "证据门控",
+    category: "evidence",
+    inputs: { evidence: port("evidence_list") },
+    outputs: { evidence: "evidence_list" },
+    config_schema: {},
+    tags: ["evidence.gated"],
+  },
+  {
+    type: "generation.llm",
+    title: "模型回答",
+    category: "generation",
+    inputs: {
+      evidence: { ...port("evidence_list"), requires_tag: "evidence.gated" },
+    },
+    outputs: { draft: "string" },
+    config_schema: {},
+  },
+  {
+    type: "citation.validate",
+    title: "引用校验",
+    category: "citation",
+    inputs: { draft: port("string") },
+    outputs: { answer: "answer" },
+    config_schema: {},
+    tags: ["answer.cited"],
+  },
+  {
+    type: "answer.output",
+    title: "答案输出",
+    category: "output",
+    inputs: {
+      answer: { ...port("answer"), requires_tag: "answer.cited" },
+    },
+    outputs: { answer: "string" },
+    config_schema: {},
+    fixed: true,
+    canonical: true,
+  },
+  {
+    type: "search.output",
+    title: "证据输出",
+    category: "output",
+    inputs: { evidence: port("evidence_list") },
+    outputs: { evidence: "evidence_list" },
+    config_schema: {},
+    fixed: true,
   },
 ];
 beforeEach(() => {
@@ -187,6 +273,62 @@ it("adds, configures and saves a new node with a version increment", async () =>
       ]),
     }),
   );
+});
+
+it("groups the palette by the node catalog so new node types are addable", async () => {
+  const user = userEvent.setup();
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+
+  // 问题处理类节点（含 merge.collect）以前被硬编码分组漏掉，画布上加不出来。
+  const canvas = await screen.findByTestId("canvas");
+  expect(await screen.findByRole("heading", { name: "问题处理" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: /问题重写/ })).toBeInTheDocument();
+  // 目录里出现的任何分类都会成组，未知分类直接用原始键名当标题。
+  expect(screen.getByRole("heading", { name: "audit" })).toBeInTheDocument();
+
+  const before = within(canvas).getAllByRole("button").length;
+  await user.click(screen.getByRole("button", { name: /问题重写/ }));
+  expect(within(canvas).getAllByRole("button")).toHaveLength(before + 1);
+});
+
+it("saves a routing condition on the node instance so the router stays optional", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflow).mockResolvedValue(routedWorkflow);
+  vi.mocked(api.getWorkflows).mockResolvedValue([routedWorkflow]);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer-routed"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  await user.click(await screen.findByRole("button", { name: "问题重写" }));
+  await user.selectOptions(screen.getByLabelText("端口"), ["route"]);
+  const expected = screen.getByLabelText("期望值");
+  await user.clear(expected);
+  await user.type(expected, "rewrite");
+  await user.click(screen.getByRole("button", { name: "保存草稿" }));
+
+  expect(api.saveWorkflow).toHaveBeenCalledWith(
+    expect.objectContaining({
+      nodes: expect.arrayContaining([
+        expect.objectContaining({
+          type: "question.rewrite",
+          activation: { port: "route", equals: "rewrite" },
+        }),
+      ]),
+    }),
+  );
+
+  // 清掉条件后节点回到无条件执行，图里不再有任何路由依赖。
+  await user.selectOptions(screen.getByLabelText("端口"), [""]);
+  await user.click(screen.getByRole("button", { name: "保存草稿" }));
+  const saved = vi.mocked(api.saveWorkflow).mock.calls.at(-1)?.[0];
+  expect(
+    saved?.nodes.find((node) => node.type === "question.rewrite")?.activation,
+  ).toBeNull();
 });
 
 it("keeps validation in the editor without a conversation test runner", async () => {
@@ -251,22 +393,129 @@ it("keeps a deep-linked non-answer workflow editable", async () => {
   ).toHaveValue("medical-search");
 });
 
-it("publishes the workflow switch to the chat page", async () => {
+it("publishes the workflow switch to the chat page only after confirming", async () => {
   const user = userEvent.setup();
   vi.mocked(api.getWorkflows).mockResolvedValue([
     answerWorkflow,
     expandedWorkflow,
   ]);
+  vi.mocked(api.getWorkflow).mockResolvedValue(answerWorkflow);
   render(
     <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
       <App />
     </MemoryRouter>,
   );
-  await user.selectOptions(
-    await screen.findByRole("combobox", { name: "切换工作流" }),
-    "medical-answer-expanded",
-  );
+  const selector = await screen.findByRole("combobox", { name: "切换工作流" });
+
+  await user.selectOptions(selector, "medical-answer-expanded");
+  const dialog = await screen.findByRole("dialog", {
+    name: "切换到「路由式医疗资料问答 · v1」？",
+  });
+  expect(
+    within(dialog).getByText(
+      "问答页会立刻改用该工作流回答，问答页本身不再提供切换。",
+    ),
+  ).toBeInTheDocument();
+  await user.click(within(dialog).getByRole("button", { name: "取消" }));
+  expect(localStorage.getItem("zhiyuan-current-workflow-v1")).toBeNull();
+  expect(selector).toHaveValue("medical-answer");
+
+  await user.selectOptions(selector, "medical-answer-expanded");
+  await user.click(await screen.findByRole("button", { name: "确认切换" }));
   expect(localStorage.getItem("zhiyuan-current-workflow-v1")).toBe(
     "medical-answer-expanded",
   );
+});
+
+it("offers to save canvas edits before switching workflow", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflows).mockResolvedValue([
+    answerWorkflow,
+    expandedWorkflow,
+  ]);
+  vi.mocked(api.getWorkflow).mockResolvedValue(answerWorkflow);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  await user.click(
+    await screen.findByRole("button", { name: /向量检索 retrieval.dense/ }),
+  );
+  await user.selectOptions(
+    screen.getByRole("combobox", { name: "切换工作流" }),
+    "medical-answer-expanded",
+  );
+  expect(
+    await screen.findByText("当前画布有未保存修改，切换后这些修改会丢失。"),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "先保存草稿" }));
+  await waitFor(() =>
+    expect(api.saveWorkflow).toHaveBeenCalledWith(
+      expect.objectContaining({ status: "draft" }),
+    ),
+  );
+  expect(localStorage.getItem("zhiyuan-current-workflow-v1")).toBeNull();
+});
+
+it("keeps fixed node types resident in the palette and undeletable on the canvas", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflows).mockResolvedValue([answerWorkflow]);
+  vi.mocked(api.getWorkflow).mockResolvedValue(answerWorkflow);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByRole("button", { name: /问题输入 query.input 常驻/ }),
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: /答案输出 answer.output 常驻/ }),
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: /向量检索 retrieval.dense/ }),
+  ).toBeEnabled();
+
+  await user.click(screen.getByRole("button", { name: "问题输入" }));
+  expect(screen.getByText(/固定输入节点/)).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "⌫ 删除节点" })).toBeDisabled();
+});
+
+it("restores a missing fixed node when the stored workflow lacks one", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflow).mockResolvedValue(workflow);
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  expect(
+    await screen.findByText("已补回固定节点：答案输出"),
+  ).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "答案输出" }));
+  expect(screen.getByRole("button", { name: "⌫ 删除节点" })).toBeDisabled();
+});
+
+it("confirms before deleting a fixed node that has a same-category sibling", async () => {
+  const user = userEvent.setup();
+  vi.mocked(api.getWorkflows).mockResolvedValue([answerWorkflow]);
+  vi.mocked(api.getWorkflow).mockResolvedValue({
+    ...answerWorkflow,
+    nodes: [...answerWorkflow.nodes, answerNode("extra", "answer.output")],
+  });
+  render(
+    <MemoryRouter initialEntries={["/workflows/medical-answer"]}>
+      <App />
+    </MemoryRouter>,
+  );
+  const outputs = await screen.findAllByRole("button", { name: "答案输出" });
+  await user.click(outputs[1]);
+  await user.click(screen.getByRole("button", { name: "⌫ 删除节点" }));
+  const dialog = await screen.findByRole("dialog", {
+    name: "删除固定输出节点「答案输出」？",
+  });
+  await user.click(within(dialog).getByRole("button", { name: "仍然删除" }));
+  // 常驻的规范输出还在，多余的这一条被移除。
+  expect(screen.getAllByRole("button", { name: "答案输出" })).toHaveLength(1);
 });
