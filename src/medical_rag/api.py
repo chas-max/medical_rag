@@ -1,6 +1,7 @@
 """FastAPI entry point and consistent public response envelope."""
 
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -8,7 +9,8 @@ from typing import Literal
 from fastapi import FastAPI, File, Form, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
+                               StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -34,6 +36,11 @@ def _success(value: object) -> dict:
 
 def _failure(code: str, message: str, status: int) -> JSONResponse:
     return JSONResponse(status_code=status, content={"success": False, "data": None, "error": {"code": code, "message": message}})
+
+
+def _event_frame(event: dict) -> str:
+    """Encode one stream event as a Server-Sent Events frame."""
+    return f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
 
 
 def create_app(service: object | None = None, frontend_dist: Path | None = None) -> FastAPI:
@@ -135,6 +142,11 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None)
             raise ApiError("INVALID_WORKFLOW", "工作流 ID 与路径不一致", 422)
         return _success(_service().validate_workflow(definition))
 
+    @app.get("/workflows/{workflow_id}/run-schema")
+    def workflow_run_schema(workflow_id: str):
+        """运行入参由图推导：输入节点的输出端口就是这条工作流接受的字段。"""
+        return _success(_service().run_inputs_schema(workflow_id))
+
     @app.post("/workflows/{workflow_id}/runs")
     async def run_workflow(workflow_id: str, payload: WorkflowRunRequest):
         # Workflow nodes call synchronous Milvus/model clients. Run the whole
@@ -144,6 +156,46 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None)
             return asyncio.run(_service().run_workflow(workflow_id, payload.inputs))
 
         return _success(await run_in_threadpool(execute))
+
+    @app.post("/workflows/{workflow_id}/runs/stream")
+    async def stream_workflow(workflow_id: str, payload: WorkflowRunRequest):
+        """Run one published workflow, pushing each verified claim as an SSE event.
+
+        The request runs in a worker thread for the same reason as the
+        synchronous route. Failures after the first frame arrive as an ``error``
+        event, because the status line is already on the wire by then.
+        """
+        service = _service()
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        finished = object()
+
+        def emit(event: dict) -> None:
+            loop.call_soon_threadsafe(queue.put_nowait, event)
+
+        def execute() -> None:
+            try:
+                result = asyncio.run(service.run_workflow(workflow_id, payload.inputs, emit=emit))
+                emit({"event": "done", "data": jsonable_encoder(result)})
+            except ApiError as error:
+                emit({"event": "error", "data": {"code": error.code, "message": error.message,
+                                                 "status": error.status}})
+            except Exception:
+                emit({"event": "error", "data": {"code": "DEPENDENCY_ERROR",
+                                                 "message": "检索或模型服务不可用", "status": 503}})
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, finished)
+
+        async def events():
+            loop.run_in_executor(None, execute)
+            while True:
+                item = await queue.get()
+                if item is finished:
+                    return
+                yield _event_frame(item)
+
+        return StreamingResponse(events(), media_type="text/event-stream",
+                                 headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
     @app.get("/runs/{run_id}")
     def get_run(run_id: str):

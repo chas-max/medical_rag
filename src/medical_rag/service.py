@@ -6,13 +6,31 @@ from pathlib import Path
 from .config import Settings
 from .types import ApiError
 from .workflow.bootstrap import build_registry
+from .workflow.contracts import CAPABILITY_WEB_SEARCH, StreamEmitter
 from .workflow.definition import WorkflowDefinition
 from .workflow.engine import WorkflowEngine, WorkflowRunResult
 from .workflow.repository import WorkflowRepository
+from .workflow.run_schema import run_inputs_schema
 from .workflow.validator import validate_workflow
 
 
 DEFAULT_WORKFLOWS = Path(__file__).resolve().parents[2] / "workflows"
+
+# 运行入参不合法时由输入节点抛出这些码，HTTP 层据此回 422。字段本身不再按
+# 工作流 ID 维护白名单：图里连了什么输入节点，就按那个节点的声明校验。
+REQUEST_ERROR_CODES = frozenset({"INVALID_QUERY", "INVALID_PROVIDER",
+                                 "INVALID_DOCUMENT", "INVALID_SOURCE"})
+
+
+def failed_error(result: WorkflowRunResult) -> dict[str, str]:
+    """The first node failure recorded in a run, already sanitized by the engine."""
+    return next((item.error for item in result.trace if item.status == "failed"), None) or {}
+
+
+def global_capabilities(generator: object) -> dict[str, bool]:
+    """Capabilities every workflow gets by construction, independent of its graph."""
+    # 生成器只有在 Tavily 已配置时才持有工具；没有钥匙就没有联网能力，与不联网时行为一致。
+    return {CAPABILITY_WEB_SEARCH: bool(getattr(generator, "tools", None))}
 
 
 class RagService:
@@ -22,7 +40,8 @@ class RagService:
         self.settings = settings
         self.store = store
         self.registry = build_registry(store, embedder, reranker, generator, settings)
-        self.engine = WorkflowEngine(self.registry)
+        self.capabilities = global_capabilities(generator)
+        self.engine = WorkflowEngine(self.registry, self.capabilities)
         self.repository = WorkflowRepository(workflow_root or DEFAULT_WORKFLOWS,
                                              DEFAULT_WORKFLOWS if workflow_root else None)
         self.runs: dict[str, WorkflowRunResult] = {}
@@ -55,39 +74,38 @@ class RagService:
         except ValueError as exc:
             raise ApiError("WORKFLOW_CONFLICT", str(exc), 409) from exc
 
-    async def run_workflow(self, workflow_id: str, inputs: dict[str, object]) -> WorkflowRunResult:
+    async def run_workflow(self, workflow_id: str, inputs: dict[str, object],
+                           emit: StreamEmitter | None = None) -> WorkflowRunResult:
         try:
             definition = self.repository.get_published(workflow_id)
         except KeyError as exc:
             raise ApiError("WORKFLOW_NOT_PUBLISHED", "仅可运行已发布的工作流", 409) from exc
         if validate_workflow(definition, self.registry):
             raise ApiError("INVALID_WORKFLOW", "工作流校验未通过", 422)
-        if workflow_id in ("medical-answer", "medical-search", "medical-answer-expanded"):
-            if not isinstance(inputs.get("question"), str) or not inputs["question"].strip():
-                raise ApiError("INVALID_QUERY", "问题不能为空", 422)
-            top_k = inputs.get("top_k", self.settings.top_k)
-            if not isinstance(top_k, int) or isinstance(top_k, bool) or not 1 <= top_k <= 20:
-                raise ApiError("INVALID_QUERY", "top_k 必须在 1 到 20 之间", 422)
-            if inputs.get("provider", "qwen") != "qwen":
-                raise ApiError("INVALID_PROVIDER", "不支持的生成模型厂商", 422)
-            inputs = {**inputs, "top_k": top_k}
         self.last_workflow_id = workflow_id
-        result = await self.engine.run(definition, inputs)
+        result = await self.engine.run(definition, inputs, emit=emit)
         self.runs[result.run_id] = result
+        if result.status == "failed":
+            error = failed_error(result)
+            if error.get("code") in REQUEST_ERROR_CODES:
+                raise ApiError(error["code"], error.get("message", "请求参数不符合要求"), 422)
         return result
 
     def run(self, workflow_id: str, inputs: dict[str, object]) -> dict:
         result = asyncio.run(self.run_workflow(workflow_id, inputs))
         if result.status == "failed":
-            error = next((item.error for item in result.trace if item.status == "failed"), None) or {}
+            error = failed_error(result)
             code = error.get("code", "DEPENDENCY_ERROR")
             if code == "NODE_EXECUTION_ERROR":
                 code = "DEPENDENCY_ERROR"
-            status = {"MODEL_RATE_LIMITED": 429, "MODEL_UPSTREAM_ERROR": 502}.get(
-                code, 422 if code in ("INVALID_DOCUMENT", "INVALID_SOURCE", "INVALID_QUERY", "INVALID_PROVIDER") else 503
-            )
+            status = {"MODEL_RATE_LIMITED": 429, "MODEL_UPSTREAM_ERROR": 502}.get(code, 503)
             raise ApiError(code, error.get("message", "检索或模型服务不可用"), status)
         return result.output
+
+    def run_inputs_schema(self, workflow_id: str) -> list[dict[str, object]]:
+        """Derive the run inputs from the graph instead of a hardcoded field list."""
+        definition = self.workflow(workflow_id)
+        return run_inputs_schema(definition, self.registry)
 
     def get_run(self, run_id: str) -> WorkflowRunResult:
         try:

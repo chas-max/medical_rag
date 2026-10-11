@@ -120,7 +120,7 @@ def test_vague_retrieval_is_supplemented_by_model_queries():
     assert [item.chunk.id for item in result["evidence"]] == ["k1", "web-1"]
     history = transport.chats[-1]["messages"]
     assert [item["role"] for item in history] == ["system", "user", "assistant", "tool"]
-    assert history[0]["content"].startswith("你是公开医疗资料检索助手")
+    assert history[0]["content"].startswith("你是公开医疗资料解读助手")
     assert "tavily_search" in history[0]["content"]
     assert json.loads(history[1]["content"])["self_check"] == {"mode": "vague", "reason": "evidence_weak"}
     assert json.loads(history[3]["content"])["results"][0]["chunk_id"] == "web-1"

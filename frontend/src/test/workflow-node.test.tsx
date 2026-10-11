@@ -23,7 +23,14 @@ it("renders schema-defined ports and execution status", () => {
             type: "retrieval.dense",
             title: "向量检索",
             category: "retrieval",
-            inputs: { question: "string" },
+            inputs: {
+              question: {
+                dtype: "string",
+                optional: false,
+                collect: false,
+                requires_tag: null,
+              },
+            },
             outputs: { evidence: "evidence_list" },
             config_schema: {},
           },
@@ -37,4 +44,33 @@ it("renders schema-defined ports and execution status", () => {
   expect(screen.getByTestId("target-question")).toBeInTheDocument();
   expect(screen.getByTestId("source-evidence")).toBeInTheDocument();
   expect(screen.getByText("success")).toBeInTheDocument();
+  expect(screen.queryByText("固定")).not.toBeInTheDocument();
+});
+
+it("marks fixed nodes as resident instead of showing the overflow menu", () => {
+  const { container } = render(
+    <WorkflowNode
+      {...({
+        id: "query",
+        selected: false,
+        data: {
+          nodeType: "query.input",
+          metadata: {
+            type: "query.input",
+            title: "问题输入",
+            category: "input",
+            inputs: {},
+            outputs: { question: "string" },
+            config_schema: {},
+            fixed: true,
+          },
+          config: {},
+        },
+      } as unknown as NodeProps<GraphNode>)}
+    />,
+  );
+
+  expect(container.querySelector(".flow-node")?.className).toContain("fixed");
+  expect(container.querySelector(".flow-node-lock")?.textContent).toBe("固定");
+  expect(container.querySelector(".flow-node-menu")).toBeNull();
 });

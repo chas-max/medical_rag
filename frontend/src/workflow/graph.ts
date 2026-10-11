@@ -1,6 +1,8 @@
 import type { Connection, Edge, Node } from "@xyflow/react";
 import type {
+  NodeActivation,
   NodeMetadata,
+  PortInfo,
   Workflow,
   WorkflowEdge,
   WorkflowNode,
@@ -10,30 +12,96 @@ export type GraphNode = Node<{
   nodeType: string;
   metadata?: NodeMetadata;
   config: WorkflowNode["config"];
+  activation?: NodeActivation | null;
   traceStatus?: string;
 }>;
 
-export const toGraph = (workflow: Workflow, catalog: NodeMetadata[]) => ({
-  nodes: workflow.nodes.map((node) => ({
-    id: node.id,
+const categoryOf = (node: GraphNode) => node.data.metadata?.category || "";
+
+/** 同类别的其它节点数量：固定节点只有在这归零时才是不可删的。 */
+export const fixedSiblings = (node: GraphNode, nodes: GraphNode[]) =>
+  nodes.filter((item) => item.id !== node.id && categoryOf(item) === categoryOf(node)).length;
+
+export function createGraphNode(
+  meta: NodeMetadata,
+  position: { x: number; y: number },
+): GraphNode {
+  return {
+    id: `${meta.type.replaceAll(".", "-")}-${crypto.randomUUID().slice(0, 6)}`,
     type: "workflow",
-    position: node.position,
+    position,
+    deletable: !meta.fixed,
     data: {
-      nodeType: node.type,
-      metadata: catalog.find((item) => item.type === node.type),
-      config: node.config,
+      nodeType: meta.type,
+      metadata: meta,
+      config: Object.fromEntries(
+        Object.entries(meta.config_schema)
+          .filter(([, schema]) => schema.default !== undefined)
+          .map(([key, schema]) => [key, schema.default!]),
+      ),
+      activation: null,
     },
-  })) as GraphNode[],
-  edges: workflow.edges.map((edge) => ({
-    id: edge.id,
-    source: edge.source,
-    target: edge.target,
-    sourceHandle: edge.source_port,
-    targetHandle: edge.target_port,
-    type: "smoothstep",
-    animated: false,
-  })) as Edge[],
-});
+  };
+}
+
+export function toGraph(
+  workflow: Workflow,
+  catalog: NodeMetadata[],
+): { nodes: GraphNode[]; edges: Edge[] } {
+  return {
+    nodes: workflow.nodes.map((node) => {
+      const metadata = catalog.find((item) => item.type === node.type);
+      return {
+        id: node.id,
+        type: "workflow",
+        position: node.position,
+        deletable: !metadata?.fixed,
+        data: {
+          nodeType: node.type,
+          metadata,
+          config: node.config,
+          activation: node.activation ?? null,
+        },
+      };
+    }) as GraphNode[],
+    edges: workflow.edges.map((edge) => ({
+      id: edge.id,
+      source: edge.source,
+      target: edge.target,
+      sourceHandle: edge.source_port,
+      targetHandle: edge.target_port,
+      type: "smoothstep",
+      animated: false,
+    })) as Edge[],
+  };
+}
+
+/**
+ * 输入/输出类节点是固定节点：图里缺整类时按后端标注的规范类型补回，
+ * 保证画布始终有一条从固定入口走到固定出口的完整路径。
+ */
+export function withFixedNodes(
+  nodes: GraphNode[],
+  catalog: NodeMetadata[],
+): { nodes: GraphNode[]; added: NodeMetadata[] } {
+  const added: NodeMetadata[] = [];
+  const columns = nodes.map((node) => node.position.x);
+  const left = columns.length ? Math.min(...columns) - 255 : 60;
+  const right = columns.length ? Math.max(...columns) + 255 : 570;
+  const next = [...nodes];
+  for (const category of new Set(
+    catalog.filter((item) => item.fixed).map((item) => item.category),
+  )) {
+    if (next.some((node) => categoryOf(node) === category)) continue;
+    const meta =
+      catalog.find((item) => item.canonical && item.category === category) ||
+      catalog.find((item) => item.fixed && item.category === category);
+    if (!meta) continue;
+    next.push(createGraphNode(meta, { x: category === "input" ? left : right, y: 80 }));
+    added.push(meta);
+  }
+  return { nodes: next, added };
+}
 
 export function toWorkflow(
   original: Workflow,
@@ -50,6 +118,7 @@ export function toWorkflow(
       type: node.data.nodeType,
       position: node.position,
       config: node.data.config,
+      activation: node.data.activation ?? null,
     })),
     edges: edges.map(
       (edge) =>
@@ -70,41 +139,62 @@ export function compatible(
   catalog: NodeMetadata[],
   edges: Edge[],
 ): boolean {
+  return explainConnection(connection, nodes, catalog, edges) === null;
+}
+
+/**
+ * 连线被拒时的具体原因，供界面直接说给用户听；可连接则返回 null。
+ * ReactFlow 的 isValidConnection 只会静默取消连线，所以校验放在这里由调用方展示。
+ */
+export function explainConnection(
+  connection: Connection,
+  nodes: GraphNode[],
+  catalog: NodeMetadata[],
+  edges: Edge[],
+): string | null {
+  const { source, target, sourceHandle, targetHandle } = connection;
+  if (!source || !target || !sourceHandle || !targetHandle) return "连线端点不完整";
+  if (source === target) return "节点不能连到自己";
+  const fromNode = nodes.find((node) => node.id === source);
+  const toNode = nodes.find((node) => node.id === target);
+  if (!fromNode || !toNode) return "找不到连线两端的节点";
+  const from = catalog.find((item) => item.type === fromNode.data.nodeType)
+    ?.outputs[sourceHandle];
+  const to = catalog.find((item) => item.type === toNode.data.nodeType)
+    ?.inputs[targetHandle];
+  if (!from) return `上游没有输出端口 ${sourceHandle}`;
+  if (!to) return `下游没有输入端口 ${targetHandle}`;
+  if (!portTypesMatch(from, to)) return `端口类型不匹配：${from} → ${to.dtype}`;
+  // 只有声明为 collect 的端口才允许多条入边，其它端口第二条连线会被后端拒绝。
   if (
-    !connection.source ||
-    !connection.target ||
-    !connection.sourceHandle ||
-    !connection.targetHandle ||
-    connection.source === connection.target
-  )
-    return false;
-  const source = nodes.find((node) => node.id === connection.source);
-  const target = nodes.find((node) => node.id === connection.target);
-  const from = catalog.find((item) => item.type === source?.data.nodeType)
-    ?.outputs[connection.sourceHandle];
-  const to = catalog.find((item) => item.type === target?.data.nodeType)
-    ?.inputs[connection.targetHandle];
-  if (
-    !from ||
-    from !== to ||
+    to.collect !== true &&
     edges.some(
-      (edge) =>
-        edge.target === connection.target &&
-        edge.targetHandle === connection.targetHandle,
+      (edge) => edge.target === target && edge.targetHandle === targetHandle,
     )
-  )
-    return false;
+  ) {
+    return `${targetHandle} 只接受一条连线；要汇聚多个上游请选带 ⇉ 的端口（如 retrieval.rrf.sources）`;
+  }
   // Reject a connection that would immediately introduce a directed cycle.
   const seen = new Set<string>();
   const visit = (id: string): boolean => {
-    if (id === connection.source) return true;
+    if (id === source) return true;
     if (seen.has(id)) return false;
     seen.add(id);
     return edges
       .filter((edge) => edge.source === id)
       .some((edge) => visit(edge.target));
   };
-  return !visit(connection.target);
+  if (visit(target)) return "这样连会形成环路";
+  return null;
+}
+
+/** 与后端 validator 的 port_accepts 一致：同名相等，或 collect 端口吞下 list<T>。 */
+function portTypesMatch(from: string, to: PortInfo): boolean {
+  if (from === to.dtype) return true;
+  if (!to.collect) return false;
+  return from.startsWith("list<") && from.endsWith(">")
+    ? from.slice(5, -1) === to.dtype
+    : false;
 }
 
 export function autoLayout(nodes: GraphNode[], edges: Edge[]): GraphNode[] {

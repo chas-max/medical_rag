@@ -21,6 +21,7 @@ import {
   getWorkflows,
   saveWorkflow,
   validateWorkflow,
+  type NodeActivation,
   type NodeMetadata,
   type Workflow,
   type ValidationResult,
@@ -28,9 +29,12 @@ import {
 import WorkflowNode from "../components/workflow/WorkflowNode";
 import {
   autoLayout,
-  compatible,
+  createGraphNode,
+  explainConnection,
+  fixedSiblings,
   toGraph,
   toWorkflow,
+  withFixedNodes,
   type GraphNode,
 } from "../workflow/graph";
 import {
@@ -41,14 +45,28 @@ import {
 const nodeTypes = { workflow: WorkflowNode };
 const categories: Record<string, string> = {
   input: "输入",
-  document: "文档处理",
+  question: "问题处理",
   retrieval: "检索",
   fusion: "融合",
   rerank: "重排",
   evidence: "证据安全",
   generation: "模型生成",
   citation: "引用校验",
+  document: "文档处理",
   output: "输出",
+};
+
+/** 已知分类的展示顺序；没列出来的新分类排在末尾，但仍然会出现在节点库里。 */
+const categoryOrder = Object.keys(categories);
+
+/** 需要用户显式确认的操作：切换工作流、删除固定节点。 */
+type ConfirmAction = {
+  title: string;
+  lines: string[];
+  confirmLabel: string;
+  onConfirm: () => void;
+  altLabel?: string;
+  onAlt?: () => void;
 };
 
 function Editor() {
@@ -65,6 +83,10 @@ function Editor() {
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [traceOpen, setTraceOpen] = useState(true);
+  const [notice, setNotice] = useState("");
+  const [connectHint, setConnectHint] = useState("");
+  const [pendingWorkflow, setPendingWorkflow] = useState("");
+  const [confirm, setConfirm] = useState<ConfirmAction | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -75,11 +97,17 @@ function Editor() {
         setOriginal(workflow);
         setWorkflows(selectAnswerWorkflows(available));
         const graph = toGraph(workflow, types);
-        setNodes(graph.nodes);
+        const fixed = withFixedNodes(graph.nodes, types);
+        setNodes(fixed.nodes);
         setEdges(graph.edges);
         setValidation(null);
         setSelectedId(null);
         setError("");
+        setNotice(
+          fixed.added.length
+            ? `已补回固定节点：${fixed.added.map((item) => item.title).join("、")}`
+            : "",
+        );
         window.setTimeout(
           () => setViewport({ x: 65, y: 60, zoom: 0.78 }, { duration: 350 }),
           50,
@@ -97,17 +125,34 @@ function Editor() {
   const selectedMeta = catalog.find(
     (item) => item.type === selected?.data.nodeType,
   );
-  const grouped = useMemo(
-    () =>
-      Object.entries(categories)
-        .map(([key, title]) => ({
-          key,
-          title,
-          items: catalog.filter((item) => item.category === key),
-        }))
-        .filter((group) => group.items.length),
-    [catalog],
+  // 固定节点只有在同类别还剩别的实例时才可删，否则画布会缺入口或出口。
+  const selectedIsLastFixed = Boolean(
+    selected && selectedMeta?.fixed && !fixedSiblings(selected, nodes),
   );
+  const selectedActivation = selected?.data.activation ?? null;
+  // 分组来自节点目录本身：后端新增一个分类（例如新的问题处理节点）就自动出现在画布里。
+  const grouped = useMemo(() => {
+    const keys = [...new Set(catalog.map((item) => item.category))];
+    const rank = (key: string) => {
+      const index = categoryOrder.indexOf(key);
+      return index < 0 ? categoryOrder.length : index;
+    };
+    return keys
+      .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b))
+      .map((key) => ({
+        key,
+        title: categories[key] || key,
+        items: catalog.filter((item) => item.category === key),
+      }));
+  }, [catalog]);
+  const dirty = useMemo(() => {
+    if (!original) return false;
+    const current = toWorkflow(original, nodes, edges, original.status);
+    return (
+      JSON.stringify([current.nodes, current.edges]) !==
+      JSON.stringify([original.nodes, original.edges])
+    );
+  }, [original, nodes, edges]);
   const changed = () => {
     setValidation(null);
   };
@@ -121,8 +166,10 @@ function Editor() {
   }, []);
   const onConnect = useCallback(
     (connection: Connection) => {
-      if (!compatible(connection, nodes, catalog, edges)) {
-        setError("端口类型不匹配、输入已连接或存在环路");
+      const reason = explainConnection(connection, nodes, catalog, edges);
+      if (reason) {
+        // 连线被拒必须当场说清楚：ReactFlow 的 isValidConnection 只会静默取消。
+        setConnectHint(reason);
         return;
       }
       setEdges((previous) =>
@@ -131,6 +178,7 @@ function Editor() {
           previous,
         ),
       );
+      setConnectHint("");
       setError("");
       changed();
     },
@@ -138,26 +186,15 @@ function Editor() {
   );
 
   function addNode(type: NodeMetadata, position?: { x: number; y: number }) {
-    const id = `${type.type.replaceAll(".", "-")}-${crypto.randomUUID().slice(0, 6)}`;
-    const node: GraphNode = {
-      id,
-      type: "workflow",
-      position: position || {
+    const node = createGraphNode(
+      type,
+      position || {
         x: 180 + Math.random() * 100,
         y: 180 + Math.random() * 100,
       },
-      data: {
-        nodeType: type.type,
-        metadata: type,
-        config: Object.fromEntries(
-          Object.entries(type.config_schema)
-            .filter(([, schema]) => schema.default !== undefined)
-            .map(([key, schema]) => [key, schema.default!]),
-        ),
-      },
-    };
+    );
     setNodes((previous) => [...previous, node]);
-    setSelectedId(id);
+    setSelectedId(node.id);
     changed();
   }
 
@@ -177,7 +214,7 @@ function Editor() {
     setSelectedId(id);
     changed();
   }
-  function remove() {
+  function deleteSelected() {
     if (!selectedId) return;
     setNodes((previous) => previous.filter((node) => node.id !== selectedId));
     setEdges((previous) =>
@@ -187,6 +224,28 @@ function Editor() {
     );
     setSelectedId(null);
     changed();
+  }
+  function remove() {
+    if (!selected) return;
+    const meta = selected.data.metadata;
+    if (!meta?.fixed) {
+      deleteSelected();
+      return;
+    }
+    const group = categories[meta.category] || meta.category;
+    if (selectedIsLastFixed) {
+      setError(`「${meta.title}」是固定${group}节点，工作流必须保留一个`);
+      return;
+    }
+    setConfirm({
+      title: `删除固定${group}节点「${meta.title}」？`,
+      lines: [
+        `输入与输出节点常驻工作流，删除后仍需保留至少一个${group}节点。`,
+        `该节点上的 ${edges.filter((edge) => edge.source === selected.id || edge.target === selected.id).length} 条连线会一起移除。`,
+      ],
+      confirmLabel: "仍然删除",
+      onConfirm: deleteSelected,
+    });
   }
   function updateConfig(
     nodeId: string,
@@ -204,6 +263,18 @@ function Editor() {
               },
             }
           : node,
+      ),
+    );
+    changed();
+  }
+  /** 路由条件写在节点实例上，所以换端口或改期望值都不需要动节点类型。 */
+  function setActivation(
+    nodeId: string,
+    activation: NodeActivation | null,
+  ) {
+    setNodes((previous) =>
+      previous.map((node) =>
+        node.id === nodeId ? { ...node, data: { ...node.data, activation } } : node,
       ),
     );
     changed();
@@ -248,6 +319,30 @@ function Editor() {
       setBusy(false);
     }
   }
+  function switchTo(targetId: string) {
+    writeCurrentWorkflowId(targetId);
+    navigate(`/workflows/${targetId}`);
+  }
+  /** 这里是唯一的工作流切换入口，问答页同步使用它，因此切换必须经确认。 */
+  function requestSwitch(targetId: string) {
+    if (!targetId || targetId === workflowId) {
+      setPendingWorkflow("");
+      return;
+    }
+    setPendingWorkflow(targetId);
+    const target = workflows.find((item) => item.id === targetId);
+    const label = target ? `「${target.name} · v${target.version}」` : `「${targetId}」`;
+    setConfirm({
+      title: `切换到${label}？`,
+      lines: [
+        "问答页会立刻改用该工作流回答，问答页本身不再提供切换。",
+        ...(dirty ? ["当前画布有未保存修改，切换后这些修改会丢失。"] : []),
+      ],
+      confirmLabel: "确认切换",
+      onConfirm: () => switchTo(targetId),
+      ...(dirty ? { altLabel: "先保存草稿", onAlt: () => void save("draft") } : {}),
+    });
+  }
   return (
     <div className="editor-layout">
       <div className="editor-header">
@@ -261,25 +356,25 @@ function Editor() {
           </div>
         </div>
         <div className="editor-actions">
-          <select
-            aria-label="切换工作流"
-            value={workflowId}
-            onChange={(event) => {
-              writeCurrentWorkflowId(event.target.value);
-              navigate(`/workflows/${event.target.value}`);
-            }}
-          >
-            {!workflows.some((item) => item.id === workflowId) && (
-              <option value={workflowId}>
-                {original?.name || workflowId}
-              </option>
-            )}
-            {workflows.map((item) => (
-              <option key={item.id} value={item.id}>
-                {item.name}
-              </option>
-            ))}
-          </select>
+          <label className="workflow-switch">
+            <span className="switch-caption">唯一切换入口</span>
+            <select
+              aria-label="切换工作流"
+              value={pendingWorkflow || workflowId}
+              onChange={(event) => requestSwitch(event.target.value)}
+            >
+              {!workflows.some((item) => item.id === workflowId) && (
+                <option value={workflowId}>
+                  {original?.name || workflowId}
+                </option>
+              )}
+              {workflows.map((item) => (
+                <option key={item.id} value={item.id}>
+                  {item.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <button
             className="button-ghost"
             onClick={() => void check()}
@@ -309,34 +404,51 @@ function Editor() {
             <h2>节点库</h2>
             <span>{catalog.length} 个节点</span>
           </div>
-          <p className="panel-hint">拖动节点到画布，或点击添加</p>
+          <p className="panel-hint">
+            拖动节点到画布，或点击添加；输入与输出节点常驻工作流。
+          </p>
           <div className="palette-scroll">
             {grouped.map((group) => (
               <section key={group.key} className="palette-group">
                 <h3>{group.title}</h3>
-                {group.items.map((item) => (
-                  <button
-                    key={item.type}
-                    draggable
-                    onDragStart={(event) => {
-                      event.dataTransfer.setData(
-                        "application/zhiyuan-node",
-                        item.type,
-                      );
-                      event.dataTransfer.effectAllowed = "move";
-                    }}
-                    onClick={() => addNode(item)}
-                  >
-                    <span className={`palette-icon category-${item.category}`}>
-                      ◇
-                    </span>
-                    <span>
-                      <strong>{item.title}</strong>
-                      <small>{item.type}</small>
-                    </span>
-                    <span className="palette-plus">＋</span>
-                  </button>
-                ))}
+                {group.items.map((item) => {
+                  const resident =
+                    Boolean(item.fixed) &&
+                    nodes.some((node) => node.data.nodeType === item.type);
+                  return (
+                    <button
+                      key={item.type}
+                      draggable={!item.fixed}
+                      disabled={resident}
+                      title={
+                        item.fixed
+                          ? "固定节点：常驻画布，不可删除"
+                          : "拖动或点击添加"
+                      }
+                      onDragStart={(event) => {
+                        event.dataTransfer.setData(
+                          "application/zhiyuan-node",
+                          item.type,
+                        );
+                        event.dataTransfer.effectAllowed = "move";
+                      }}
+                      onClick={() => addNode(item)}
+                    >
+                      <span className={`palette-icon category-${item.category}`}>
+                        ◇
+                      </span>
+                      <span>
+                        <strong>{item.title}</strong>
+                        <small>{item.type}</small>
+                      </span>
+                      <span
+                        className={item.fixed ? "palette-fixed" : "palette-plus"}
+                      >
+                        {item.fixed ? (resident ? "常驻" : "固定") : "＋"}
+                      </span>
+                    </button>
+                  );
+                })}
               </section>
             ))}
           </div>
@@ -397,19 +509,7 @@ function Editor() {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onConnect={onConnect}
-              isValidConnection={(connection) =>
-                compatible(
-                  {
-                    source: connection.source,
-                    target: connection.target,
-                    sourceHandle: connection.sourceHandle || null,
-                    targetHandle: connection.targetHandle || null,
-                  },
-                  nodes,
-                  catalog,
-                  edges,
-                )
-              }
+              isValidConnection={() => true}
               onNodeClick={(_, node) => setSelectedId(node.id)}
               onPaneClick={() => setSelectedId(null)}
               minZoom={0.25}
@@ -426,6 +526,14 @@ function Editor() {
               />
             </ReactFlow>
           </div>
+          {connectHint && (
+            <p className="editor-notice connect-hint" role="status">
+              这条线连不上：{connectHint}
+              <button onClick={() => setConnectHint("")} aria-label="关闭连线提示">
+                ×
+              </button>
+            </p>
+          )}
           {traceOpen && (
             <div className="trace-panel">
               <div className="trace-heading">
@@ -437,6 +545,14 @@ function Editor() {
               {error && (
                 <p className="editor-notice" role="status">
                   {error}
+                </p>
+              )}
+              {notice && (
+                <p className="editor-notice fixed-notice" role="status">
+                  {notice}
+                  <button onClick={() => setNotice("")} aria-label="关闭固定节点提示">
+                    ×
+                  </button>
                 </p>
               )}
               {validation && (
@@ -462,7 +578,8 @@ function Editor() {
                 </div>
               )}
               {!validation &&
-                !error && (
+                !error &&
+                !notice && (
                   <p className="empty-trace">校验当前画布以查看校验结果。</p>
                 )}
             </div>
@@ -482,6 +599,15 @@ function Editor() {
               </span>
               <h3>{selectedMeta.title}</h3>
               <p>{selectedMeta.type}</p>
+              {selectedMeta.fixed && (
+                <p className="inspector-fixed">
+                  🔒 固定{categories[selectedMeta.category] || selectedMeta.category}节点
+                  ·{" "}
+                  {selectedIsLastFixed
+                    ? "本工作流必须保留它，不可删除"
+                    : "常驻画布，删除需确认"}
+                </p>
+              )}
               <div className="divider" />
               <label className="field-label">
                 节点 ID
@@ -558,9 +684,61 @@ function Editor() {
                 <p className="panel-hint">此节点无需额外配置</p>
               )}
               <div className="divider" />
+              <span className="field-title">执行条件（路由）</span>
+              <p className="panel-hint">
+                指定入参等于期望值时本节点才执行，未执行的分支在运行记录里是
+                inactive。不设置就是无条件执行——想完全不路由，删掉问题路由节点即可。
+              </p>
+              <label className="field-label">
+                端口
+                <select
+                  value={selectedActivation?.port ?? ""}
+                  onChange={(event) => {
+                    const port = event.target.value;
+                    setActivation(
+                      selected.id,
+                      port
+                        ? { port, equals: selectedActivation?.equals ?? "" }
+                        : null,
+                    );
+                  }}
+                >
+                  <option value="">不设置</option>
+                  {Object.entries(selectedMeta.inputs).map(([name, port]) => (
+                    <option key={name} value={name}>
+                      {name} · {port.dtype}
+                      {port.optional ? "（可不连线）" : ""}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {selectedActivation && (
+                <label className="field-label">
+                  期望值
+                  <input
+                    value={String(selectedActivation.equals)}
+                    onChange={(event) =>
+                      setActivation(selected.id, {
+                        port: selectedActivation.port,
+                        equals: event.target.value,
+                      })
+                    }
+                  />
+                </label>
+              )}
+              <div className="divider" />
               <div className="inspector-buttons">
                 <button onClick={duplicate}>⊞ 复制节点</button>
-                <button className="danger" onClick={remove}>
+                <button
+                  className="danger"
+                  onClick={remove}
+                  disabled={selectedIsLastFixed}
+                  title={
+                    selectedIsLastFixed
+                      ? "固定节点：工作流必须保留至少一个同类节点"
+                      : undefined
+                  }
+                >
                   ⌫ 删除节点
                 </button>
               </div>
@@ -581,6 +759,66 @@ function Editor() {
           </div>
         </aside>
       </div>
+      {confirm && (
+        <div
+          className="confirm-overlay"
+          role="presentation"
+          onClick={() => {
+            setConfirm(null);
+            setPendingWorkflow("");
+          }}
+        >
+          <div
+            className="confirm-card"
+            role="dialog"
+            aria-modal="true"
+            aria-label={confirm.title}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <span className="eyebrow">CONFIRM · 需要确认</span>
+            <h2>{confirm.title}</h2>
+            <ul>
+              {confirm.lines.map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+            <div className="confirm-actions">
+              <button
+                className="button-ghost"
+                onClick={() => {
+                  setConfirm(null);
+                  setPendingWorkflow("");
+                }}
+              >
+                取消
+              </button>
+              {confirm.altLabel && (
+                <button
+                  className="button-ghost"
+                  onClick={() => {
+                    confirm.onAlt?.();
+                    setConfirm(null);
+                    setPendingWorkflow("");
+                  }}
+                >
+                  {confirm.altLabel}
+                </button>
+              )}
+              <button
+                className="button-primary"
+                onClick={() => {
+                  const run = confirm.onConfirm;
+                  setConfirm(null);
+                  setPendingWorkflow("");
+                  run();
+                }}
+              >
+                {confirm.confirmLabel}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
