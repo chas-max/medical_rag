@@ -1,0 +1,30 @@
+{
+  "id": "medical-answer-decompose",
+  "name": "问题分解检索问答",
+  "version": 1,
+  "status": "published",
+  "nodes": [
+    {"id":"query","type":"query.input","position":{"x":80,"y":240},"config":{}},
+    {"id":"decompose","type":"question.decompose","position":{"x":320,"y":120},"config":{}},
+    {"id":"multi","type":"retrieval.multi","position":{"x":580,"y":240},"config":{"strategy":"hybrid","k":60}},
+    {"id":"rerank","type":"retrieval.rerank","position":{"x":840,"y":240},"config":{}},
+    {"id":"gate","type":"evidence.gate","position":{"x":1080,"y":240},"config":{}},
+    {"id":"llm","type":"generation.llm","position":{"x":1320,"y":240},"config":{}},
+    {"id":"citation","type":"citation.validate","position":{"x":1560,"y":240},"config":{}},
+    {"id":"output","type":"answer.output","position":{"x":1800,"y":240},"config":{}}
+  ],
+  "edges": [
+    {"id":"q-decompose","source":"query","source_port":"question","target":"decompose","target_port":"question"},
+    {"id":"q-multi","source":"query","source_port":"question","target":"multi","target_port":"queries"},
+    {"id":"decompose-multi","source":"decompose","source_port":"queries","target":"multi","target_port":"queries"},
+    {"id":"multi-rerank","source":"multi","source_port":"evidence","target":"rerank","target_port":"evidence"},
+    {"id":"q-rerank","source":"query","source_port":"question","target":"rerank","target_port":"question"},
+    {"id":"k-rerank","source":"query","source_port":"top_k","target":"rerank","target_port":"top_k"},
+    {"id":"rerank-gate","source":"rerank","source_port":"evidence","target":"gate","target_port":"evidence"},
+    {"id":"gate-llm","source":"gate","source_port":"evidence","target":"llm","target_port":"evidence"},
+    {"id":"q-llm","source":"query","source_port":"question","target":"llm","target_port":"question"},
+    {"id":"llm-citation","source":"llm","source_port":"draft","target":"citation","target_port":"draft"},
+    {"id":"llm-citation-evidence","source":"llm","source_port":"evidence","target":"citation","target_port":"evidence"},
+    {"id":"citation-output","source":"citation","source_port":"answer","target":"output","target_port":"answer"}
+  ]
+}
