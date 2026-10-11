@@ -7,7 +7,14 @@ from typing import Literal
 from uuid import uuid4
 
 from ..types import ApiError
-from .contracts import ExecutionContext, NodeTrace
+from .contracts import (
+    ExecutionContext,
+    NodeTrace,
+    PortSpec,
+    StreamEmitter,
+    list_item,
+    node_inputs,
+)
 from .definition import WorkflowDefinition, WorkflowEdge, WorkflowNode
 from .registry import NodeRegistry
 
@@ -34,17 +41,22 @@ class WorkflowRunResult:
 class WorkflowEngine:
     """Runs registered workflow nodes in stable topological order."""
 
-    def __init__(self, registry: NodeRegistry) -> None:
+    def __init__(self, registry: NodeRegistry, capabilities: dict[str, bool] | None = None) -> None:
         self.registry = registry
+        # 全局内置能力对所有工作流一视同仁：节点不再自行声明是否联网。
+        self.capabilities = dict(capabilities or {})
 
     async def run(
-        self, definition: WorkflowDefinition, inputs: dict[str, object]
+        self, definition: WorkflowDefinition, inputs: dict[str, object],
+        emit: StreamEmitter | None = None,
     ) -> WorkflowRunResult:
         run_id = uuid4().hex
         context = ExecutionContext(
             run_id=run_id,
             workflow_id=definition.id,
             variables=dict(inputs),
+            capabilities=dict(self.capabilities),
+            emit=emit,
         )
         nodes_by_id: dict[str, WorkflowNode] = {}
         for node in definition.nodes:
@@ -83,9 +95,10 @@ class WorkflowEngine:
             return WorkflowRunResult(run_id, "failed", {}, context.trace)
 
         node_outputs: dict[str, dict[str, object]] = {}
-        skipped_generation_branch: set[str] = set()
-        abstention_output: dict[str, object] | None = None
+        halted_subtree: set[str] = set()
+        halt_output: dict[str, object] | None = None
         output: dict[str, object] = {}
+        execution_order = {node_id: index for index, node_id in enumerate(ordered_ids)}
 
         for node_id in ordered_ids:
             definition_node = nodes_by_id[node_id]
@@ -104,36 +117,51 @@ class WorkflowEngine:
                 )
                 return WorkflowRunResult(run_id, "failed", {}, context.trace)
 
-            node_inputs: dict[str, object] = {}
+            specs = node_inputs(node)
+            resolved: dict[str, object] = {}
             if node.category == "input" and not incoming[node_id]:
-                node_inputs.update(inputs)
+                resolved.update(inputs)
             values_by_port: dict[str, list[object]] = defaultdict(list)
-            missing_upstream_ports: list[str] = []
-            for edge in incoming[node_id]:
+            for edge in sorted(incoming[node_id],
+                               key=lambda connected: execution_order[connected.source]):
                 source_outputs = node_outputs.get(edge.source)
-                if source_outputs is not None and edge.source_port in source_outputs:
-                    values_by_port[edge.target_port].append(
-                        source_outputs[edge.source_port]
-                    )
-                elif edge.target_port not in missing_upstream_ports:
-                    missing_upstream_ports.append(edge.target_port)
-            for port, values in values_by_port.items():
-                node_inputs[port] = values[0] if len(values) == 1 else values
+                if source_outputs is None or edge.source_port not in source_outputs:
+                    continue
+                self._collect(values_by_port[edge.target_port], edge, source_outputs,
+                              specs.get(edge.target_port), nodes_by_id)
+            for port, collected in values_by_port.items():
+                spec = specs.get(port)
+                if spec is not None and spec.collect:
+                    resolved[port] = collected
+                else:
+                    resolved[port] = collected[0]
 
-            if node_id in skipped_generation_branch:
+            if node_id in halted_subtree:
                 context.trace.append(
                     NodeTrace(
                         node_id=node_id,
                         status="skipped",
-                        metadata={"reason": "gate_abstained"},
+                        metadata={"reason": "halted_upstream"},
+                    )
+                )
+                continue
+
+            activation = definition_node.activation
+            if activation is not None and not _matches(resolved, activation.port,
+                                                       activation.equals):
+                context.trace.append(
+                    NodeTrace(
+                        node_id=node_id,
+                        status="inactive",
+                        metadata={"reason": "activation_not_matched",
+                                  "port": activation.port},
                     )
                 )
                 continue
 
             missing_inputs = [
-                port
-                for port in node.inputs
-                if port not in node_inputs or port in missing_upstream_ports
+                spec.name for spec in specs.values()
+                if not spec.optional and spec.name not in resolved
             ]
             if missing_inputs:
                 context.trace.append(
@@ -151,7 +179,7 @@ class WorkflowEngine:
             started = perf_counter()
             try:
                 result = await node.execute(
-                    node_inputs, definition_node.config, context
+                    resolved, definition_node.config, context
                 )
             except ApiError as error:
                 duration_ms = max(0, int((perf_counter() - started) * 1000))
@@ -191,9 +219,9 @@ class WorkflowEngine:
                 )
                 return WorkflowRunResult(run_id, "failed", {}, context.trace)
 
-            # Explicitly skipped nodes may publish a harmless branch placeholder.
-            # Engine-induced skips above never publish outputs.
-            if result.status in ("success", "skipped") and result.outputs:
+            # skipped 表示"本次没有值"：只有 success 与 halt 才向下游发布输出，
+            # 消费者用 optional/collect 端口吸收缺口，而不是靠占位对象。
+            if result.status in ("success", "halt") and result.outputs:
                 node_outputs[node_id] = dict(result.outputs)
             context.trace.append(
                 NodeTrace(
@@ -206,24 +234,31 @@ class WorkflowEngine:
             if node.category == "output" and result.status == "success":
                 output = dict(result.outputs)
 
-            if result.status == "success" and result.outputs.get("abstained") is True:
-                abstention_output = dict(result.outputs)
-                generation_roots: set[str] = set()
-                for candidate_id in self._descendants(node_id, outgoing):
-                    try:
-                        candidate = self.registry.get(nodes_by_id[candidate_id].type)
-                    except KeyError:
-                        continue
-                    if candidate.category == "generation":
-                        generation_roots.add(candidate_id)
-                for generation_id in generation_roots:
-                    skipped_generation_branch.update(
-                        {generation_id, *self._descendants(generation_id, outgoing)}
-                    )
+            if result.status == "halt":
+                halt_output = dict(result.outputs)
+                halted_subtree.update(self._descendants(node_id, outgoing))
 
-        if abstention_output is not None:
-            output = abstention_output
+        if halt_output is not None:
+            output = halt_output
         return WorkflowRunResult(run_id, "success", output, context.trace)
+
+    def _collect(self, bucket: list[object], edge: WorkflowEdge,
+                 source_outputs: dict[str, object], spec: PortSpec | None,
+                 nodes_by_id: dict[str, WorkflowNode]) -> None:
+        """Add one edge's value to a port bucket, honouring the port's cardinality."""
+        value = source_outputs[edge.source_port]
+        if spec is None or not spec.collect:
+            bucket.append(value)
+            return
+        source_dtype = self.registry.get(nodes_by_id[edge.source].type).outputs.get(
+            edge.source_port
+        )
+        # A collect port of dtype T accepts T edges and list<T> edges; the latter
+        # contribute their items, which is how one fan-out producer feeds a join.
+        if source_dtype is not None and list_item(source_dtype) == spec.dtype:
+            bucket.extend(value if isinstance(value, list) else [value])
+        else:
+            bucket.append(value)
 
     @staticmethod
     def _descendants(node_id: str, outgoing: dict[str, list[str]]) -> set[str]:
@@ -241,3 +276,13 @@ class WorkflowEngine:
     def _safe_node_error(_error: dict[str, str] | None) -> dict[str, str]:
         """Return generic trace data instead of exposing node-supplied strings."""
         return {"code": "NODE_EXECUTION_ERROR", "message": "节点执行失败"}
+
+
+def _matches(resolved: dict[str, object], port: str, expected: object) -> bool:
+    """Evaluate a node's activation condition against its resolved inputs."""
+    if port not in resolved:
+        return False
+    actual = resolved[port]
+    if isinstance(actual, list):
+        return expected in actual
+    return actual == expected

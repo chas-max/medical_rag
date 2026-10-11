@@ -7,6 +7,19 @@ from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 WorkflowStatus = Literal["draft", "validated", "published"]
 
 
+class NodeActivation(BaseModel):
+    """Runs a node only when one of its inputs carries the expected value.
+
+    Declaring the condition on the instance keeps branch selection out of the
+    node implementation, so a router is just another deletable node.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    port: str
+    equals: JsonValue
+
+
 class WorkflowNode(BaseModel):
     """A node instance placed in a workflow graph."""
 
@@ -16,6 +29,7 @@ class WorkflowNode(BaseModel):
     type: str
     position: dict[str, float] = Field(default_factory=dict)
     config: dict[str, JsonValue] = Field(default_factory=dict)
+    activation: NodeActivation | None = None
 
 
 class WorkflowEdge(BaseModel):

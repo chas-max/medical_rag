@@ -2,7 +2,24 @@
 
 from copy import deepcopy
 
-from .contracts import Node
+from .contracts import (
+    CANONICAL_FIXED_TYPES,
+    FIXED_NODE_CATEGORIES,
+    Node,
+    node_inputs,
+    node_shared_producers,
+    node_tags,
+)
+
+
+def port_info(spec) -> dict:
+    """Wire form of an input port; the port name is already the mapping key."""
+    return {
+        "dtype": spec.dtype,
+        "optional": spec.optional,
+        "collect": spec.collect,
+        "requires_tag": spec.requires_tag,
+    }
 
 
 class NodeRegistry:
@@ -25,9 +42,13 @@ class NodeRegistry:
                 "type": node.type,
                 "title": node.title,
                 "category": node.category,
-                "inputs": deepcopy(node.inputs),
+                "inputs": {name: port_info(spec) for name, spec in node_inputs(node).items()},
                 "outputs": deepcopy(node.outputs),
+                "tags": sorted(node_tags(node)),
+                "shared_producers": [list(pair) for pair in node_shared_producers(node)],
                 "config_schema": deepcopy(node.config_schema),
+                "fixed": node.category in FIXED_NODE_CATEGORIES,
+                "canonical": CANONICAL_FIXED_TYPES.get(node.category) == node.type,
             }
             for node in sorted(self._nodes.values(), key=lambda registered: registered.type)
         ]
