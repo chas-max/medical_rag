@@ -1,0 +1,33 @@
+{
+  "id": "medical-answer",
+  "name": "医疗资料问答",
+  "version": 2,
+  "status": "published",
+  "nodes": [
+    {"id":"query","type":"query.input","position":{"x":80,"y":180},"config":{}},
+    {"id":"dense","type":"retrieval.dense","position":{"x":330,"y":60},"config":{}},
+    {"id":"bm25","type":"retrieval.bm25","position":{"x":330,"y":300},"config":{}},
+    {"id":"fusion","type":"retrieval.rrf","position":{"x":580,"y":180},"config":{"k":60}},
+    {"id":"rerank","type":"retrieval.rerank","position":{"x":830,"y":180},"config":{}},
+    {"id":"gate","type":"evidence.gate","position":{"x":1080,"y":180},"config":{}},
+    {"id":"llm","type":"generation.llm","position":{"x":1330,"y":180},"config":{}},
+    {"id":"citation","type":"citation.validate","position":{"x":1580,"y":180},"config":{}},
+    {"id":"output","type":"answer.output","position":{"x":1830,"y":180},"config":{}}
+  ],
+  "edges": [
+    {"id":"q-d","source":"query","source_port":"question","target":"dense","target_port":"question"},
+    {"id":"q-b","source":"query","source_port":"question","target":"bm25","target_port":"question"},
+    {"id":"d-f","source":"dense","source_port":"evidence","target":"fusion","target_port":"sources"},
+    {"id":"b-f","source":"bm25","source_port":"evidence","target":"fusion","target_port":"sources"},
+    {"id":"f-r","source":"fusion","source_port":"evidence","target":"rerank","target_port":"evidence"},
+    {"id":"q-r","source":"query","source_port":"question","target":"rerank","target_port":"question"},
+    {"id":"q-k","source":"query","source_port":"top_k","target":"rerank","target_port":"top_k"},
+    {"id":"r-g","source":"rerank","source_port":"evidence","target":"gate","target_port":"evidence"},
+    {"id":"g-l","source":"gate","source_port":"evidence","target":"llm","target_port":"evidence"},
+    {"id":"q-l","source":"query","source_port":"question","target":"llm","target_port":"question"},
+    {"id":"q-p","source":"query","source_port":"provider","target":"llm","target_port":"provider"},
+    {"id":"l-c","source":"llm","source_port":"draft","target":"citation","target_port":"draft"},
+    {"id":"l-e","source":"llm","source_port":"evidence","target":"citation","target_port":"evidence"},
+    {"id":"c-o","source":"citation","source_port":"answer","target":"output","target_port":"answer"}
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "drafts": [
+    {
+      "draft": "dietary-guidelines.psv",
+      "source_id": "dietary-guidelines-2022",
+      "source_file": "../../../中国居民膳食指南2022_平衡膳食八准则.md",
+      "category": "中国居民膳食指南八准则"
+    },
+    {
+      "draft": "hypertension-diet-qa.psv",
+      "source_id": "hypertension-diet-qa-2023",
+      "source_file": "../../../成人高血压食养指南（2023年版）问答.pdf",
+      "category": "成人高血压食养"
+    },
+    {
+      "draft": "hypertension-diet-main.psv",
+      "source_id": "hypertension-diet-2023",
+      "source_file": "../../../成人高血压食养指南（2023年版）.pdf",
+      "category": "成人高血压食养"
+    },
+    {
+      "draft": "diabetes-diet.psv",
+      "source_id": "diabetes-diet-2023",
+      "source_file": "../../../成人糖尿病食养指南（2023年版）.pdf",
+      "category": "成人糖尿病食养"
+    },
+    {
+      "draft": "public-health.psv",
+      "source_id": "public-health-2017",
+      "source_file": "../../../国家基本公共卫生服务规范（第三版）.pdf",
+      "category": "基本公共卫生与随访"
+    },
+    {
+      "draft": "primary-hypertension.psv",
+      "source_id": "primary-hypertension-2025",
+      "source_file": "../../../国家基层高血压防治管理指南（2025版）.pdf",
+      "category": "基层高血压诊疗"
+    },
+    {
+      "draft": "health-literacy.psv",
+      "source_id": "health-literacy-2024",
+      "source_file": "../../../中国公民健康素养——基本知识与技能（2024年版）.pdf",
+      "category": "公民健康素养"
+    }
+  ],
+  "composites": [
+    {"draft": "cross-topic.psv", "category": "跨主题综合场景"}
+  ]
+}

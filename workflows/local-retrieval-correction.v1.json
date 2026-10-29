@@ -1,0 +1,40 @@
+{
+  "id": "local-retrieval-correction",
+  "name": "本地检索纠错迭代",
+  "version": 1,
+  "status": "published",
+  "kind": "agent_iteration",
+  "nodes": [
+    {"id":"input","type":"agent.input","position":{"x":60,"y":180},"config":{}},
+    {"id":"assess","type":"evidence.assess","position":{"x":320,"y":60},"config":{}},
+    {"id":"refine","type":"question.refine","position":{"x":580,"y":60},"config":{},"activation":{"port":"repair","equals":true}},
+    {"id":"retrieve","type":"retrieval.multi","position":{"x":840,"y":60},"config":{"strategy":"hybrid"}},
+    {"id":"accumulate","type":"evidence.accumulate","position":{"x":1100,"y":180},"config":{}},
+    {"id":"rerank","type":"retrieval.rerank","position":{"x":1360,"y":180},"config":{}},
+    {"id":"output","type":"agent.output","position":{"x":1620,"y":300},"config":{}}
+  ],
+  "edges": [
+    {"id":"i-a-q","source":"input","source_port":"question","target":"assess","target_port":"question"},
+    {"id":"i-a-e","source":"input","source_port":"evidence","target":"assess","target_port":"evidence"},
+    {"id":"i-a-p","source":"input","source_port":"provider","target":"assess","target_port":"provider"},
+    {"id":"i-a-s","source":"input","source_port":"state","target":"assess","target_port":"state"},
+    {"id":"i-f-q","source":"input","source_port":"question","target":"refine","target_port":"question"},
+    {"id":"i-f-p","source":"input","source_port":"provider","target":"refine","target_port":"provider"},
+    {"id":"i-f-f","source":"input","source_port":"feedback","target":"refine","target_port":"feedback"},
+    {"id":"a-f-a","source":"assess","source_port":"assessment","target":"refine","target_port":"assessment"},
+    {"id":"a-f-r","source":"assess","source_port":"repair","target":"refine","target_port":"repair"},
+    {"id":"f-r-q","source":"refine","source_port":"queries","target":"retrieve","target_port":"queries"},
+    {"id":"i-c-e","source":"input","source_port":"evidence","target":"accumulate","target_port":"sources"},
+    {"id":"r-c-e","source":"retrieve","source_port":"evidence","target":"accumulate","target_port":"sources"},
+    {"id":"c-r-e","source":"accumulate","source_port":"evidence","target":"rerank","target_port":"evidence"},
+    {"id":"i-r-q","source":"input","source_port":"question","target":"rerank","target_port":"question"},
+    {"id":"i-r-k","source":"input","source_port":"top_k","target":"rerank","target_port":"top_k"},
+    {"id":"i-o-e","source":"input","source_port":"evidence","target":"output","target_port":"evidence"},
+    {"id":"r-o-e","source":"rerank","source_port":"evidence","target":"output","target_port":"evidence"},
+    {"id":"i-o-q","source":"input","source_port":"question","target":"output","target_port":"question"},
+    {"id":"i-o-p","source":"input","source_port":"provider","target":"output","target_port":"provider"},
+    {"id":"i-o-k","source":"input","source_port":"top_k","target":"output","target_port":"top_k"},
+    {"id":"i-o-s","source":"input","source_port":"state","target":"output","target_port":"state"},
+    {"id":"a-o-a","source":"assess","source_port":"assessment","target":"output","target_port":"assessment"}
+  ]
+}

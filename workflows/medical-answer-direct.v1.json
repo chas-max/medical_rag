@@ -1,0 +1,23 @@
+{
+  "id": "medical-answer-direct",
+  "name": "最简直连问答",
+  "version": 1,
+  "status": "published",
+  "nodes": [
+    {"id":"query","type":"query.input","position":{"x":80,"y":180},"config":{}},
+    {"id":"dense","type":"retrieval.dense","position":{"x":340,"y":180},"config":{}},
+    {"id":"gate","type":"evidence.gate","position":{"x":600,"y":180},"config":{}},
+    {"id":"llm","type":"generation.llm","position":{"x":860,"y":180},"config":{}},
+    {"id":"citation","type":"citation.validate","position":{"x":1120,"y":180},"config":{}},
+    {"id":"output","type":"answer.output","position":{"x":1380,"y":180},"config":{}}
+  ],
+  "edges": [
+    {"id":"q-d","source":"query","source_port":"question","target":"dense","target_port":"question"},
+    {"id":"d-g","source":"dense","source_port":"evidence","target":"gate","target_port":"evidence"},
+    {"id":"g-l","source":"gate","source_port":"evidence","target":"llm","target_port":"evidence"},
+    {"id":"q-l","source":"query","source_port":"question","target":"llm","target_port":"question"},
+    {"id":"l-c","source":"llm","source_port":"draft","target":"citation","target_port":"draft"},
+    {"id":"l-e","source":"llm","source_port":"evidence","target":"citation","target_port":"evidence"},
+    {"id":"c-o","source":"citation","source_port":"answer","target":"output","target_port":"answer"}
+  ]
+}

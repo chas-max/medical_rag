@@ -1,0 +1,22 @@
+{
+  "id":"document-ingestion","name":"公开资料入库","version":1,"status":"published",
+  "nodes":[
+    {"id":"input","type":"document.input","position":{"x":80,"y":180},"config":{}},
+    {"id":"parse","type":"document.parse","position":{"x":330,"y":180},"config":{}},
+    {"id":"chunk","type":"document.chunk","position":{"x":580,"y":180},"config":{}},
+    {"id":"embed","type":"document.embed","position":{"x":830,"y":80},"config":{}},
+    {"id":"store","type":"document.store","position":{"x":1080,"y":180},"config":{}},
+    {"id":"output","type":"document.output","position":{"x":1330,"y":180},"config":{}}
+  ],
+  "edges":[
+    {"id":"i-p-f","source":"input","source_port":"filename","target":"parse","target_port":"filename"},
+    {"id":"i-p-c","source":"input","source_port":"content","target":"parse","target_port":"content"},
+    {"id":"i-c-s","source":"input","source_port":"source_id","target":"chunk","target_port":"source_id"},
+    {"id":"p-c","source":"parse","source_port":"parsed","target":"chunk","target_port":"parsed"},
+    {"id":"c-e","source":"chunk","source_port":"chunks","target":"embed","target_port":"chunks"},
+    {"id":"c-s-d","source":"chunk","source_port":"document","target":"store","target_port":"document"},
+    {"id":"c-s-c","source":"chunk","source_port":"chunks","target":"store","target_port":"chunks"},
+    {"id":"e-s","source":"embed","source_port":"vectors","target":"store","target_port":"vectors"},
+    {"id":"s-o","source":"store","source_port":"result","target":"output","target_port":"result"}
+  ]
+}

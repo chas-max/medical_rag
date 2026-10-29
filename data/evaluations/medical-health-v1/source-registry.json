@@ -1,0 +1,68 @@
+{
+  "schema_version": "1.0",
+  "sources": [
+    {
+      "source_id": "public-health-2017",
+      "filename": "../../国家基本公共卫生服务规范（第三版）.pdf",
+      "publisher": "原国家卫生计生委",
+      "publication_date": "2017",
+      "url": "http://hp.whut.edu.cn/zkmz/sqggwsfw/202410/P020241018615146486575.pdf",
+      "sha256": "5e61460188040be01605e8294561f8d82f29c09720dca40ff8c1eab7703431d8",
+      "extraction": "pypdf page extraction; printed page numbers differ from PDF indexes"
+    },
+    {
+      "source_id": "primary-hypertension-2025",
+      "filename": "../../国家基层高血压防治管理指南（2025版）.pdf",
+      "publisher": "国家心血管病中心国家基层高血压防治管理办公室",
+      "publication_date": "2025",
+      "url": "https://www.scdc.sh.cn/shjk/shjk/upload/202510/1031_101832_436.pdf",
+      "sha256": "22fab1133592a1f485bbfb213d6ad419b3f085dd03a17c2e9bbab8f227a172f8",
+      "extraction": "pypdf page extraction; two-column text order needs manual review"
+    },
+    {
+      "source_id": "hypertension-diet-2023",
+      "filename": "../../成人高血压食养指南（2023年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "url": "https://www.nhc.gov.cn/sps/c100088/202301/f01895a06c5349ef999f25da833c166d/files/1732844468193_68545.pdf",
+      "sha256": "e6c5227d95d289a810c953d895afc740ae922fc80ed4a8f1d5f4e39a9cd6c000",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hypertension-diet-qa-2023",
+      "filename": "../../成人高血压食养指南（2023年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "url": "https://www.nhc.gov.cn/sps/c100088/202301/f01895a06c5349ef999f25da833c166d/files/1732844468136_16321.pdf",
+      "sha256": "fc8003c2bf44f1a7944770268604153090960eca0bfd84d9cceea50e4316d68a",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "diabetes-diet-2023",
+      "filename": "../../成人糖尿病食养指南（2023年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "url": "https://www.nhc.gov.cn/cms-search/downFiles/4fcbecd2c18e46baaf291bf46c2b79cd.pdf",
+      "sha256": "2e03cd9e06b1a1faf67298647a01c5e5d2be9cd99aacb527732c51f1ee378d87",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "health-literacy-2024",
+      "filename": "../../中国公民健康素养——基本知识与技能（2024年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2024",
+      "url": "https://xyy.haust.edu.cn/__local/4/84/6C/F09EDA9070A0AA56F7E0A3022BC_76C27BAA_C3620.pdf",
+      "sha256": "fa46725dba26d5ecf2978d3fddf721fd76e57128106e4af5144bad018395dc7e",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "dietary-guidelines-2022",
+      "filename": "../../中国居民膳食指南2022_平衡膳食八准则.md",
+      "publisher": "中国营养学会",
+      "publication_date": "2022",
+      "url": "http://dg.cnsoc.org/article/04/J4-AsD_DR3OLQMnHG0-jZA.html",
+      "sha256": "a8a74dfe2f23c5e2a8e5ae4c7e9979d14ed110d5893374c9d8adae66ac3bb7cd",
+      "extraction": "UTF-8 Markdown headings"
+    }
+  ]
+}
