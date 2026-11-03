@@ -1,0 +1,615 @@
+# Task8 I1 and M1 test-only fix package
+
+Base: byte-identical pre-fix snapshots outputs/task8-fix-baseline-20261103/tests.
+Head: frozen follow-up test sources; final hashes/commands in actual-mfa-report.md appendix.
+No production/policy/native-helper changes. Three files with full context.
+
+diff --git a/outputs/task8-fix-baseline-20261103/tests/test_keycloak_mfa_support.py b/tests/test_keycloak_mfa_support.py
+index 5b2a65c..05d9225 100644
+--- a/outputs/task8-fix-baseline-20261103/tests/test_keycloak_mfa_support.py
++++ b/tests/test_keycloak_mfa_support.py
+@@ -1,223 +1,225 @@
+ """Pure reference-policy and bounded native OTP-driver contracts."""
+ 
+ import inspect
+ import json
+ from pathlib import Path
+ 
+ import httpx
+ import keycloak_forms
+ import keycloak_runtime
+ import pytest
+ 
+ POLICY = Path(__file__).resolve().parents[1] / "deploy/identity/keycloak-mfa-policy.json"
+ 
+ 
+ def test_runtime_has_explicit_opt_in_policy_composition():
+     available = "realm_transform" in inspect.signature(keycloak_runtime.identity_runtime).parameters
+     assert available, "Actual MFA provisioning must opt in without changing default fixture behavior"
+ 
+ 
+ def test_fixture_composer_uses_same_public_policy_and_memory_only_credentials():
+     helper = Path(__file__).with_name("keycloak_mfa.py")
+     present = helper.exists()
+     assert present, "Focused MFA composer must load the shipped policy"
+     from keycloak_mfa import compose_mfa
+ 
+     imported, users = {"roles": {"realm": [{"name": "admin"}]} , "users": []}, {}
+     compose_mfa(imported, users)
+     public = json.loads(POLICY.read_text(encoding="utf-8"))
+     assert imported["authenticationFlows"] == public["authenticationFlows"]
+     assert imported["attributes"] == public["attributes"]
+-    assert set(users) == {"staff", "staff_norole", "staff_unenrolled"}
+-    assert "otp_seed" in users["staff"] and "otp_seed" not in users["staff_unenrolled"]
++    expected_users = set(users) == {"staff", "staff_norole", "staff_unenrolled"}
++    assert expected_users, "Composer must provision exactly the fictional staff scenarios"
++    enrollment_matches = "otp_seed" in users["staff"] and "otp_seed" not in users["staff_unenrolled"]
++    assert enrollment_matches, "Only enrolled fictional staff may have a fixture OTP seed"
+     assert all(user["realmRoles"] == ["medical-staff-mfa"] for user in imported["users"])
+     otp_models = [json.loads(credential["credentialData"]) for user in imported["users"]
+                   for credential in user["credentials"] if credential["type"] == "otp"]
+     encoding_matches = all(model.get("secretEncoding") == "BASE32" for model in otp_models)
+     assert encoding_matches, "Keycloak credential model must explicitly decode the Base32 fixture secret"
+ 
+ 
+ @pytest.mark.parametrize("now,waiting", [(60.0, False), (89.0, True)])
+ def test_code_generation_uses_cryptography_and_bounded_rollover(monkeypatch, now, waiting):
+     import keycloak_mfa
+     from cryptography.hazmat.primitives import hashes
+     from cryptography.hazmat.primitives.twofactor.totp import TOTP
+ 
+     available = hasattr(keycloak_mfa, "otp_code")
+     assert available, "Mature OTP generation with bounded rollover handling required"
+     slept = []
+     clock = iter([now, 90.05])
+     monkeypatch.setattr(keycloak_mfa.time, "time", lambda: next(clock))
+     monkeypatch.setattr(keycloak_mfa.time, "sleep", slept.append)
+     seed = b"fictional-unit-test-only"
+     code = keycloak_mfa.otp_code({"otp_seed": seed})
+     valid = code == TOTP(seed, 6, hashes.SHA1(), 30).generate(90.05 if waiting else now).decode()
+     assert valid, "Generated code must match mature TOTP utility"
+     assert bool(slept) == waiting
+     assert all(0 < duration < 3.1 for duration in slept)
+ 
+ 
+ def test_code_generation_never_reuses_the_last_issued_timestep(monkeypatch):
+     import keycloak_mfa
+ 
+     clock = iter([65.0, 90.05])
+     slept = []
+     monkeypatch.setattr(keycloak_mfa.time, "time", lambda: next(clock))
+     monkeypatch.setattr(keycloak_mfa.time, "sleep", slept.append)
+     user = {"otp_seed": b"fictional-unit-test-only", "_last_otp_step": 2}
+     keycloak_mfa.otp_code(user)
+     fresh = user["_last_otp_step"] == 3 and len(slept) == 1 and 0 < slept[0] <= 30.05
+     assert fresh, "Keep provider single-use OTP policy; wait boundedly for a fresh timestep"
+ 
+ 
+ def test_wrong_code_is_outside_default_provider_time_window(monkeypatch):
+     import keycloak_mfa
+     from cryptography.hazmat.primitives import hashes
+     from cryptography.hazmat.primitives.twofactor.totp import TOTP
+ 
+     available = hasattr(keycloak_mfa, "wrong_otp_code")
+     assert available, "Actual bad-OTP test must deterministically avoid valid adjacent timestep codes"
+     monkeypatch.setattr(keycloak_mfa.time, "time", lambda: 300.0)
+     user = {"otp_seed": b"fictional-unit-test-only"}
+     code = keycloak_mfa.wrong_otp_code(user)
+     candidates = {TOTP(user["otp_seed"], 6, hashes.SHA1(), 30).generate(300 + offset * 30).decode() for offset in range(-2, 3)}
+     invalid = code not in candidates and len(code) == 6 and code.isdecimal()
+     assert invalid, "Bad code must be a native six-digit input outside the provider default acceptance window"
+ 
+ 
+ def test_public_policy_native_role_and_level_required_without_deployment_identity():
+     present = POLICY.exists()
+     assert present, "Reusable public MFA policy fragment is required"
+     policy = json.loads(POLICY.read_text(encoding="utf-8"))
+     assert set(policy) == {"authenticationFlows", "authenticatorConfig", "browserFlow", "attributes", "roles"}
+     assert policy["attributes"]["acr.loa.map"] == '{"urn:medical-rag:reference:otp":2}'
+     flows = {flow["alias"]: flow for flow in policy["authenticationFlows"]}
+     level2 = flows["medical-reference-staff-level2"]["authenticationExecutions"]
+     assert [item["authenticator"] for item in level2] == [
+         "conditional-user-role", "conditional-level-of-authentication", "auth-otp-form"]
+     assert all(item["requirement"] == "REQUIRED" for item in level2)
+     configs = {item["alias"]: item["config"] for item in policy["authenticatorConfig"]}
+     assert configs["medical-reference-level2"] == {"loa-condition-level": "2", "loa-max-age": "0"}
+     assert configs["medical-reference-staff"] == {"condUserRole": "medical-staff-mfa", "negate": "false"}
+     assert policy["roles"] == {"realm": [{"name": "medical-staff-mfa"}]}
+     assert not any("mapper" in key.lower() for key in policy)
+ 
+ 
+ def test_password_challenge_driver_exists():
+     available = callable(getattr(keycloak_forms, "password_challenge", None))
+     assert available, "Native password driver must return a bounded pending OTP challenge"
+ 
+ 
+ def test_otp_submit_driver_exists():
+     available = callable(getattr(keycloak_forms, "submit_otp", None))
+     assert available, "Native OTP driver must submit to actual provider"
+ 
+ 
+ def test_pending_challenge_repr_is_private():
+     available = hasattr(keycloak_forms, "OTPChallenge")
+     assert available, "Pending challenge must have a private representation"
+     challenge = keycloak_forms.OTPChallenge("PRIVATE-CANARY", {"otp": "PRIVATE-CANARY"})
+     assert "PRIVATE-CANARY" not in repr(challenge)
+ 
+ 
+ @pytest.mark.parametrize("result", ["otp", "rejected", "redirect", "invalid", "external", "large"])
+ def test_driver_requires_native_password_then_bounded_same_origin_otp(monkeypatch, result):
+     assert hasattr(keycloak_forms, "password_challenge"), "Native challenge driver required"
+     calls = []
+     login = b'<form id="kc-form-login" method="post" action="/password"><input name="credentialId" value="fictional"></form>'
+     otp = b'<form id="kc-otp-login-form" method="post" action="/otp"><input name="otp"></form>'
+     if result == "external":
+         otp = otp.replace(b'/otp', b'https://external.invalid/otp')
+     response = httpx.Response(200, request=httpx.Request("GET", "https://provider.invalid/auth"))
+ 
+     def request(browser, method, url, **kwargs):
+         calls.append((method, url, kwargs))
+         if len(calls) == 1:
+             return response, login
+         if result == "redirect":
+             return httpx.Response(302, headers={"location": "https://app.invalid/callback"}, request=response.request), b""
+         if result == "invalid":
+             return httpx.Response(500, request=response.request), b""
+         return response, login if result == "rejected" else otp
+ 
+     monkeypatch.setattr(keycloak_forms, "_request", request)
+     if result in {"invalid", "external"}:
+         with pytest.raises(RuntimeError):
+             keycloak_forms.password_challenge(None, "https://provider.invalid/auth", "fictional", "private")
+         return
+     challenge, redirect = keycloak_forms.password_challenge(None, "https://provider.invalid/auth", "fictional", "private")
+     assert calls[1][0:2] == ("POST", "https://provider.invalid/password")
+     assert (challenge is not None) == (result in {"otp", "large"})
+     assert bool(redirect) == (result == "redirect")
+ 
+ 
+ @pytest.mark.parametrize("status,challenge_page", [(302, False), (200, True), (400, False)])
+ def test_otp_submit_accepts_redirect_only_and_preserves_rejected_challenge(monkeypatch, status, challenge_page):
+     assert hasattr(keycloak_forms, "submit_otp"), "OTP submission driver required"
+     challenge = keycloak_forms.OTPChallenge("https://provider.invalid/otp", {})
+     body = b'<form id="kc-otp-login-form" method="post" action="/otp"><input name="otp"></form>'
+     response = httpx.Response(status, headers={"location": "https://app.invalid/callback"}, request=httpx.Request("POST", challenge.action))
+     monkeypatch.setattr(keycloak_forms, "_request", lambda *args, **kwargs: (response, body))
+     if status == 400:
+         with pytest.raises(RuntimeError):
+             keycloak_forms.submit_otp(None, challenge, "123456")
+     else:
+         pending, redirect = keycloak_forms.submit_otp(None, challenge, "123456")
+         assert (pending is not None) == challenge_page
+         assert bool(redirect) == (status == 302)
+ 
+ 
+ @pytest.mark.parametrize("oversized", [False, True])
+ def test_native_stream_is_bounded_before_decoding(oversized):
+     # Synthetic driver-only test; actual-provider suites do not use MockTransport.
+     payload = b"x" * (131073 if oversized else 8)
+     with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=payload))) as browser:
+         if oversized:
+             with pytest.raises(RuntimeError, match="^Provider page limit$"):
+                 keycloak_forms._request(browser, "GET", "https://provider.invalid/form")
+         else:
+             response, body = keycloak_forms._request(browser, "GET", "https://provider.invalid/form")
+             assert response.status_code == 200 and body == payload
+ 
+ 
+ @pytest.mark.parametrize("html", [
+     '<form id="f" method="get">',
+     '<form id="f" method="post"></form><form id="f" method="post">',
+     '<form id="f" method="post"><input name="x"><input name="x">',
+     '<form id="f" method="post"><input name="' + 'x' * 257 + '">',
+ ])
+ def test_native_form_rejects_ambiguous_or_unbounded_controls(html):
+     with pytest.raises(RuntimeError):
+         keycloak_forms.NativeForm(html, "f")
+ 
+ 
+ @pytest.mark.parametrize("action", [None, "https://external.invalid/otp", "https://user@provider.invalid/otp", "/otp#fragment"])
+ def test_native_otp_action_remains_same_origin_without_userinfo_or_fragments(action):
+     response = httpx.Response(200, request=httpx.Request("GET", "https://provider.invalid/form"))
+     form = keycloak_forms.NativeForm('<form id="f" method="post">', "f")
+     form.action = action
+     with pytest.raises(RuntimeError):
+         keycloak_forms._action(response, form)
+ 
+ 
+ def test_native_sso_get_can_return_otp_without_resending_password(monkeypatch):
+     calls = []
+     response = httpx.Response(200, request=httpx.Request("GET", "https://provider.invalid/form"))
+     body = b'<form id="kc-otp-login-form" method="post" action="/otp"><input name="otp"></form>'
+ 
+     def request(*args, **kwargs):
+         calls.append(args)
+         return response, body
+ 
+     monkeypatch.setattr(keycloak_forms, "_request", request)
+     pending, redirect = keycloak_forms.password_challenge(None, "https://provider.invalid/auth", "fictional", "private")
+     assert pending is not None and redirect is None and len(calls) == 1
+ 
+ 
+ def test_otp_clock_rollback_fails_statically(monkeypatch):
+     import keycloak_mfa
+ 
+     monkeypatch.setattr(keycloak_mfa.time, "time", lambda: 60.0)
+     monkeypatch.setattr(keycloak_mfa.time, "sleep", lambda _: None)
+     with pytest.raises(RuntimeError, match="^Fixture OTP clock did not advance$"):
+         keycloak_mfa.otp_code({"otp_seed": b"fictional-unit-test-only", "_last_otp_step": 2})
+
+diff --git a/outputs/task8-fix-baseline-20261103/tests/test_keycloak_mfa_privacy.py b/tests/test_keycloak_mfa_privacy.py
+index d5c64e0..5890316 100644
+--- a/outputs/task8-fix-baseline-20261103/tests/test_keycloak_mfa_privacy.py
++++ b/tests/test_keycloak_mfa_privacy.py
+@@ -1,72 +1,134 @@
+ """Replay actual MFA assertion AST with synthetic sensitive canaries only."""
+ 
+ import ast
+ import base64
+ from pathlib import Path
+ from types import SimpleNamespace
+ 
+ import pytest
++from _pytest.assertion import util as assertion_util
+ from _pytest.assertion.rewrite import rewrite_asserts
+ 
+ SOURCE = Path(__file__).with_name("test_keycloak_mfa.py")
+ 
+ 
+ def test_new_acr_red_diagnostics_do_not_repr_credential_bearing_fixture_argument():
+     tree = ast.parse(SOURCE.with_name("test_oidc_login.py").read_text(encoding="utf-8"))
+     scenario = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "test_login_requests_only_sorted_trusted_nonessential_acr")
+     private = "system" not in {argument.arg for argument in scenario.args.args}
+     assert private, "New ACR test must not expose the legacy credential-bearing fixture tuple in pytest argument diagnostics"
+ 
+ 
+-def checks():
+-    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++def checks(source=SOURCE, scenario=None):
++    tree = ast.parse(source.read_text(encoding="utf-8"))
++    if scenario is not None:
++        tree = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == scenario)
+     result = {}
+     for parent in ast.walk(tree):
+         for value in vars(parent).values():
+             if not isinstance(value, list):
+                 continue
+             for index, node in enumerate(value):
+                 if isinstance(node, ast.Assert):
+                     statements = [node]
+                     if isinstance(node.test, ast.Name) and index and isinstance(value[index - 1], ast.Assign):
+                         statements.insert(0, value[index - 1])
+                     result[getattr(node.test, "id", str(node.lineno))] = statements
+     return result
+ 
+ 
++def composer_checks():
++    assertions = checks(SOURCE.with_name("test_keycloak_mfa_support.py"),
++                        "test_fixture_composer_uses_same_public_policy_and_memory_only_credentials")
++    return [items for items in assertions.values()
++            if any(isinstance(node, ast.Name) and node.id == "users"
++                   for statement in items for node in ast.walk(statement))]
++
++
++def test_composer_sensitive_checks_are_boolean_locals_and_static_messages():
++    assertions = composer_checks()
++    private = len(assertions) == 2 and all(
++        len(items) == 2 and isinstance(items[-1].test, ast.Name)
++        and isinstance(items[-1].msg, ast.Constant) and isinstance(items[-1].msg.value, str)
++        for items in assertions)
++    assert private, "Credential-bearing composer checks must use boolean locals and static messages"
++
++
++@pytest.mark.parametrize("failure", ["missing_user", "unexpected_unenrolled_seed"])
++def test_rewritten_actual_composer_failures_never_dump_credentials(failure, monkeypatch):
++    # Exercise default rewritten diagnostics too; set-diff hooks can hide call arguments.
++    monkeypatch.setattr(assertion_util, "_reprcompare", None)
++    password, seed = "PRIVATE_PASSWORD_CANARY", b"PRIVATE_SEED_CANARY"
++    users = {name: {"password": password, "otp_seed": seed}
++             for name in ("staff", "staff_norole", "staff_unenrolled")}
++    if failure == "missing_user":
++        del users["staff_norole"]
++        del users["staff_unenrolled"]["otp_seed"]
++    statements = composer_checks()[0 if failure == "missing_user" else 1]
++    source = ast.unparse(ast.Module(body=statements, type_ignores=[])).encode()
++    rewritten = ast.parse(source)
++    rewrite_asserts(rewritten, source)
++    try:
++        exec(compile(rewritten, "<synthetic-composer-check>", "exec"), {"users": users})  # noqa: S102
++    except AssertionError:
++        diagnostic = str(pytest.ExceptionInfo.from_current().getrepr(style="short", showlocals=False))
++    else:
++        pytest.fail("Synthetic actual composer check must fail")
++    safe = not any(value in diagnostic for value in (
++        password, seed.decode(), seed.hex(), base64.b32encode(seed).decode().rstrip("=")))
++    assert safe, "Rewritten actual composer assertion exposed synthetic sensitive values"
++    fixed = isinstance(statements[-1].msg, ast.Constant) and statements[-1].msg.value in diagnostic and "assert False" in diagnostic
++    assert fixed, "Synthetic composer diagnostic must retain the actual static assertion message"
++
++
++def test_consumed_callback_replay_supplies_original_pending_browser_proof():
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    scenario = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
++                    and node.name == "test_actual_sso_reauthentication_requires_otp_again_and_stale_challenge_denied")
++    calls = [node for node in ast.walk(scenario) if isinstance(node, ast.Call)]
++    replay = next((node for node in calls if isinstance(node.func, ast.Attribute)
++                   and node.func.attr == "get" and node.args and isinstance(node.args[0], ast.Name)
++                   and node.args[0].id == "first_callback"), None)
++    supplied = replay is not None and any(
++        keyword.arg == "headers" and any(isinstance(node, ast.Name) and node.id == "original_pending_cookie"
++                                         for node in ast.walk(keyword.value))
++        for keyword in replay.keywords)
++    assert supplied, "Consumed first callback replay must supply original pending browser proof explicitly"
++
++
+ def test_actual_mfa_checks_are_boolean_locals_and_static_messages():
+     assertions = checks().values()
+     private = all(len(items) == 2 and isinstance(items[-1].test, ast.Name)
+                   and isinstance(items[-1].msg, ast.Constant) and isinstance(items[-1].msg.value, str)
+                   for items in assertions)
+     assert private, "All actual MFA checks must use boolean locals and static messages"
+ 
+ 
+ @pytest.mark.parametrize("name", ["credentials_private", "seed_base32_private", "tokens_private", "otp_private"])
+ def test_rewritten_privacy_assertions_never_dump_sensitive_values(name):
+     all_checks = checks()
+     present = name in all_checks
+     assert present, "Actual MFA privacy checks must cover encoded seed, raw JWT and the used OTP"
+     password, cookie, raw_logout, code = ("PRIVATE_PASSWORD_CANARY", "PRIVATE_COOKIE_CANARY", "PRIVATE_JWT_CANARY", "654321")
+     seed = b"PRIVATE_SEED_CANARY"
+     encoded = base64.b32encode(seed).decode().rstrip("=")
+     exposed = {"credentials_private": password, "seed_base32_private": encoded,
+                "tokens_private": raw_logout, "otp_private": code}[name]
+     namespace = {"base64": base64, "provider": SimpleNamespace(users={"staff": {"password": password, "otp_seed": seed}}),
+                  "exposed": exposed, "cookie": cookie, "logout_token": raw_logout,
+                  "body": ("logout_token=" + raw_logout).encode(), "used_code": code}
+     statements = all_checks[name]
+     source = ast.unparse(ast.Module(body=statements, type_ignores=[])).encode()
+     rewritten = ast.parse(source)
+     rewrite_asserts(rewritten, source)
+     try:
+         exec(compile(rewritten, "<synthetic-mfa-check>", "exec"), namespace)  # noqa: S102
+     except AssertionError:
+         diagnostic = str(pytest.ExceptionInfo.from_current().getrepr(style="short", showlocals=False))
+     else:
+         pytest.fail("Synthetic actual MFA privacy check must fail")
+     safe = not any(value in diagnostic for value in (password, cookie, raw_logout, code, seed.hex(), encoded))
+     assert safe, "Rewritten actual MFA assertion exposed synthetic sensitive values"
+     fixed = statements[-1].msg.value in diagnostic and "assert False" in diagnostic
+     assert fixed, "Synthetic diagnostic must retain the actual static assertion message"
+
+diff --git a/outputs/task8-fix-baseline-20261103/tests/test_keycloak_mfa.py b/tests/test_keycloak_mfa.py
+index 8075f57..afa4568 100644
+--- a/outputs/task8-fix-baseline-20261103/tests/test_keycloak_mfa.py
++++ b/tests/test_keycloak_mfa.py
+@@ -1,213 +1,225 @@
+ """Actual native password+OTP, signed assurance and isolated auditor API.
+ 
+ Provider boundary: pinned Keycloak real verified-HTTPS sockets. Application:
+ fixed HTTPS TestClient, real disposable least-privilege PostgreSQL authority.
+ """
+ 
+ # ruff: noqa: F401,F811 -- imported fixture functions
+ import base64
+ import json
+ from dataclasses import replace
+ from urllib.parse import parse_qs, urlsplit
+ 
+ import psycopg
+ import pytest
+ from fastapi.testclient import TestClient
+ from keycloak_forms import password_challenge, submit_otp
+ from keycloak_mfa import ACR, compose_mfa, otp_code, wrong_otp_code
+ from keycloak_runtime import APP_ORIGIN, identity_runtime
+ from test_keycloak_identity import application as raw_application
+ from test_keycloak_identity import csrf_headers, no_provider_url_logging
+ from test_keycloak_rotation import captured_logout
+ 
+ from medical_rag.oidc_login import OIDCLogin
+ from medical_rag.patient_api import create_patient_app
+ from medical_rag.patient_service import HealthNotice
+ 
+ pytestmark = pytest.mark.integration
+ 
+ 
+ @pytest.fixture(scope="module")
+ def provider(tmp_path_factory):
+     with identity_runtime(tmp_path_factory.mktemp("actual-mfa"), realm_transform=compose_mfa) as runtime:
+         yield runtime
+ 
+ 
+ @pytest.fixture
+ def application(raw_application, provider):
+     _, original, tenant, accounts = raw_application
+     with psycopg.connect(**provider.admin) as db:
+         for name in ("staff", "staff_norole", "staff_unenrolled"):
+             db.execute("DELETE FROM medical_rag.identity_roles WHERE tenant_id=%s AND account_id=%s",
+                        (tenant, accounts[name]))
+             if name != "staff_norole":
+                 db.execute("INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'auditor')", (tenant, accounts[name]))
+     login = OIDCLogin(replace(original.config, mfa_acr_values=frozenset({ACR})),
+                       lambda: psycopg.connect(**provider.database), tenant_id=tenant,
+                       transaction_encryption_key=b"m" * 32)
+     notice = HealthNotice("fictional-v1", "Fictional reference MFA only.", 3600)
+     with TestClient(create_patient_app(login, notice), base_url=APP_ORIGIN, headers={}) as client:
+         yield client, login, tenant, accounts
+ 
+ 
+ def begin(client, browser, provider, name):
+     response = client.post("/auth/login", headers={"Origin": APP_ORIGIN}, follow_redirects=False)
+     started = response.status_code == 303
+     assert started, "Application must start the native OIDC flow"
+     return password_challenge(browser, response.headers["location"], name, provider.users[name]["password"])
+ 
+ 
+ def finish(client, redirect):
+     callback_matches = bool(redirect) and urlsplit(redirect)[:3] == urlsplit(APP_ORIGIN + "/auth/callback")[:3]
+     assert callback_matches, "Provider callback must match the exact trusted origin and path"
+     return client.get(redirect, follow_redirects=False)
+ 
+ 
+ def actual_mfa(client, browser, provider, name):
+     pending, redirect = begin(client, browser, provider, name)
+     actual_challenge = pending is not None and redirect is None
+     assert actual_challenge, "Accepted password must require actual native OTP before any callback"
+     no_session = not client.cookies.get("__Host-medical-session")
+     assert no_session, "Password acceptance alone must not issue an application session"
+     code = otp_code(provider.users[name])
+     pending, redirect = submit_otp(browser, pending, code)
+     accepted = pending is None and redirect is not None
+     assert accepted, "Actual provider must accept the real fictional OTP"
+     completed = finish(client, redirect).status_code == 303
+     assert completed, "Actual signed OTP identity must complete the application session"
+     return code
+ 
+ 
+ def test_actual_password_otp_signed_assurance_allows_only_current_auditor(application, provider):
+     client, login, _, _ = application
+     with provider.browser() as browser:
+         actual_mfa(client, browser, provider, "staff")
+     principal = login.sessions.authenticate(client.cookies.get("__Host-medical-session"))
+     assurance_verified = principal.mfa_verified is True
+     assert assurance_verified, "Existing verifier/session authority must record signed accepted assurance"
+     audit_permission = client.get("/me").json()["data"]["permissions"]["audit"] is True
+     assert audit_permission, "Current local auditor with verified OTP must have audit permission"
+     auditor_allowed = client.get("/audit").status_code == 200
+     assert auditor_allowed, "Existing isolated auditor API must allow current verified auditor"
+     patient_denied = client.get("/me/consents/health").status_code == 403 and client.get("/conversations").status_code == 403
+     assert patient_denied, "Staff MFA must not grant self-patient consent or content access"
+ 
+ 
+ @pytest.mark.parametrize("name", ["patient1", "admin"])
+ def test_actual_requested_acr_does_not_upgrade_password_only_identity(application, provider, name):
+     client, login, _, _ = application
+     with provider.browser() as browser:
+         pending, redirect = begin(client, browser, provider, name)
+         lower_authentication = pending is None and redirect is not None
+         assert lower_authentication, "Non-staff classification must complete only password authentication"
+         completed = finish(client, redirect).status_code == 303
+         assert completed, "Nonessential requested ACR must permit lower-assurance identity"
+     principal = login.sessions.authenticate(client.cookies.get("__Host-medical-session"))
+     lower_assurance = principal.mfa_verified is False
+     assert lower_assurance, "Requested ACR alone must not verify MFA"
+     audit_denied = client.get("/audit").status_code == 403 and client.get("/me").json()["data"]["permissions"]["audit"] is False
+     assert audit_denied, "Patient or local low-assurance auditor must not access audit"
+     if name == "patient1":
+         patient_self = client.get("/me/consents/health").status_code == 200
+         assert patient_self, "Patient password identity must retain adult verified self functionality"
+ 
+ 
+ def test_actual_mfa_without_local_role_cannot_grant_audit(application, provider):
+     client, login, _, _ = application
+     with provider.browser() as browser:
+         actual_mfa(client, browser, provider, "staff_norole")
+     verified_but_unprivileged = login.sessions.authenticate(client.cookies.get("__Host-medical-session")).mfa_verified is True and client.get("/audit").status_code == 403
+     assert verified_but_unprivileged, "Provider classification and actual MFA must not grant a local auditor role"
+ 
+ 
+ def test_actual_wrong_missing_and_uncompleted_otp_cannot_issue_session(application, provider):
+     client, _, _, _ = application
+     with provider.browser() as browser:
+         pending, redirect = begin(client, browser, provider, "staff")
+         password_only_denied = pending is not None and redirect is None and client.get("/me").status_code == 401
+         assert password_only_denied, "Accepted password with incomplete OTP must have no application session"
+         for code in ("", wrong_otp_code(provider.users["staff"])):
+             pending, redirect = submit_otp(browser, pending, code)
+             actual_rejection = pending is not None and redirect is None
+             assert actual_rejection, "Actual provider must reject absent or incorrect OTP without callback"
+         guessed = client.get("/auth/callback", params={"state": "guessed", "code": "guessed"}, follow_redirects=False)
+         guessed_denied = guessed.status_code == 401 and not client.cookies.get("__Host-medical-session")
+         assert guessed_denied, "Guessed callback must not manufacture staff authority"
+ 
+ 
+ def test_actual_unenrolled_staff_cannot_silently_bypass_otp(application, provider):
+     client, _, _, _ = application
+     with provider.browser() as browser:
+         pending, redirect = begin(client, browser, provider, "staff_unenrolled")
+     unenrolled_denied = pending is None and bool(redirect) and urlsplit(redirect)[:2] == urlsplit(provider.issuer)[:2] and "required-action" in urlsplit(redirect).path and client.get("/me").status_code == 401
+     assert unenrolled_denied, "Unenrolled staff must redirect to provider required action, never application callback/session"
+ 
+ 
+ def test_actual_sso_reauthentication_requires_otp_again_and_stale_challenge_denied(application, provider):
+     client, _login, _, _ = application
+     with provider.browser() as browser:
+         pending, redirect = begin(client, browser, provider, "staff")
+         first_challenge = pending is not None and redirect is None
+         assert first_challenge, "Cold staff authentication must require OTP"
++        original_pending_cookie = client.cookies.get("__Host-medical-oidc")
++        browser_proof_present = bool(original_pending_cookie)
++        assert browser_proof_present, "Pending login must issue browser-bound OIDC proof"
+         stale = pending
+         first_code = otp_code(provider.users["staff"])
+         pending, redirect = submit_otp(browser, pending, first_code)
++        first_callback = redirect
+         completed = finish(client, redirect).status_code == 303
+         assert completed, "Initial OTP authentication must complete"
+         client.cookies.clear()
+         pending, redirect = begin(client, browser, provider, "staff")
+         new_challenge = pending is not None and redirect is None and client.get("/me").status_code == 401
+         assert new_challenge, "Provider SSO must require a new OTP challenge at level2 max-age zero"
+         pending, redirect = submit_otp(browser, pending, first_code)
+         replay_rejected = pending is not None and redirect is None and client.get("/me").status_code == 401
+         assert replay_rejected, "Actual provider must reject replayed OTP on a new SSO challenge"
+         pending, redirect = submit_otp(browser, pending, otp_code(provider.users["staff"]))
+         second_completed = finish(client, redirect).status_code == 303
+         assert second_completed, "SSO reauthentication must complete only after a fresh real OTP"
+         client.cookies.clear()
++        no_authenticated_cookie = not client.cookies.get("__Host-medical-session")
++        assert no_authenticated_cookie, "Consumed callback replay must start without an authenticated local cookie"
++        replay = client.get(first_callback, headers={"Cookie": "__Host-medical-oidc=" + original_pending_cookie},
++                            follow_redirects=False)
++        callback_replay_denied = replay.status_code == 401 and not client.cookies.get("__Host-medical-session") and client.get("/me").status_code == 401
++        assert callback_replay_denied, "Consumed first callback with original browser proof must not issue a new session"
+         _old_pending, old_redirect = submit_otp(browser, stale, first_code)
+         stale_callback = bool(old_redirect) and urlsplit(old_redirect)[:3] == urlsplit(APP_ORIGIN + "/auth/callback")[:3]
+-        stale_status = finish(client, old_redirect).status_code if stale_callback else None
+-        stale_denied = (not stale_callback or stale_status == 401) and client.get("/me").status_code == 401
++        provider_redirect = not old_redirect or urlsplit(old_redirect)[:2] == urlsplit(provider.issuer)[:2]
++        stale_status = client.get(old_redirect, headers={"Cookie": "__Host-medical-oidc=" + original_pending_cookie},
++                                  follow_redirects=False).status_code if stale_callback else None
++        stale_denied = (provider_redirect or stale_status == 401) and not client.cookies.get("__Host-medical-session") and client.get("/me").status_code == 401
+         assert stale_denied, "Consumed provider challenge must not issue a usable new application session"
+ 
+ 
+ @pytest.mark.parametrize("change", ["role", "disabled"])
+ def test_actual_mfa_current_role_and_account_revocation_block_next_access(application, provider, change):
+     client, _, tenant, accounts = application
+     with provider.browser() as browser:
+         actual_mfa(client, browser, provider, "staff")
+     with psycopg.connect(**provider.admin) as db:
+         if change == "role":
+             db.execute("DELETE FROM medical_rag.identity_roles WHERE tenant_id=%s AND account_id=%s", (tenant, accounts["staff"]))
+         else:
+             db.execute("UPDATE medical_rag.identity_accounts SET active=false WHERE tenant_id=%s AND account_id=%s", (tenant, accounts["staff"]))
+     revoked = client.get("/audit").status_code in (401, 403)
+     assert revoked, "Current local revocation must block the next auditor access"
+ 
+ 
+ def test_actual_mfa_provider_logout_and_audit_public_log_privacy(application, provider, caplog):
+     client, _login, tenant, _ = application
+     with provider.browser() as browser:
+         used_code = actual_mfa(client, browser, provider, "staff")
+         cookie = client.cookies.get("__Host-medical-session")
+         response = client.get("/audit")
+         request_ids = bool(response.headers.get("x-request-id"))
+         assert request_ids, "Auditor responses must retain server request IDs"
+         body = captured_logout(provider, browser)
+     delivered = client.post("/auth/backchannel-logout", content=body, headers={"Content-Type": "application/x-www-form-urlencoded"}).status_code == 200
+     assert delivered, "Actual signed provider logout must pass the existing signed route"
+     revoked = client.get("/audit").status_code == 401 and client.get("/me").status_code == 401
+     assert revoked, "Provider logout must invalidate the old actual-MFA local session"
+     with psycopg.connect(**provider.admin) as db:
+         audit = json.dumps(db.execute("SELECT * FROM medical_rag.security_audit_events WHERE tenant_id=%s", (tenant,)).fetchall(), default=str)
+     exposed = audit + caplog.text + response.text + client.get("/me").text
+     credentials_private = all(user["password"] not in exposed and ("otp_seed" not in user or user["otp_seed"].hex() not in exposed) for user in provider.users.values())
+     assert credentials_private, "Audit/public errors/logs must exclude credentials and OTP seeds"
+     seed_base32_private = all("otp_seed" not in user or base64.b32encode(user["otp_seed"]).decode().rstrip("=") not in exposed for user in provider.users.values())
+     assert seed_base32_private, "Audit/public errors/logs must exclude actual Base32-imported OTP seeds"
+     logout_token = parse_qs(body.decode())["logout_token"][0]
+     tokens_private = cookie not in exposed and logout_token not in exposed
+     assert tokens_private, "Audit/public errors/logs must exclude raw sessions and provider logout tokens"
+     otp_private = used_code not in exposed
+     assert otp_private, "Audit/public errors/logs must exclude the OTP actually submitted to provider"
+
+

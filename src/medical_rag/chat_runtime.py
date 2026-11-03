@@ -24,6 +24,7 @@ from .profile_models import (
 )
 from .profile_policy import build_profile_plan
 from .profile_store import LABELS, ProfileStore, fingerprint
+from .public_errors import public_error
 from .types import ApiError
 from .workflow.contracts import StreamEmitter
 
@@ -174,7 +175,7 @@ class ChatRuntime:
                                 question, decision, snapshot, payload.memory_consent), payload.memory_consent,
                             owner_token=request["owner_token"])
             except ApiError as error:
-                if error.status == 409:
+                if public_error(error.code).status == 409:
                     raise
             except Exception:  # noqa: BLE001 - optional extraction failures must not block retrieval
                 logger.warning("Profile analysis unavailable")
@@ -201,8 +202,7 @@ class ChatRuntime:
                     record["run_id"] = request["run_id"]
                 except Exception as error:  # noqa: BLE001 - preserve an already committed profile outcome
                     record["status"] = "failed"
-                    record["error"] = ({"code": error.code, "message": error.message} if isinstance(error, ApiError)
-                                       else {"code": "DEPENDENCY_ERROR", "message": "检索或模型服务不可用；画像处理结果已保留"})
+                    record["error"] = public_error(error.code if isinstance(error, ApiError) else None).data()
             else:
                 lines = [a.message for a in profile.actions]
                 if decision.lookup_keys:
@@ -234,9 +234,10 @@ class ChatRuntime:
                                                 owner_token=request["owner_token"])
             except ApiError as error:
                 self.history.release_request(payload.request_id, request["owner_token"])
-                if error.code in {"MEMORY_CONFIRMATION_EXPIRED", "MEMORY_CONFIRMATION_CONFLICT"}:
+                safe_error = public_error(error.code)
+                if safe_error.code in {"MEMORY_CONFIRMATION_EXPIRED", "MEMORY_CONFIRMATION_CONFLICT"}:
                     self.history.resolve_confirmation(payload.token, ProfileOutcome(status="conflict", actions=[
-                        ProfileAction(key="*", status="conflict", message=error.message)]).model_dump())
+                        ProfileAction(key="*", status="conflict", message=safe_error.message)]).model_dump())
                 raise
             self.history.resolve_confirmation(payload.token, profile.model_dump())
             record = self._record(request["run_id"], None, profile)

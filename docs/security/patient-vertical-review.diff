@@ -1,0 +1,1256 @@
+# Task1 review package
+
+Uncommitted task: exact session baseline compared, new modules and focused test shown in full. Existing uncommitted unrelated work excluded.
+
+warning: in the working copy of 'D:/TEMP-O~1/medical-patient-vertical-baseline-20261102/identity_sessions.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/identity_sessions.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/D:/TEMP-O~1/medical-patient-vertical-baseline-20261102/identity_sessions.py b/src/medical_rag/identity_sessions.py
+index 09c8436..29414e8 100644
+--- a/D:/TEMP-O~1/medical-patient-vertical-baseline-20261102/identity_sessions.py
++++ b/src/medical_rag/identity_sessions.py
+@@ -1,29 +1,30 @@
+-"""Experimental opaque sessions; disconnected from the API and unsafe for production.
++"""Experimental opaque sessions for isolated OIDC/patient APIs, not production.
+ 
+ Only a trusted login flow may pass an independently verified identity to issue;
+ constructing VerifiedIdentity is not authentication. The caller must configure a
+ single institutional tenant and connect to its authoritative primary database.
+ Role and binding administration, identity proofing, audit, transport security,
+-CSRF enforcement at all routes and PostgreSQL privilege review are not provided.
++Legacy APIs/workers remain disconnected and locked. The isolated API supplies
++route CSRF checks; PostgreSQL privilege review is still a deployment obligation.
+ The runtime database role can create or change session rows and is fully trusted
+ for session integrity; it must not be allowed to change authority tables or
+ execute arbitrary SQL on behalf of users. The partial diagnostic is not an audit.
+ After locking the session row, authorization uses a fresh READ COMMITTED SQL
+ statement. Revocations committed before that statement starts are observed;
+ changes committing after its snapshot are in flight and can miss this check.
+ The returned principal is a snapshot and must not be cached across operations;
+ this does not stop an already authorized operation, stream, or worker.
+ """
+ 
+ import re
+-from collections.abc import Callable
++from collections.abc import Callable, Iterator
+ from contextlib import AbstractContextManager, contextmanager
+ from dataclasses import dataclass, field
+ from hashlib import sha256
+ from secrets import token_urlsafe
+ from uuid import UUID
+ 
+ from psycopg import Connection
+ from psycopg.pq import TransactionStatus
+ 
+ from .access_policy import Principal, Role
+@@ -42,20 +43,41 @@ class UnsafeConnection(Exception):
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class IssuedSession:
+     """Raw values are returned once and excluded from object representations."""
+ 
+     token: str = field(repr=False)
+     csrf_token: str = field(repr=False)
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class AuthorizedTransaction:
++    """Internal operation scope; valid only inside authorized_transaction.
++
++    The session row stays locked until the operation commits or rolls back.
++    Call refresh after waiting for a patient lock, before using any patient
++    data. It rechecks time and live authority on this same primary connection
++    and rejects changed authority. Never retain this object across operations.
++    """
++
++    connection: Connection = field(repr=False)
++    principal: Principal
++    _refresh: Callable[[], Principal] = field(repr=False)
++
++    def refresh(self) -> Principal:
++        current = self._refresh()
++        if current != self.principal:
++            raise AuthenticationDenied()
++        return current
++
++
+ def _hash_token(value: object) -> bytes:
+     if type(value) is not str or _TOKEN.fullmatch(value) is None:
+         raise AuthenticationDenied()
+     return sha256(value.encode("ascii")).digest()
+ 
+ 
+ class SessionStore:
+     """Use a fresh database transaction to check current authority per call."""
+ 
+     def __init__(self, connection_factory: ConnectionFactory, *, tenant_id: str,
+@@ -65,27 +87,29 @@ class SessionStore:
+         except (ValueError, TypeError, AttributeError):
+             raise ValueError("Invalid institution configuration") from None
+         if (type(absolute_lifetime_seconds) is not int or type(idle_lifetime_seconds) is not int
+                 or not 1 <= idle_lifetime_seconds <= absolute_lifetime_seconds <= 86400):
+             raise ValueError("Invalid session lifetime configuration")
+         self._connection_factory = connection_factory
+         self._absolute = absolute_lifetime_seconds
+         self._idle = idle_lifetime_seconds
+ 
+     @contextmanager
+-    def _transaction(self):
++    def _transaction(self) -> Iterator[Connection]:
+         with self._connection_factory() as connection:
+             if connection.info.transaction_status != TransactionStatus.IDLE:
+                 raise UnsafeConnection()
+             with connection.transaction():
+                 connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
+                 connection.execute("SET LOCAL search_path TO pg_catalog")
++                connection.execute("SET LOCAL lock_timeout = '3s'")
++                connection.execute("SET LOCAL statement_timeout = '5s'")
+                 if connection.execute("SELECT medical_rag.runtime_role_basic_check() "
+                                       "AND NOT pg_catalog.pg_is_in_recovery()").fetchone() != (True,):
+                     raise UnsafeConnection()
+                 yield connection
+ 
+     def issue(self, identity: VerifiedIdentity, *, expected_tenant_version: int | None = None) -> IssuedSession:
+         """Issue fresh values; optionally bind a trusted pending-login epoch.
+ 
+         The optional version is taken from server-side login state, never a
+         client field. Comparing it inside the INSERT prevents a pending login
+@@ -111,58 +135,76 @@ class SessionStore:
+                 (_hash_token(token), _hash_token(csrf_token), identity.mfa_verified, self._absolute,
+                  self._tenant_id, identity.issuer, identity.subject, expected_tenant_version, expected_tenant_version),
+             ).fetchone()
+             if row is None:
+                 raise AuthenticationDenied()
+         return IssuedSession(token, csrf_token)
+ 
+     def authenticate(self, token: str, *, require_csrf: bool = False,
+                      csrf_token: str | None = None) -> Principal:
+         """Read live account, institution, roles and verified binding in one statement."""
++        with self.authorized_transaction(token, require_csrf=require_csrf, csrf_token=csrf_token) as authorized:
++            return authorized.principal
++
++    @contextmanager
++    def authorized_transaction(self, token: str, *, require_csrf: bool = False,
++                               csrf_token: str | None = None) -> Iterator[AuthorizedTransaction]:
++        """Hold an independent READ COMMITTED session lock for one operation.
++
++        Only trusted services may use the connection. Request fields cannot
++        supply scope or authority. Refresh after patient-lock waits; an error
++        rolls back all operation writes, including last-seen/session updates.
++        """
+         if type(require_csrf) is not bool:
+             raise AuthenticationDenied()
+         digest = _hash_token(token)
+         csrf_digest = _hash_token(csrf_token) if require_csrf else None
+         with self._transaction() as connection:
+             # UPDATE's predicate may be evaluated before waiting for a row lock.
+             # Lock first, then check time and current authority in a new READ
+             # COMMITTED statement, so waiting cannot extend an expired session.
+             if connection.execute(
+                 "SELECT 1 FROM medical_rag.identity_sessions "
+                 "WHERE tenant_id=%s AND token_hash=%s FOR UPDATE",
+                 (self._tenant_id, digest),
+             ).fetchone() is None:
+                 raise AuthenticationDenied()
+-            row = connection.execute(
++            principal = self._authorize(connection, digest, require_csrf, csrf_digest)
++            yield AuthorizedTransaction(connection, principal,
++                                        lambda: self._authorize(connection, digest, require_csrf, csrf_digest))
++
++    def _authorize(self, connection: Connection, digest: bytes,
++                   require_csrf: bool, csrf_digest: bytes | None) -> Principal:
++        row = connection.execute(
+                 "WITH live AS (UPDATE medical_rag.identity_sessions s SET last_seen_at=clock_timestamp() "
+                 "FROM medical_rag.identity_accounts a JOIN medical_rag.tenants t USING (tenant_id) "
+                 "WHERE s.tenant_id=%s AND s.token_hash=%s AND s.tenant_id=a.tenant_id "
+                 "AND s.account_id=a.account_id AND NOT s.revoked AND a.active AND t.active "
+                 "AND s.account_version=a.session_version AND s.tenant_version=t.session_version "
+                 "AND s.expires_at > clock_timestamp() "
+                 "AND s.last_seen_at > clock_timestamp() - (%s * interval '1 second') "
+                 "AND (NOT %s OR s.csrf_hash=%s) RETURNING s.account_id, s.tenant_id, s.mfa_verified) "
+                 "SELECT l.account_id, l.mfa_verified, "
+                 "ARRAY(SELECT r.role FROM medical_rag.identity_roles r "
+                 "WHERE r.tenant_id=l.tenant_id AND r.account_id=l.account_id), "
+                 "(SELECT b.patient_id FROM medical_rag.identity_bindings b "
+                 "WHERE b.tenant_id=l.tenant_id AND b.account_id=l.account_id AND b.verified) FROM live l",
+                 (self._tenant_id, digest, self._idle, require_csrf, csrf_digest),
+-            ).fetchone()
+-            if row is None:
+-                raise AuthenticationDenied()
+-            account, mfa, roles, patient = row
+-            try:
+-                roles = frozenset(Role(role) for role in roles)
+-            except ValueError:
+-                raise AuthenticationDenied() from None
+-            return Principal(str(account), str(self._tenant_id), roles, True, True,
+-                             str(patient) if patient else None, mfa)
++        ).fetchone()
++        if row is None:
++            raise AuthenticationDenied()
++        account, mfa, roles, patient = row
++        try:
++            roles = frozenset(Role(role) for role in roles)
++        except ValueError:
++            raise AuthenticationDenied() from None
++        return Principal(str(account), str(self._tenant_id), roles, True, True,
++                         str(patient) if patient else None, mfa)
+ 
+     def revoke(self, token: str, *, csrf_token: str) -> None:
+         """Revoke this session with CSRF proof without disclosing existence."""
+         digest = _hash_token(token)
+         csrf_digest = _hash_token(csrf_token)
+         with self._transaction() as connection:
+             connection.execute("UPDATE medical_rag.identity_sessions SET revoked=true "
+                                "WHERE tenant_id=%s AND token_hash=%s AND csrf_hash=%s",
+                                (self._tenant_id, digest, csrf_digest))
+
+warning: in the working copy of 'database/migrations/0004_patient_access.sql', LF will be replaced by CRLF the next time Git touches it
+diff --git a/database/migrations/0004_patient_access.sql b/database/migrations/0004_patient_access.sql
+new file mode 100644
+index 0000000..dfa9e8c
+--- /dev/null
++++ b/database/migrations/0004_patient_access.sql
+@@ -0,0 +1,65 @@
++-- Fictional-data vertical slice. Provisioning roles are separate from runtime.
++-- Runtime: SELECT subject columns, UPDATE(patient_id) solely for row locking;
++-- SELECT/INSERT consent events, conversations and turns. Never grant runtime
++-- UPDATE(age_classification,identity_verified), authority-table writes, table
++-- ownership, BYPASSRLS, sequence/DDL/admin privileges or broad role membership.
++BEGIN;
++
++ALTER TABLE medical_rag.patient_subjects
++    ADD COLUMN age_classification text NOT NULL DEFAULT 'unknown'
++        CHECK (age_classification IN ('adult','under_14','older_minor','unknown')),
++    ADD COLUMN identity_verified boolean NOT NULL DEFAULT false;
++
++CREATE TABLE medical_rag.patient_consent_events (
++    event_id uuid PRIMARY KEY,
++    tenant_id uuid NOT NULL,
++    patient_id uuid NOT NULL,
++    grantor_account_id uuid NOT NULL,
++    purpose text NOT NULL CHECK (purpose IN ('health_information','hospital_record','external_model')),
++    notice_version text NOT NULL CHECK (length(notice_version) BETWEEN 1 AND 128),
++    granted boolean NOT NULL,
++    recorded_at timestamptz NOT NULL,
++    expires_at timestamptz NOT NULL,
++    event_order bigint NOT NULL,
++    UNIQUE (tenant_id,patient_id,event_order),
++    FOREIGN KEY (tenant_id,patient_id) REFERENCES medical_rag.patient_subjects(tenant_id,patient_id),
++    FOREIGN KEY (tenant_id,grantor_account_id) REFERENCES medical_rag.identity_accounts(tenant_id,account_id)
++);
++CREATE INDEX patient_consent_latest ON medical_rag.patient_consent_events
++    (tenant_id,patient_id,purpose,event_order DESC);
++
++-- Allocate the per-patient order AFTER obtaining the exclusive patient lock,
++-- not in a sequence/default evaluated before a lock wait. READ COMMITTED is
++-- required: each operation reads fresh authority and latest committed events.
++CREATE FUNCTION medical_rag.serialize_patient_consent() RETURNS trigger
++LANGUAGE plpgsql VOLATILE SECURITY INVOKER SET search_path = pg_catalog AS $$
++BEGIN
++    IF TG_OP <> 'INSERT' THEN
++        RAISE EXCEPTION 'Consent events are append only';
++    END IF;
++    PERFORM patient_id FROM medical_rag.patient_subjects
++        WHERE tenant_id=NEW.tenant_id AND patient_id=NEW.patient_id FOR UPDATE;
++    IF NOT FOUND THEN
++        RAISE EXCEPTION 'Patient scope required';
++    END IF;
++    SELECT COALESCE(max(event_order),0)+1 INTO NEW.event_order
++        FROM medical_rag.patient_consent_events
++        WHERE tenant_id=NEW.tenant_id AND patient_id=NEW.patient_id;
++    NEW.recorded_at := clock_timestamp();
++    RETURN NEW;
++END;
++$$;
++CREATE TRIGGER serialize_patient_consent BEFORE INSERT OR UPDATE OR DELETE
++    ON medical_rag.patient_consent_events FOR EACH ROW
++    EXECUTE FUNCTION medical_rag.serialize_patient_consent();
++
++ALTER TABLE medical_rag.patient_consent_events ENABLE ROW LEVEL SECURITY;
++ALTER TABLE medical_rag.patient_consent_events FORCE ROW LEVEL SECURITY;
++CREATE POLICY patient_consent_scope ON medical_rag.patient_consent_events
++    USING (current_setting('app.patient_scope',true) =
++        pg_current_xact_id_if_assigned()::text || '/' || tenant_id::text || '/' || patient_id::text)
++    WITH CHECK (current_setting('app.patient_scope',true) =
++        pg_current_xact_id_if_assigned()::text || '/' || tenant_id::text || '/' || patient_id::text);
++REVOKE ALL ON medical_rag.patient_consent_events FROM PUBLIC;
++
++COMMIT;
+
+warning: in the working copy of 'src/medical_rag/patient_service.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/medical_rag/patient_service.py b/src/medical_rag/patient_service.py
+new file mode 100644
+index 0000000..6f4fbe2
+--- /dev/null
++++ b/src/medical_rag/patient_service.py
+@@ -0,0 +1,229 @@
++"""Live, fictional-data patient operations, with primary-DB authority per call.
++
++Patient shared locks serialize content against exclusive consent changes.
++After lock waits, fresh statements recheck patient identity, account/session
++authority, then latest purpose-specific consent. Already authorized operations
++holding shared locks are in flight: withdrawal waits, not stream cancellation.
++This is not institutional identity proofing, clinical or legal acceptance.
++"""
++
++from collections.abc import Iterator
++from contextlib import contextmanager
++from dataclasses import dataclass
++from datetime import datetime
++from uuid import UUID, uuid4
++
++from psycopg import Connection
++
++from .access_policy import Action, Resource, is_allowed
++from .consent_policy import (
++    ConsentPurpose,
++    ConsentRecord,
++    PatientIdentity,
++    SubjectAge,
++    has_current_consent,
++)
++from .identity_sessions import AuthorizedTransaction, SessionStore
++
++JsonObject = dict[str, object]
++ContentRow = tuple[UUID, str, datetime]
++
++
++class PatientDenied(Exception):
++    """No current verified adult self-patient authority/consent."""
++
++
++class ResourceMissing(Exception):
++    """Missing, malformed or invisible owned resource."""
++
++
++@dataclass(frozen=True, slots=True)
++class HealthNotice:
++    """Institution-supplied immutable actual notice; no pre-approved default."""
++
++    version: str
++    text: str
++    validity_seconds: int
++
++    def __post_init__(self) -> None:
++        if (type(self.version) is not str or not self.version.strip()
++                or self.version != self.version.strip() or len(self.version) > 128
++                or type(self.text) is not str or not self.text.strip() or len(self.text) > 64000
++                or type(self.validity_seconds) is not int or not 1 <= self.validity_seconds <= 31536000):
++            raise ValueError("Trusted health notice configuration required")
++
++
++def _identifier(value: str) -> UUID:
++    try:
++        return UUID(value)
++    except (ValueError, TypeError, AttributeError):
++        raise ResourceMissing() from None
++
++
++def _text(value: str, maximum: int) -> None:
++    if type(value) is not str or not value.strip() or len(value) > maximum:
++        raise ValueError("Invalid request")
++
++
++def _page(limit: int, offset: int) -> None:
++    if (type(limit) is not int or not 1 <= limit <= 100
++            or type(offset) is not int or not 0 <= offset <= 10000):
++        raise ValueError("Invalid pagination")
++
++
++def _item(row: ContentRow, field: str) -> JsonObject:
++    return {"id": str(row[0]), field: row[1], "created_at": row[2].isoformat()}
++
++
++class PatientService:
++    """No disconnected repository/snapshot principal may authorize these calls."""
++
++    def __init__(self, sessions: SessionStore, notice: HealthNotice) -> None:
++        if not isinstance(sessions, SessionStore) or type(notice) is not HealthNotice:
++            raise ValueError("Trusted session store and health notice required")
++        self.sessions = sessions
++        self.notice = notice
++
++    def _subject(self, authorized: AuthorizedTransaction, *, exclusive: bool = False,
++                 action: Action = Action.PATIENT_READ) -> PatientIdentity:
++        principal = authorized.principal
++        resource = Resource(principal.tenant_id, principal.patient_id)
++        if not is_allowed(principal, action, resource):
++            raise PatientDenied()
++        db = authorized.connection
++        scope = (principal.tenant_id, principal.patient_id)
++        db.execute("SELECT set_config('app.patient_scope',pg_current_xact_id()::text||'/'||%s||'/'||%s,true)", scope)
++        row = db.execute("SELECT patient_id FROM medical_rag.patient_subjects "
++                         "WHERE tenant_id=%s AND patient_id=%s " + ("FOR UPDATE" if exclusive else "FOR SHARE"),
++                         scope).fetchone()
++        if row is None:
++            raise PatientDenied()
++        # Fresh statement AFTER the lock: don't rely on the waiting SELECT's
++        # snapshot, including for trusted provisioning changes to verification.
++        age, verified = db.execute("SELECT age_classification,identity_verified FROM medical_rag.patient_subjects "
++                                   "WHERE tenant_id=%s AND patient_id=%s", scope).fetchone()
++        principal = authorized.refresh()
++        if age != SubjectAge.ADULT.value or verified is not True:
++            raise PatientDenied()
++        return PatientIdentity(principal.tenant_id, principal.patient_id, principal.user_id,
++                               SubjectAge(age), verified)
++
++    def _consent(self, db: Connection, subject: PatientIdentity,
++                 action: Action = Action.PATIENT_READ) -> tuple[bool, str | None]:
++        # Never filter version/granted before selecting the latest purpose event.
++        row = db.execute("SELECT grantor_account_id,notice_version,granted,recorded_at,expires_at "
++                         "FROM medical_rag.patient_consent_events WHERE tenant_id=%s AND patient_id=%s "
++                         "AND purpose='health_information' ORDER BY event_order DESC LIMIT 1",
++                         (subject.tenant_id, subject.patient_id)).fetchone()
++        now = db.execute("SELECT clock_timestamp()").fetchone()[0]
++        if row is None:
++            return False, None
++        grantor, version, granted, recorded, expires = row
++        record = ConsentRecord(subject.tenant_id, subject.patient_id, ConsentPurpose.HEALTH_INFORMATION,
++                               version, str(grantor), granted, not granted, recorded, expires, recorded)
++        current = has_current_consent(subject, record, ConsentPurpose.HEALTH_INFORMATION, action,
++                                      required_version=self.notice.version, now=now)
++        return current, expires.isoformat() if current else None
++
++    @contextmanager
++    def _operation(self, token: str, *, csrf_token: str | None = None, mutation: bool = False,
++                   consent: bool = True, exclusive: bool = False
++                   ) -> Iterator[tuple[Connection, PatientIdentity, bool, str | None]]:
++        with self.sessions.authorized_transaction(token, require_csrf=mutation, csrf_token=csrf_token) as authorized:
++            subject = self._subject(authorized, exclusive=exclusive,
++                                    action=Action.PATIENT_WRITE if mutation else Action.PATIENT_READ)
++            current, expires = self._consent(authorized.connection, subject,
++                                            Action.PATIENT_WRITE if mutation else Action.PATIENT_READ)
++            if consent and not current:
++                raise PatientDenied()
++            yield authorized.connection, subject, current, expires
++
++    def me(self, token: str) -> JsonObject:
++        with self.sessions.authorized_transaction(token) as authorized:
++            principal = authorized.principal
++            eligible, current = False, False
++            try:
++                subject = self._subject(authorized)
++            except PatientDenied:
++                pass
++            else:
++                eligible = True
++                current, _ = self._consent(authorized.connection, subject)
++            return {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
++                    "roles": sorted(principal.roles), "binding": {"verified": principal.patient_id is not None},
++                    "permissions": {"identity": True, "health_consent": eligible, "conversations": current}}
++
++    def _status(self, current: bool, expires: str | None) -> JsonObject:
++        return {"notice": {"version": self.notice.version, "text": self.notice.text,
++                           "validity_seconds": self.notice.validity_seconds},
++                "granted": current, "expires_at": expires}
++
++    def consent_status(self, token: str) -> JsonObject:
++        with self._operation(token, consent=False) as (_, _, current, expires):
++            return self._status(current, expires)
++
++    def change_consent(self, token: str, *, csrf_token: str, granted: bool,
++                       version: str | None = None) -> JsonObject:
++        if type(granted) is not bool or (granted and version != self.notice.version):
++            raise ValueError("Invalid consent")
++        with self._operation(token, csrf_token=csrf_token, mutation=True, consent=False, exclusive=True) as (db, subject, _, _):
++            db.execute("INSERT INTO medical_rag.patient_consent_events "
++                       "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
++                       "VALUES (%s,%s,%s,%s,'health_information',%s,%s,"
++                       "clock_timestamp()+(%s*interval '1 second'))",
++                       (uuid4(), subject.tenant_id, subject.patient_id, subject.account_id,
++                        self.notice.version, granted, self.notice.validity_seconds if granted else 0))
++            current, expires = self._consent(db, subject)
++            return self._status(current, expires)
++
++    def create_conversation(self, token: str, *, csrf_token: str, title: str) -> JsonObject:
++        _text(title, 200)
++        with self._operation(token, csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
++            row = db.execute("INSERT INTO medical_rag.conversations(tenant_id,patient_id,conversation_id,title) "
++                             "VALUES (%s,%s,%s,%s) RETURNING conversation_id,title,created_at",
++                             (subject.tenant_id, subject.patient_id, uuid4(), title)).fetchone()
++            return _item(row, "title")
++
++    def list_conversations(self, token: str, *, limit: int = 20, offset: int = 0) -> JsonObject:
++        _page(limit, offset)
++        with self._operation(token) as (db, subject, _, _):
++            rows = db.execute("SELECT conversation_id,title,created_at FROM medical_rag.conversations "
++                              "WHERE tenant_id=%s AND patient_id=%s ORDER BY created_at DESC,conversation_id "
++                              "LIMIT %s OFFSET %s", (subject.tenant_id, subject.patient_id, limit, offset)).fetchall()
++            return {"items": [_item(row, "title") for row in rows], "limit": limit, "offset": offset}
++
++    @staticmethod
++    def _conversation(db: Connection, subject: PatientIdentity, identifier: UUID) -> ContentRow:
++        row = db.execute("SELECT conversation_id,title,created_at FROM medical_rag.conversations "
++                         "WHERE tenant_id=%s AND patient_id=%s AND conversation_id=%s",
++                         (subject.tenant_id, subject.patient_id, identifier)).fetchone()
++        if row is None:
++            raise ResourceMissing()
++        return row
++
++    def get_conversation(self, token: str, identifier: str) -> JsonObject:
++        conversation_id = _identifier(identifier)
++        with self._operation(token) as (db, subject, _, _):
++            return _item(self._conversation(db, subject, conversation_id), "title")
++
++    def append_turn(self, token: str, identifier: str, *, csrf_token: str, content: str) -> JsonObject:
++        conversation_id = _identifier(identifier)
++        _text(content, 16000)
++        with self._operation(token, csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
++            self._conversation(db, subject, conversation_id)
++            row = db.execute("INSERT INTO medical_rag.conversation_turns "
++                             "(tenant_id,patient_id,conversation_id,turn_id,content) VALUES (%s,%s,%s,%s,%s) "
++                             "RETURNING turn_id,content,created_at",
++                             (subject.tenant_id, subject.patient_id, conversation_id, uuid4(), content)).fetchone()
++            return _item(row, "content")
++
++    def list_turns(self, token: str, identifier: str, *, limit: int = 20, offset: int = 0) -> JsonObject:
++        conversation_id = _identifier(identifier)
++        _page(limit, offset)
++        with self._operation(token) as (db, subject, _, _):
++            self._conversation(db, subject, conversation_id)
++            rows = db.execute("SELECT turn_id,content,created_at FROM medical_rag.conversation_turns "
++                              "WHERE tenant_id=%s AND patient_id=%s AND conversation_id=%s "
++                              "ORDER BY created_at,turn_id LIMIT %s OFFSET %s",
++                              (subject.tenant_id, subject.patient_id, conversation_id, limit, offset)).fetchall()
++            return {"items": [_item(row, "content") for row in rows], "limit": limit, "offset": offset}
+
+warning: in the working copy of 'src/medical_rag/patient_api.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/medical_rag/patient_api.py b/src/medical_rag/patient_api.py
+new file mode 100644
+index 0000000..60eff44
+--- /dev/null
++++ b/src/medical_rag/patient_api.py
+@@ -0,0 +1,175 @@
++"""Protected isolated OIDC/patient JSON API; no legacy or inference routes."""
++
++import json
++from typing import TypeVar
++
++from fastapi import FastAPI, Request
++from fastapi.exceptions import RequestValidationError
++from fastapi.responses import JSONResponse
++from pydantic import (
++    BaseModel,
++    ConfigDict,
++    Field,
++    StrictBool,
++    StrictStr,
++    ValidationError,
++)
++from starlette.concurrency import run_in_threadpool
++
++from .oidc_login import OIDCLogin, _cookie, create_auth_app
++from .patient_service import (
++    HealthNotice,
++    JsonObject,
++    PatientDenied,
++    PatientService,
++    ResourceMissing,
++)
++
++
++class _Body(BaseModel):
++    model_config = ConfigDict(extra="forbid", strict=True)
++
++
++BodyT = TypeVar("BodyT", bound=_Body)
++
++
++class _Grant(_Body):
++    version: StrictStr = Field(min_length=1, max_length=128)
++    accepted: StrictBool
++
++
++class _Conversation(_Body):
++    title: StrictStr = Field(min_length=1, max_length=200)
++
++
++class _Turn(_Body):
++    content: StrictStr = Field(min_length=1, max_length=16000)
++
++
++def _error(status: int, code: str, message: str) -> JSONResponse:
++    return JSONResponse({"success": False, "data": None, "error": {"code": code, "message": message}},
++                        status_code=status)
++
++
++def _ok(data: JsonObject) -> JsonObject:
++    return {"success": True, "data": data, "error": None}
++
++
++def _pagination(request: Request) -> dict[str, int]:
++    pairs = request.query_params.multi_items()
++    if any(key not in {"limit", "offset"} for key, _ in pairs) or len(pairs) != len(dict(pairs)):
++        raise ValueError("Invalid pagination")
++    try:
++        return {"limit": int(request.query_params.get("limit", "20")),
++                "offset": int(request.query_params.get("offset", "0"))}
++    except (ValueError, TypeError):
++        raise ValueError("Invalid pagination") from None
++
++
++async def _body(request: Request, model: type[BodyT]) -> BodyT:
++    # Bound bytes before parsing JSON, including chunked input. Never include
++    # received input/validation objects in responses or application logs.
++    data = bytearray()
++    async for chunk in request.stream():
++        if len(data) + len(chunk) > 100000:
++            raise ValueError("Invalid request")
++        data.extend(chunk)
++    try:
++        def unique(pairs: list[tuple[str, object]]) -> JsonObject:
++            result = {}
++            for key, value in pairs:
++                if key in result:
++                    raise ValueError("Invalid request")
++                result[key] = value
++            return result
++        return model.model_validate(json.loads(data, object_pairs_hook=unique))
++    except (ValueError, TypeError, RecursionError, UnicodeError):
++        raise ValueError("Invalid request") from None
++
++
++def create_patient_app(login: OIDCLogin, notice: HealthNotice) -> FastAPI:
++    """Reuse all headless OIDC cookie, origin and no-store protections."""
++    service = PatientService(login.sessions, notice)
++    app = create_auth_app(login)
++
++    @app.exception_handler(PatientDenied)
++    async def denied(request: Request, error: PatientDenied) -> JSONResponse:
++        return _error(403, "PATIENT_ACCESS_DENIED", "Patient access denied")
++
++    @app.exception_handler(ResourceMissing)
++    async def missing(request: Request, error: ResourceMissing) -> JSONResponse:
++        return _error(404, "RESOURCE_NOT_FOUND", "Resource not found")
++
++    @app.exception_handler(ValueError)
++    @app.exception_handler(ValidationError)
++    @app.exception_handler(RequestValidationError)
++    async def invalid(request: Request, error: Exception) -> JSONResponse:
++        return _error(400, "INVALID_REQUEST", "Invalid request")
++
++    async def credentials(request: Request, *, mutation: bool = False) -> tuple[str, str | None]:
++        token = _cookie(request, "__Host-medical-session")
++        csrf = None
++        if mutation:
++            values = request.headers.getlist("x-csrf-token")
++            if len(values) != 1:
++                raise PatientDenied()
++            csrf = values[0]
++        # Authenticate BEFORE body/path/pagination validation. This principal
++        # is discarded; the service obtains live authority in its own locked
++        # operation transaction, never trusting a disconnected snapshot here.
++        await run_in_threadpool(login.sessions.authenticate, token, require_csrf=mutation, csrf_token=csrf)
++        return token, csrf
++
++    @app.get("/me")
++    async def me(request: Request) -> JsonObject:
++        token, _ = await credentials(request)
++        return _ok(await run_in_threadpool(service.me, token))
++
++    @app.get("/me/consents/health")
++    async def consent_status(request: Request) -> JsonObject:
++        token, _ = await credentials(request)
++        return _ok(await run_in_threadpool(service.consent_status, token))
++
++    @app.post("/me/consents/health")
++    async def grant(request: Request) -> JsonObject:
++        token, csrf = await credentials(request, mutation=True)
++        body = await _body(request, _Grant)
++        if body.accepted is not True:
++            raise ValueError("Explicit acceptance required")
++        return _ok(await run_in_threadpool(service.change_consent, token, csrf_token=csrf,
++                                           granted=True, version=body.version))
++
++    @app.delete("/me/consents/health")
++    async def withdraw(request: Request) -> JsonObject:
++        token, csrf = await credentials(request, mutation=True)
++        return _ok(await run_in_threadpool(service.change_consent, token, csrf_token=csrf, granted=False))
++
++    @app.get("/conversations")
++    async def conversations(request: Request) -> JsonObject:
++        token, _ = await credentials(request)
++        return _ok(await run_in_threadpool(service.list_conversations, token, **_pagination(request)))
++
++    @app.post("/conversations")
++    async def create(request: Request) -> JsonObject:
++        token, csrf = await credentials(request, mutation=True)
++        body = await _body(request, _Conversation)
++        return _ok(await run_in_threadpool(service.create_conversation, token, csrf_token=csrf, title=body.title))
++
++    @app.get("/conversations/{identifier}")
++    async def conversation(request: Request, identifier: str) -> JsonObject:
++        token, _ = await credentials(request)
++        return _ok(await run_in_threadpool(service.get_conversation, token, identifier))
++
++    @app.get("/conversations/{identifier}/turns")
++    async def turns(request: Request, identifier: str) -> JsonObject:
++        token, _ = await credentials(request)
++        return _ok(await run_in_threadpool(service.list_turns, token, identifier, **_pagination(request)))
++
++    @app.post("/conversations/{identifier}/turns")
++    async def append(request: Request, identifier: str) -> JsonObject:
++        token, csrf = await credentials(request, mutation=True)
++        body = await _body(request, _Turn)
++        return _ok(await run_in_threadpool(service.append_turn, token, identifier,
++                                           csrf_token=csrf, content=body.content))
++
++    return app
+
+warning: in the working copy of 'tests/test_patient_vertical.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tests/test_patient_vertical.py b/tests/test_patient_vertical.py
+new file mode 100644
+index 0000000..e44cb48
+--- /dev/null
++++ b/tests/test_patient_vertical.py
+@@ -0,0 +1,516 @@
++"""Fictional patient slice against real unprivileged PostgreSQL and test IdP."""
++# ruff: noqa: F401,F811 -- imported pytest fixtures are used by injection
++
++import importlib.util
++import secrets
++import time
++from concurrent.futures import ThreadPoolExecutor
++from threading import Event
++from uuid import uuid4
++
++import psycopg
++import pytest
++from fastapi.testclient import TestClient
++from test_oidc_login import (
++    ACCOUNT,
++    APP_ORIGIN,
++    ISSUER,
++    ROOT,
++    TENANT,
++    signing_key,
++    start,
++)
++from test_oidc_login import (
++    database as oidc_database,
++)
++from test_oidc_login import (
++    system as auth_system,
++)
++
++from medical_rag.identity_sessions import AuthenticationDenied
++from medical_rag.oidc_identity import VerifiedIdentity
++
++PATIENT = "00000000-0000-0000-0000-000000000301"
++OTHER = "00000000-0000-0000-0000-000000000302"
++OTHER_ACCOUNT = "00000000-0000-0000-0000-000000000202"
++OTHER_TENANT = "00000000-0000-0000-0000-000000000102"
++
++
++@pytest.fixture(scope="module")
++def database(oidc_database):
++    runtime, admin = oidc_database
++    with psycopg.connect(**admin) as db:
++        db.execute((ROOT / "database/migrations/0004_patient_access.sql").read_text(encoding="utf-8"))
++        db.execute("REVOKE SELECT ON medical_rag.tenants,medical_rag.identity_accounts, "
++                   "medical_rag.identity_roles,medical_rag.identity_bindings FROM login_test")
++        for table, columns in {
++            "tenants": "tenant_id,active,session_version",
++            "identity_accounts": "tenant_id,account_id,issuer,subject,active,session_version",
++            "identity_roles": "tenant_id,account_id,role",
++            "identity_bindings": "tenant_id,account_id,patient_id,verified",
++        }.items():
++            db.execute(f"GRANT SELECT ({columns}) ON medical_rag.{table} TO login_test")
++        db.execute("GRANT SELECT (tenant_id,patient_id,age_classification,identity_verified) "
++                   "ON medical_rag.patient_subjects TO login_test")
++        db.execute("GRANT UPDATE (patient_id) ON medical_rag.patient_subjects TO login_test")
++        db.execute("GRANT SELECT,INSERT ON medical_rag.patient_consent_events, "
++                   "medical_rag.conversations,medical_rag.conversation_turns TO login_test")
++    return runtime, admin
++
++
++@pytest.fixture
++def system(auth_system):
++    from medical_rag.patient_api import create_patient_app
++    from medical_rag.patient_service import HealthNotice
++
++    _, login, provider, admin = auth_system
++    with psycopg.connect(**admin) as db:
++        db.execute("INSERT INTO medical_rag.patient_subjects(tenant_id,patient_id,age_classification,identity_verified) "
++                   "VALUES (%s,%s,'adult',true),(%s,%s,'adult',true)", (TENANT, PATIENT, TENANT, OTHER))
++        db.execute("INSERT INTO medical_rag.identity_bindings VALUES (%s,%s,%s,true)", (TENANT, ACCOUNT, PATIENT))
++        db.execute("INSERT INTO medical_rag.identity_accounts(tenant_id,account_id,issuer,subject) "
++                   "VALUES (%s,%s,%s,'subject-2')", (TENANT, OTHER_ACCOUNT, ISSUER))
++        db.execute("INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'patient')", (TENANT, OTHER_ACCOUNT))
++        db.execute("INSERT INTO medical_rag.identity_bindings VALUES (%s,%s,%s,true)", (TENANT, OTHER_ACCOUNT, OTHER))
++        db.execute("INSERT INTO medical_rag.tenants(tenant_id) VALUES (%s)", (OTHER_TENANT,))
++        db.execute("INSERT INTO medical_rag.patient_subjects(tenant_id,patient_id,age_classification,identity_verified) "
++                   "VALUES (%s,%s,'adult',true)", (OTHER_TENANT, PATIENT))
++    notice = HealthNotice("fictional-v1", "Fictional development notice: health information only.", 3600)
++    with TestClient(create_patient_app(login, notice), base_url=APP_ORIGIN, headers={}) as client:
++        yield client, login, provider, admin
++
++
++def logged_in(system):
++    client, _, _, _ = system
++    _, query = start(system)
++    assert client.get("/auth/callback", params={"state": query["state"][0], "code": "fictional-code"},
++                      follow_redirects=False).status_code == 303
++    csrf = client.get("/auth/session").json()["data"]["csrf_token"]
++    return {"Origin": APP_ORIGIN, "X-CSRF-Token": csrf}
++
++
++def grant(client, headers):
++    response = client.post("/me/consents/health", headers=headers, json={"version": "fictional-v1", "accepted": True})
++    assert response.status_code == 200, response.text
++    return response
++
++
++def mutate(admin, sql, params=()):
++    with psycopg.connect(**admin) as db:
++        db.execute(sql, params)
++
++
++def count_events(admin):
++    with psycopg.connect(**admin) as db:
++        return db.execute("SELECT count(*),array_agg(DISTINCT purpose) FROM medical_rag.patient_consent_events").fetchone()
++
++
++def test_patient_slice_has_live_service_and_protected_app():
++    assert importlib.util.find_spec("medical_rag.patient_service") is not None
++    assert importlib.util.find_spec("medical_rag.patient_api") is not None
++
++
++@pytest.mark.integration
++def test_full_oidc_patient_consent_conversation_and_turn_flow(system):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    me = client.get("/me").json()["data"]
++    assert me["user_id"] == ACCOUNT and me["tenant_id"] == TENANT
++    assert me["binding"] == {"verified": True}
++    assert me["permissions"] == {"identity": True, "health_consent": True, "conversations": False}
++    assert client.get("/conversations").status_code == 403
++    notice = client.get("/me/consents/health").json()["data"]
++    assert notice["notice"]["text"].startswith("Fictional development") and notice["granted"] is False
++    assert grant(client, headers).json()["data"]["granted"] is True
++    assert client.get("/me").json()["data"]["permissions"]["conversations"] is True
++    response = client.post("/conversations", headers=headers, json={"title": "fictional title"})
++    assert response.status_code == 200
++    conversation = response.json()["data"]
++    assert conversation["title"] == "fictional title"
++    path = "/conversations/" + conversation["id"]
++    assert client.get(path).json()["data"] == conversation
++    assert client.get("/conversations?limit=1&offset=0").json()["data"]["items"] == [conversation]
++    turn = client.post(path + "/turns", headers=headers, json={"content": "fictitious patient text"})
++    assert turn.status_code == 200
++    assert client.get(path + "/turns").json()["data"]["items"] == [turn.json()["data"]]
++    assert client.get(path).headers["cache-control"] == "no-store"
++    assert count_events(admin) == (1, ["health_information"])
++
++
++@pytest.mark.integration
++def test_content_mutations_authorize_write_action_independently_of_shared_lock(system, monkeypatch):
++    from medical_rag import patient_service
++    from medical_rag.access_policy import Action
++    client, _, _, _ = system
++    headers = logged_in(system)
++    grant(client, headers)
++    original = patient_service.is_allowed
++    monkeypatch.setattr(patient_service, "is_allowed",
++                        lambda principal, action, resource: action is not Action.PATIENT_WRITE
++                        and original(principal, action, resource))
++    assert client.get("/conversations").status_code == 200
++    assert client.post("/conversations", headers=headers, json={"title": "x"}).status_code == 403
++
++
++@pytest.mark.integration
++def test_withdrawal_waits_for_shared_content_transaction_and_denies_next_operation(system, database, monkeypatch):
++    from medical_rag.identity_sessions import SessionStore
++    from medical_rag.patient_service import HealthNotice, PatientDenied, PatientService
++    client, login, _, admin = system
++    runtime, _ = database
++    headers = logged_in(system)
++    grant(client, headers)
++    token = client.cookies.get("__Host-medical-session")
++    notice = HealthNotice("fictional-v1", "fictional notice", 3600)
++    service = PatientService(login.sessions, notice)
++    waiting_name = "patient-withdraw-" + secrets.token_hex(8)
++    waiting_store = SessionStore(lambda: psycopg.connect(**dict(runtime, application_name=waiting_name)), tenant_id=TENANT)
++    other_session = waiting_store.issue(VerifiedIdentity(ISSUER, "subject-1", True))
++    withdrawal = PatientService(waiting_store, notice)
++    checked, finish = Event(), Event()
++    original = service._consent
++    def hold(*args, **kwargs):
++        current = original(*args, **kwargs)
++        checked.set()
++        assert finish.wait(5)
++        return current
++    monkeypatch.setattr(service, "_consent", hold)
++    with ThreadPoolExecutor(max_workers=2) as executor:
++        content = executor.submit(service.list_conversations, token)
++        pending = None
++        try:
++            assert checked.wait(3)
++            pending = executor.submit(withdrawal.change_consent, other_session.token,
++                                      csrf_token=other_session.csrf_token, granted=False)
++            wait_for_lock(admin, waiting_name)
++            assert not pending.done()
++        finally:
++            finish.set()
++        assert content.result(timeout=5)["items"] == []
++        assert pending.result(timeout=5)["granted"] is False
++    with pytest.raises(PatientDenied):
++        withdrawal.list_conversations(other_session.token)
++
++
++@pytest.mark.integration
++def test_other_purposes_never_authorize_health_content(system):
++    client, _, _, admin = system
++    logged_in(system)
++    for purpose in ["hospital_record", "external_model"]:
++        mutate(admin, "INSERT INTO medical_rag.patient_consent_events "
++            "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
++            "VALUES (%s,%s,%s,%s,%s,'fictional-v1',true,clock_timestamp()+interval '1 hour')",
++            (uuid4(), TENANT, PATIENT, ACCOUNT, purpose))
++    assert client.get("/conversations").status_code == 403
++    assert client.get("/me/consents/health").json()["data"]["granted"] is False
++
++
++@pytest.mark.integration
++def test_owned_predicates_other_patient_and_tenant_and_uniform_404(system):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    ids = [str(uuid4()), str(uuid4())]
++    with psycopg.connect(**admin) as db:
++        for institution, patient, identifier in [(TENANT, OTHER, ids[0]), (OTHER_TENANT, PATIENT, ids[1])]:
++            db.execute("INSERT INTO medical_rag.conversations(tenant_id,patient_id,conversation_id,title) "
++                       "VALUES (%s,%s,%s,'other sensitive text')", (institution, patient, identifier))
++    missing = client.get("/conversations/" + str(uuid4()))
++    assert missing.status_code == 404
++    for identifier in ids + ["not-a-uuid"]:
++        for suffix in ["", "/turns"]:
++            response = client.get("/conversations/" + identifier + suffix)
++            assert response.status_code == 404 and response.json() == missing.json()
++        response = client.post("/conversations/" + identifier + "/turns", headers=headers, json={"content": "x"})
++        assert response.status_code == 404 and response.json() == missing.json()
++    assert client.get("/conversations").json()["data"]["items"] == []
++
++
++@pytest.mark.integration
++def test_second_adult_session_isolated_from_first_patient_content(system):
++    client, login, _, _ = system
++    headers = logged_in(system)
++    grant(client, headers)
++    first = client.post("/conversations", headers=headers, json={"title": "first patient"}).json()["data"]["id"]
++    second = login.sessions.issue(VerifiedIdentity(ISSUER, "subject-2", True))
++    client.cookies.clear()
++    client.cookies.set("__Host-medical-session", second.token)
++    client.cookies.set("__Host-medical-csrf", second.csrf_token)
++    headers = {"Origin": APP_ORIGIN, "X-CSRF-Token": second.csrf_token}
++    assert client.get("/me").json()["data"]["user_id"] == OTHER_ACCOUNT
++    assert client.get("/me/consents/health").json()["data"]["granted"] is False
++    grant(client, headers)
++    own = client.post("/conversations", headers=headers, json={"title": "second patient"}).json()["data"]
++    assert client.get("/conversations").json()["data"]["items"] == [own]
++    assert client.get("/conversations/" + first).status_code == 404
++
++
++@pytest.mark.integration
++def test_withdrawal_regrant_latest_event_expiry_and_history(system):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    # Withdrawal does not depend on an existing/current grant.
++    assert client.delete("/me/consents/health", headers=headers).status_code == 200
++    grant(client, headers)
++    assert client.delete("/me/consents/health", headers=headers).json()["data"]["granted"] is False
++    assert client.get("/conversations").status_code == 403
++    assert client.post("/conversations", headers=headers, json={"title": "x"}).status_code == 403
++    grant(client, headers)
++    assert count_events(admin) == (4, ["health_information"])
++    # Trusted writer records a newer incompatible notice, not an older grant fallback.
++    mutate(admin, "INSERT INTO medical_rag.patient_consent_events "
++           "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
++           "VALUES (%s,%s,%s,%s,'health_information','different-version',true,clock_timestamp()+interval '1 hour')",
++           (uuid4(), TENANT, PATIENT, ACCOUNT))
++    assert client.get("/conversations").status_code == 403
++    grant(client, headers)
++    mutate(admin, "INSERT INTO medical_rag.patient_consent_events "
++           "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
++           "VALUES (%s,%s,%s,%s,'health_information','fictional-v1',true,clock_timestamp()-interval '1 second')",
++           (uuid4(), TENANT, PATIENT, ACCOUNT))
++    assert client.get("/conversations").status_code == 403
++    assert client.get("/me/consents/health").json()["data"]["granted"] is False
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("field,value", [("age_classification", "under_14"), ("age_classification", "older_minor"),
++    ("age_classification", "unknown"), ("identity_verified", False)])
++def test_patient_verification_and_all_nonadult_classes_deny(system, field, value):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    mutate(admin, f"UPDATE medical_rag.patient_subjects SET {field}=%s WHERE tenant_id=%s AND patient_id=%s",
++           (value, TENANT, PATIENT))
++    assert client.get("/me/consents/health").status_code == 403
++    assert client.get("/conversations").status_code == 403
++    assert client.get("/me").json()["data"]["permissions"]["conversations"] is False
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("role", ["org_admin", "support", "platform_operator", "guardian"])
++def test_staff_and_guardians_have_no_implicit_patient_permissions(system, role):
++    client, _, _, admin = system
++    mutate(admin, "DELETE FROM medical_rag.identity_roles WHERE account_id=%s", (ACCOUNT,))
++    mutate(admin, "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,%s)", (TENANT, ACCOUNT, role))
++    headers = logged_in(system)
++    assert client.get("/me").json()["data"]["permissions"] == {
++        "identity": True, "health_consent": False, "conversations": False}
++    assert client.get("/me/consents/health").status_code == 403
++    assert client.post("/me/consents/health", headers=headers,
++                       json={"version": "fictional-v1", "accepted": True}).status_code == 403
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("change", ["account", "tenant", "role", "binding", "expiry", "logout"])
++def test_live_authority_changes_deny_next_operation(system, change):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    changes = {
++        "account": "UPDATE medical_rag.identity_accounts SET active=false",
++        "tenant": "UPDATE medical_rag.tenants SET active=false",
++        "role": "DELETE FROM medical_rag.identity_roles",
++        "binding": "UPDATE medical_rag.identity_bindings SET verified=false",
++        "expiry": "UPDATE medical_rag.identity_sessions SET expires_at=clock_timestamp()-interval '1 second'",
++    }
++    if change == "logout":
++        assert client.post("/auth/logout", headers=headers).status_code == 200
++    else:
++        mutate(admin, changes[change])
++    assert client.get("/conversations").status_code == 401
++
++
++@pytest.mark.integration
++def test_unverified_binding_cannot_become_patient_from_body(system):
++    client, _, _, admin = system
++    mutate(admin, "UPDATE medical_rag.identity_bindings SET verified=false WHERE account_id=%s", (ACCOUNT,))
++    headers = logged_in(system)
++    assert client.get("/me").json()["data"]["binding"] == {"verified": False}
++    assert client.get("/me/consents/health").status_code == 403
++    assert client.post("/conversations", headers=headers,
++                       json={"title": "x", "patient_id": PATIENT, "tenant_id": TENANT}).status_code in {400, 422}
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("body", [{"title": 1}, {"title": ""}, {"title": "x" * 201},
++    {"title": "fictional secret", "patient_id": OTHER}, {"title": "x", "tenant_id": OTHER_TENANT},
++    {"title": "x", "user_id": OTHER_ACCOUNT}, {"title": "x", "role": "org_admin"}])
++def test_strict_conversation_bodies_never_echo_inputs(system, body):
++    client, _, _, _ = system
++    headers = logged_in(system)
++    grant(client, headers)
++    response = client.post("/conversations", headers=headers, json=body)
++    assert response.status_code == 400
++    assert response.json() == {"success": False, "data": None,
++                               "error": {"code": "INVALID_REQUEST", "message": "Invalid request"}}
++    assert client.get("/conversations").json()["data"]["items"] == []
++
++
++@pytest.mark.integration
++def test_csrf_origin_payload_pagination_and_unexpected_errors_are_static(system, monkeypatch, caplog):
++    client, login, _, admin = system
++    headers = logged_in(system)
++    for invalid in [{"Origin": APP_ORIGIN}, headers | {"X-CSRF-Token": "wrong"},
++                    headers | {"Origin": "https://evil.example"},
++                    [("Origin", APP_ORIGIN), ("X-CSRF-Token", headers["X-CSRF-Token"]),
++                     ("X-CSRF-Token", headers["X-CSRF-Token"])]]:
++        assert client.post("/me/consents/health", headers=invalid,
++                           json={"version": "fictional-v1", "accepted": True}).status_code in {401, 403}
++    assert count_events(admin)[0] == 0
++    for body in [{"version": "old", "accepted": True}, {"version": "fictional-v1", "accepted": False},
++                 {"version": "fictional-v1", "accepted": 1},
++                 {"version": "fictional-v1", "accepted": True, "purpose": "external_model"}]:
++        assert client.post("/me/consents/health", headers=headers, json=body).status_code == 400
++    grant(client, headers)
++    conversation = client.post("/conversations", headers=headers, json={"title": "x"}).json()["data"]["id"]
++    for body in [{"content": 1}, {"content": ""}, {"content": "x" * 16001}, {"content": "x", "patient_id": OTHER}]:
++        assert client.post(f"/conversations/{conversation}/turns", headers=headers, json=body).status_code == 400
++    for query in ["limit=101", "limit=0", "offset=-1", "offset=10001", "limit=bad", "limit=1&limit=2"]:
++        assert client.get("/conversations?" + query).status_code == 400
++    assert client.post("/conversations", headers=headers, content='{"title": "private',
++                       ).status_code == 400
++    for body in ['{"title":"x","title":"private"}', '{"title":"' + 'x' * 100000 + '"}',
++                 '{"title":"   "}']:
++        assert client.post("/conversations", headers=headers, content=body).status_code == 400
++    assert client.post(f"/conversations/{conversation}/turns", headers=headers, json={"content": "  "}).status_code == 400
++    assert client.get("/conversations?unexpected=private").status_code == 400
++    # No mutation endpoint accepts a missing/duplicate CSRF proof.
++    for method, path, body in [("DELETE", "/me/consents/health", None),
++        ("POST", "/conversations", {"title": "x"}),
++        ("POST", f"/conversations/{conversation}/turns", {"content": "x"})]:
++        for invalid in [{"Origin": APP_ORIGIN}, [("Origin", APP_ORIGIN),
++            ("X-CSRF-Token", headers["X-CSRF-Token"]), ("X-CSRF-Token", headers["X-CSRF-Token"])]]:
++            assert client.request(method, path, headers=invalid, json=body).status_code == 403
++    assert count_events(admin)[0] == 1
++    assert client.get(f"/conversations/{conversation}/turns").json()["data"]["items"] == []
++    def fail(*args, **kwargs):
++        raise RuntimeError("fictional-DB-private-token-do-not-echo")
++    monkeypatch.setattr(login.sessions, "authorized_transaction", fail)
++    response = client.get("/conversations")
++    assert response.status_code == 503 and response.json()["success"] is False
++    assert "fictional-DB-private-token-do-not-echo" not in response.text + caplog.text
++
++
++@pytest.mark.integration
++def test_authentication_precedes_invalid_request_processing(system):
++    client, _, _, _ = system
++    for method, path, body in [("POST", "/conversations", {"patient_id": "fictional-private"}),
++        ("GET", "/conversations/not-uuid", None), ("GET", "/conversations?limit=bad", None)]:
++        response = client.request(method, path, headers={"Origin": APP_ORIGIN}, json=body)
++        assert response.status_code == 401
++        assert "fictional-private" not in response.text
++
++
++@pytest.mark.integration
++def test_rls_column_privileges_append_only_and_scope_lifetime(system, database):
++    _, login, _, _admin = system
++    runtime, _ = database
++    headers = logged_in(system)
++    grant(system[0], headers)
++    with psycopg.connect(**runtime) as db:
++        assert db.execute("SELECT count(*) FROM medical_rag.patient_consent_events").fetchone() == (0,)
++        for column in ["identity_verified", "age_classification"]:
++            assert db.execute("SELECT has_column_privilege(current_user,'medical_rag.patient_subjects',%s,'UPDATE')",
++                              (column,)).fetchone() == (False,)
++        assert db.execute("SELECT has_table_privilege(current_user,'medical_rag.patient_consent_events','UPDATE')").fetchone() == (False,)
++        assert db.execute("SELECT has_table_privilege(current_user,'medical_rag.patient_consent_events','DELETE')").fetchone() == (False,)
++        db.execute("SELECT set_config('app.patient_scope',pg_current_xact_id()::text||'/'||%s||'/'||%s,false)",
++                   (TENANT, PATIENT))
++        assert db.execute("SELECT count(*) FROM medical_rag.patient_consent_events").fetchone() == (1,)
++        db.commit()
++        assert db.execute("SELECT count(*) FROM medical_rag.patient_consent_events").fetchone() == (0,)
++    assert login.sessions.authenticate(system[0].cookies.get("__Host-medical-session")).patient_id == PATIENT
++
++
++def wait_for_lock(admin, app_name):
++    with psycopg.connect(**admin) as observer:
++        deadline = time.monotonic() + 2
++        while time.monotonic() < deadline:
++            row = observer.execute("SELECT wait_event_type FROM pg_stat_activity WHERE application_name=%s",
++                                   (app_name,)).fetchone()
++            if row == ("Lock",):
++                return
++            time.sleep(0.02)
++    pytest.fail("operation did not wait for patient lock")
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("change", ["withdrawal", "verification", "authority", "binding", "age", "tenant", "expiry"])
++def test_patient_lock_wait_rechecks_consent_verification_and_authority(system, database, change):
++    from medical_rag.identity_sessions import SessionStore
++    from medical_rag.patient_service import HealthNotice, PatientDenied, PatientService
++    client, _, _, admin = system
++    runtime, _ = database
++    headers = logged_in(system)
++    grant(client, headers)
++    app_name = "patient-wait-" + secrets.token_hex(8)
++    store = SessionStore(lambda: psycopg.connect(**dict(runtime, application_name=app_name)), tenant_id=TENANT)
++    service = PatientService(store, HealthNotice("fictional-v1", "fictional notice", 3600))
++    token = client.cookies.get("__Host-medical-session")
++    if change == "expiry":
++        mutate(admin, "UPDATE medical_rag.identity_sessions SET expires_at=clock_timestamp()+interval '2 seconds'")
++    with psycopg.connect(**dict(admin, autocommit=False)) as locker:
++        locker.execute("SELECT patient_id FROM medical_rag.patient_subjects WHERE tenant_id=%s AND patient_id=%s FOR UPDATE",
++                       (TENANT, PATIENT))
++        with ThreadPoolExecutor(max_workers=1) as executor:
++            pending = executor.submit(service.list_conversations, token)
++            try:
++                wait_for_lock(admin, app_name)
++                if change == "withdrawal":
++                    locker.execute("INSERT INTO medical_rag.patient_consent_events "
++                        "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
++                        "VALUES (%s,%s,%s,%s,'health_information','fictional-v1',false,clock_timestamp())",
++                        (uuid4(), TENANT, PATIENT, ACCOUNT))
++                elif change in {"verification", "age"}:
++                    locker.execute("UPDATE medical_rag.patient_subjects SET " +
++                                   ("identity_verified=false" if change == "verification" else "age_classification='unknown'") +
++                                   " WHERE tenant_id=%s AND patient_id=%s", (TENANT, PATIENT))
++                elif change == "tenant":
++                    mutate(admin, "UPDATE medical_rag.tenants SET active=false WHERE tenant_id=%s", (TENANT,))
++                elif change == "expiry":
++                    time.sleep(2.1)
++                else:
++                    mutate(admin, "UPDATE medical_rag.identity_accounts SET active=false WHERE account_id=%s"
++                           if change == "authority" else "UPDATE medical_rag.identity_bindings SET verified=false WHERE account_id=%s",
++                           (ACCOUNT,))
++            finally:
++                locker.commit()
++            with pytest.raises((PatientDenied, AuthenticationDenied)):
++                pending.result(timeout=5)
++
++
++@pytest.mark.integration
++def test_legacy_business_routes_absent(system):
++    client, _, _, _ = system
++    for path in ["/chat", "/memory", "/documents", "/settings", "/jobs", "/api/chat"]:
++        assert client.get(path).status_code == 404
++
++
++@pytest.mark.integration
++def test_consent_server_order_timestamp_and_append_only(system):
++    _, _, _, admin = system
++    supplied = uuid4()
++    mutate(admin, "INSERT INTO medical_rag.patient_consent_events "
++        "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at,event_order,recorded_at) "
++        "VALUES (%s,%s,%s,%s,'health_information','fictional-v1',true,clock_timestamp()+interval '1 hour',"
++        "999999,'2000-01-01T00:00:00Z')", (supplied, TENANT, PATIENT, ACCOUNT))
++    with psycopg.connect(**admin) as db:
++        row = db.execute("SELECT event_order,recorded_at > '2020-01-01' FROM medical_rag.patient_consent_events").fetchone()
++        assert row == (1, True)
++        for operation in ["UPDATE medical_rag.patient_consent_events SET granted=false", "DELETE FROM medical_rag.patient_consent_events"]:
++            with pytest.raises(psycopg.errors.RaiseException):
++                db.execute(operation)
++        assert db.execute("SELECT granted FROM medical_rag.patient_consent_events").fetchone() == (True,)
++    client = system[0]
++    headers = logged_in(system)
++    grant(client, headers)
++    with psycopg.connect(**admin) as db:
++        assert db.execute("SELECT array_agg(event_order ORDER BY event_order) FROM medical_rag.patient_consent_events").fetchone() == ([1, 2],)
++
++
++@pytest.mark.parametrize("args", [("", "text", 1), ("v", "", 1), ("v", "text", 0),
++    ("v", "text", 31536001), ("v", "text", True), ("v" * 129, "text", 1), ("v", "x" * 64001, 1)])
++def test_notice_configuration_requires_actual_bounded_trusted_text(args):
++    from medical_rag.patient_service import HealthNotice
++    with pytest.raises(ValueError):
++        HealthNotice(*args)
+
+
+Additional session regression at end of existing test file:
+            finally:
+                locker.commit()
+            with pytest.raises(AuthenticationDenied):
+                pending.result(timeout=5)
+
+
+@pytest.mark.integration
+def test_live_session_principal_enforces_patient_ownership_and_staff_mfa(system):
+    from medical_rag.access_policy import Action, Resource, is_allowed
+    from medical_rag.identity_sessions import AuthenticationDenied
+
+    store, admin = system
+    patient_session = issue(store)
+    patient = store.authenticate(patient_session.token)
+    own = Resource(TENANT, PATIENT)
+    other = Resource(TENANT, "00000000-0000-0000-0000-000000000302")
+    assert is_allowed(patient, Action.PATIENT_READ, own)
+    assert not is_allowed(patient, Action.PATIENT_READ, other)
+    assert not is_allowed(patient, Action.MEMBER_MANAGE, Resource(TENANT))
+
+    mutate(admin, "DELETE FROM medical_rag.identity_roles WHERE role='patient'")
+    mutate(admin, "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'org_admin')", (TENANT, ACCOUNT))
+    with pytest.raises(AuthenticationDenied):
+        store.authenticate(patient_session.token)
+    no_mfa = store.issue(VerifiedIdentity(ISSUER, "subject-1", False))
+    assert not is_allowed(store.authenticate(no_mfa.token), Action.MEMBER_MANAGE, Resource(TENANT))
+    admin_session = store.issue(VerifiedIdentity(ISSUER, "subject-1", True))
+    staff = store.authenticate(admin_session.token)
+    assert is_allowed(staff, Action.MEMBER_MANAGE, Resource(TENANT))
+    assert not is_allowed(staff, Action.PATIENT_READ, own)
+

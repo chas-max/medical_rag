@@ -1,0 +1,1195 @@
+Task11 dedicated verified-TLS patient gateway. Dirty worktree exact snapshot diff, NOT a commit range. Task11 targets were absent at task start (outputs/patient-gateway-baseline-20261103/new-targets.txt). Full context and complete new files. tests/keycloak_runtime.py pre-Task11 view is reconstructed by reverting only the three Task11 key-identifier extensions; all other working-tree content is current. No production application or legacy-gateway source change.
+
+74BBD162F638F1FC5FF8008AF8DB3B53699EC5AE6FA9A9B187D69A8CB9CA168D  src/medical_rag/patient_gateway.py
+4D077F6534EDD8ED5F28E0C1E71B368DC4315ECC8BD19AA8F48804ED380A99F0  tests/test_patient_gateway.py
+40638737FB7C3321567416650C0E2930ABBCD10FC96089645A5D75EE517B1647  tests/patient_gateway_runtime.py
+FC117245BBA4F826A2BB14A5F33FC83329C2BC9750A6BFCB395AA7B23826B390  tests/fixtures/patient_gateway_synthetic.py
+A248449D7DBF869C9C5CEFAF0A5A61C6B51D5F783F4AEF3B3A31DE8862BDE1EC  tests/keycloak_runtime.py
+FCF61CB5EBDD868B2622389197CE2E26A0D00B97CFA71BCFDED6F109D664FA27  deploy/patient-gateway/config.example.toml
+B5AD38905D89611EE453B05095EFC4B395992D364132FD904D78998C21119466  deploy/patient-gateway/start.sh
+2F6583039F50F1B7135DB525AE7C0498C854DF266B38690DDD3F3878C050BDFB  deploy/patient-gateway/README.md
+5B93BC66387B84F300F89F70FBF5976415F7425593D8E044819C918F92A0748E  docker-compose.patient-gateway.yml
+diff --git a/src/medical_rag/patient_gateway.py b/src/medical_rag/patient_gateway.py
+new file mode 100644
+index 0000000..d8a7481
+--- /dev/null
++++ b/src/medical_rag/patient_gateway.py
+@@ -0,0 +1,217 @@
++"""Strict operator configuration for the separate verified-TLS patient gateway.
++
++This module has no application, dotenv, network or deployment dependencies.
++Rendering does not install certificates, deploy the app or grant identity.
++"""
++
++import argparse
++import ipaddress
++import re
++import sys
++import tomllib
++from dataclasses import asdict, dataclass
++from pathlib import Path
++from urllib.parse import urlsplit
++
++MAX_CONFIGURATION_BYTES = 8192
++_FIELDS = frozenset({"public_origin", "upstream_url", "upstream_tls_name",
++                     "tls_certificate", "tls_key", "upstream_ca"})
++_DNS = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
++_PATH = re.compile(r"/(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\Z")
++
++
++class GatewayConfigurationError(Exception):
++    """Static diagnostic; never retain received configuration or file paths."""
++
++    def __str__(self) -> str:
++        return "Patient gateway configuration failed."
++
++
++@dataclass(frozen=True, slots=True, repr=False)
++class GatewayConfiguration:
++    """Explicit public HTTP authority and independent upstream TLS identity."""
++
++    public_origin: str
++    upstream_url: str
++    upstream_tls_name: str
++    tls_certificate: str
++    tls_key: str
++    upstream_ca: str
++
++
++def _dns(name: str) -> bool:
++    return (len(name) <= 253 and not re.fullmatch(r"[0-9.]+", name)
++            and all(_DNS.fullmatch(label) for label in name.split(".")))
++
++
++def _url(value: str, *, upstream: bool) -> None:
++    parsed = urlsplit(value)
++    host = parsed.hostname or ""
++    if parsed.scheme != "https" or not host:
++        raise GatewayConfigurationError()
++    try:
++        address = ipaddress.ip_address(host)
++        authority = f"[{address}]" if address.version == 6 else str(address)
++    except ValueError:
++        if not _dns(host):
++            raise GatewayConfigurationError() from None
++        authority = host
++    port = parsed.port
++    if port is not None:
++        if not 1 <= port <= 65535 or (not upstream and port == 443):
++            raise GatewayConfigurationError()
++        authority += f":{port}"
++    elif upstream:
++        raise GatewayConfigurationError()
++    # Exact reconstruction rejects userinfo, Unicode, path, empty ?/#, leading
++    # port zeroes, uppercase DNS, alternate IP spellings and scoped IPv6.
++    if value != "https://" + authority or "%" in authority:
++        raise GatewayConfigurationError()
++
++
++def _validate(fields: dict) -> GatewayConfiguration:
++    if set(fields) != _FIELDS:
++        raise GatewayConfigurationError()
++    for value in fields.values():
++        if (type(value) is not str or not 0 < len(value) <= 1024
++                or not value.isascii() or any(ord(c) <= 32 or ord(c) == 127 or c in "\"';{}$\\" for c in value)):
++            raise GatewayConfigurationError()
++    _url(fields["public_origin"], upstream=False)
++    _url(fields["upstream_url"], upstream=True)
++    if not _dns(fields["upstream_tls_name"]):
++        raise GatewayConfigurationError()
++    for key in ("tls_certificate", "tls_key", "upstream_ca"):
++        value = fields[key]
++        if not _PATH.fullmatch(value) or any(part in {".", ".."} for part in value.split("/")):
++            raise GatewayConfigurationError()
++    return GatewayConfiguration(**fields)
++
++
++def load_configuration(data: bytes) -> GatewayConfiguration:
++    """Parse bounded TOML bytes, without filesystem or environment access."""
++    try:
++        if type(data) is not bytes or not 0 < len(data) <= MAX_CONFIGURATION_BYTES:
++            raise GatewayConfigurationError()
++        return _validate(tomllib.loads(data.decode("utf-8")))
++    except (ValueError, TypeError, UnicodeError):
++        raise GatewayConfigurationError() from None
++
++
++def render_nginx(configuration: GatewayConfiguration) -> str:
++    """Render fixed directives only, revalidating even directly built objects."""
++    try:
++        if type(configuration) is not GatewayConfiguration:
++            raise GatewayConfigurationError()
++        c = _validate(asdict(configuration))
++    except (TypeError, ValueError):
++        raise GatewayConfigurationError() from None
++    authority = c.public_origin.removeprefix("https://")
++    return f'''# Generated dedicated patient gateway. Operator review required.
++worker_processes 1;
++pid /tmp/nginx.pid;
++error_log /dev/null crit;
++events {{ worker_connections 256; }}
++http {{
++    access_log off;
++    server_tokens off;
++    default_type application/json;
++    client_body_temp_path /tmp/client-body;
++    proxy_temp_path /tmp/proxy;
++    fastcgi_temp_path /tmp/fastcgi;
++    uwsgi_temp_path /tmp/uwsgi;
++    scgi_temp_path /tmp/scgi;
++    client_max_body_size 100000;
++    client_body_buffer_size 128k;
++    client_body_timeout 15s;
++    client_header_timeout 10s;
++    keepalive_timeout 5s;
++    send_timeout 30s;
++    large_client_header_buffers 2 8k;
++    limit_req_zone $binary_remote_addr zone=patient_dev_ip:1m rate=5r/s;
++    limit_conn_zone $binary_remote_addr zone=patient_dev_conn:1m;
++    server {{
++        listen 8443 ssl default_server;
++        server_name _;
++        ssl_certificate {c.tls_certificate};
++        ssl_certificate_key {c.tls_key};
++        ssl_protocols TLSv1.2 TLSv1.3;
++        ssl_session_tickets off;
++        if ($http_host != "{authority}") {{ return 400; }}
++        limit_req zone=patient_dev_ip burst=20 nodelay;
++        limit_req_status 429;
++        limit_conn patient_dev_conn 32;
++        limit_conn_status 429;
++        add_header X-Gateway-Request-ID $request_id always;
++        add_header Cache-Control no-store always;
++        error_page 400 405 408 414 431 494 495 496 497 = @invalid;
++        error_page 404 = @missing;
++        error_page 413 = @body_limit;
++        error_page 429 = @rate_limit;
++        error_page 500 502 503 504 = @unavailable;
++        location @invalid {{ return 400 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_INVALID_REQUEST","message":"Invalid request"}}}}'; }}
++        location @missing {{ return 404 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_NOT_FOUND","message":"Route unavailable"}}}}'; }}
++        location @body_limit {{ return 413 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_BODY_LIMIT","message":"Request too large"}}}}'; }}
++        location @rate_limit {{ return 429 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_RATE_LIMIT","message":"Development admission limit"}}}}'; }}
++        location @unavailable {{ return 502 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_UNAVAILABLE","message":"Service unavailable"}}}}'; }}
++        location ~ ^/(auth/(login|callback|session|logout|backchannel-logout)|me(/consents/health)?|conversations(/[0-9a-fA-F-]+(/turns)?)?|audit|support/(cases(/[0-9a-fA-F-]+)?|queue(/[0-9a-fA-F-]+/(take|resolve))?)|patient\\.html|assets/.+)?$ {{
++            proxy_pass {c.upstream_url};
++            proxy_ssl_verify on;
++            proxy_ssl_verify_depth 3;
++            proxy_ssl_trusted_certificate {c.upstream_ca};
++            proxy_ssl_server_name on;
++            proxy_ssl_name {c.upstream_tls_name};
++            proxy_ssl_protocols TLSv1.2 TLSv1.3;
++            proxy_next_upstream off;
++            proxy_connect_timeout 5s;
++            proxy_send_timeout 30s;
++            proxy_read_timeout 180s;
++            proxy_http_version 1.1;
++            proxy_pass_request_headers off;
++            proxy_set_header Host {authority};
++            proxy_set_header Connection "";
++            proxy_set_header Cookie $http_cookie;
++            proxy_set_header Origin $http_origin;
++            proxy_set_header Content-Type $http_content_type;
++            proxy_set_header Accept $http_accept;
++            proxy_set_header Accept-Language $http_accept_language;
++            proxy_set_header X-CSRF-Token $http_x_csrf_token;
++            proxy_hide_header X-Gateway-Request-ID;
++            proxy_ignore_headers X-Accel-Redirect X-Accel-Buffering X-Accel-Limit-Rate;
++            proxy_buffering off;
++            proxy_request_buffering on;
++            proxy_cache off;
++            proxy_max_temp_file_size 0;
++            proxy_intercept_errors off;
++            proxy_redirect off;
++        }}
++        location / {{ return 404; }}
++    }}
++}}
++'''
++
++
++class _Parser(argparse.ArgumentParser):
++    def error(self, message):
++        raise GatewayConfigurationError()
++
++
++def main(argv: list[str] | None = None) -> int:
++    """Read explicit operator file; exclusively create output; never deploy."""
++    try:
++        parser = _Parser(description="Render the dedicated patient TLS gateway")
++        parser.add_argument("--config", type=Path, required=True)
++        parser.add_argument("--output", type=Path, required=True)
++        args = parser.parse_args(argv)
++        with args.config.open("rb") as stream:
++            rendered = render_nginx(load_configuration(stream.read(MAX_CONFIGURATION_BYTES + 1)))
++        with args.output.open("x", encoding="utf-8", newline="\n") as stream:
++            stream.write(rendered)
++        print("Patient gateway configuration written.")
++        return 0
++    except Exception:  # noqa: BLE001 -- no input, paths or OS diagnostics cross CLI boundary
++        print(str(GatewayConfigurationError()), file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/test_patient_gateway.py b/tests/test_patient_gateway.py
+new file mode 100644
+index 0000000..88b2caa
+--- /dev/null
++++ b/tests/test_patient_gateway.py
+@@ -0,0 +1,160 @@
++"""Dedicated verified TLS boundary; actual application proof is not OIDC login."""
++
++import importlib.util
++import json
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++import pytest
++
++ROOT = Path(__file__).resolve().parents[1]
++VALID = '''public_origin = "https://patient.example.org:9443"
++upstream_url = "https://patient-app:8443"
++upstream_tls_name = "patient.internal.example.org"
++tls_certificate = "/run/tls/gateway.pem"
++tls_key = "/run/tls/gateway.key"
++upstream_ca = "/run/tls/upstream-ca.pem"
++'''
++
++
++def gateway_module():
++    from medical_rag import patient_gateway
++
++    return patient_gateway
++
++
++def test_renderer_verified_tls_port_header_routes_and_bounds():
++    module = gateway_module()
++    config = module.load_configuration(VALID.encode())
++    rendered = module.render_nginx(config)
++    for directive in (
++        "proxy_ssl_verify on;", "proxy_ssl_server_name on;",
++        "proxy_ssl_name patient.internal.example.org;",
++        "proxy_ssl_trusted_certificate /run/tls/upstream-ca.pem;",
++        "ssl_protocols TLSv1.2 TLSv1.3;", "proxy_ssl_protocols TLSv1.2 TLSv1.3;",
++        "proxy_next_upstream off;", "server_tokens off;",
++        "fastcgi_temp_path /tmp/fastcgi;", "uwsgi_temp_path /tmp/uwsgi;",
++        "scgi_temp_path /tmp/scgi;",
++        "proxy_set_header Host patient.example.org:9443;",
++        "proxy_pass https://patient-app:8443;", "proxy_pass_request_headers off;",
++        "client_max_body_size 100000;", "client_body_buffer_size 128k;",
++        "proxy_buffering off;", "proxy_cache off;", "proxy_read_timeout 180s;",
++        "proxy_http_version 1.1;", 'proxy_set_header Connection "";',
++        "rate=5r/s", "burst=20", "limit_req_status 429;", "access_log off;",
++        "proxy_hide_header X-Gateway-Request-ID;", "X-Gateway-Request-ID $request_id always;",
++        "proxy_intercept_errors off;", "proxy_redirect off;",
++    ):
++        assert directive in rendered
++    assert "X-Request-ID $request_id" not in rendered
++    assert "Authorization $" not in rendered
++    assert "X-Forwarded" not in rendered
++    assert "set_real_ip_from" not in rendered
++    assert "BEGIN " not in rendered and "PRIVATE KEY" not in rendered
++
++
++@pytest.mark.parametrize("origin", [
++    "https://example.org", "https://127.0.0.1:8443", "https://[::1]:8443",
++])
++def test_canonical_public_origins(origin):
++    module = gateway_module()
++    data = VALID.replace("https://patient.example.org:9443", origin)
++    assert module.load_configuration(data.encode()).public_origin == origin
++
++
++@pytest.mark.parametrize("key,value", [
++    ("public_origin", "http://example.org"), ("public_origin", "https://EXAMPLE.org"),
++    ("public_origin", "https://example.org:443"), ("public_origin", "https://example.org:0"),
++    ("public_origin", "https://example.org:65536"), ("public_origin", "https://example.org:0443"),
++    ("public_origin", "https://a@b"), ("public_origin", "https://example.org/"),
++    ("public_origin", "https://example.org?"), ("public_origin", "https://example.org#"),
++    ("public_origin", "https://*.example.org"), ("public_origin", "https://é.example"),
++    ("public_origin", "https://127.1"), ("public_origin", "https://01.2.3.4"),
++    ("public_origin", "https://example.org."), ("public_origin", "https://[fe80::1%25eth0]:4"),
++    ("upstream_url", "https://app"), ("upstream_url", "http://app:443"),
++    ("upstream_url", "https://app:443/path"), ("upstream_url", "https://$host:443"),
++    ("upstream_tls_name", "127.0.0.1"), ("upstream_tls_name", "*.example.org"),
++    ("tls_key", "/run/../secret"), ("tls_key", "relative/key"),
++    ("tls_key", "/run/key;"), ("tls_key", "/run/key$"), ("tls_key", "/run/key{a}"),
++    ("tls_key", "/run/key name"), ("tls_key", "/run//key"),
++    ("tls_key", "/run/key\nsecret"), ("tls_key", '/run/key"secret'),
++])
++def test_rejects_ambiguous_or_injected_values(key, value):
++    module = gateway_module()
++    import tomllib
++
++    fields = tomllib.loads(VALID)
++    fields[key] = value
++    data = "\n".join(f"{k} = {json.dumps(v, ensure_ascii=False)}" for k, v in fields.items())
++    with pytest.raises(module.GatewayConfigurationError, match="^Patient gateway configuration failed\\.$"):
++        module.load_configuration(data.encode())
++
++
++@pytest.mark.parametrize("data", [
++    b"", b"x" * 8193, b"\xff", b"[]", VALID.encode() + b'unknown = "secret"',
++    VALID.encode() + b'public_origin = "secret"', VALID.replace('"/run/tls/gateway.key"', "42").encode(),
++    VALID.replace('tls_key = "/run/tls/gateway.key"\n', "").encode(),
++])
++def test_strict_bounded_toml(data):
++    module = gateway_module()
++    with pytest.raises(module.GatewayConfigurationError):
++        module.load_configuration(data)
++
++
++def test_renderer_revalidates_constructed_configuration():
++    module = gateway_module()
++    from dataclasses import replace
++
++    config = module.load_configuration(VALID.encode())
++    with pytest.raises(module.GatewayConfigurationError):
++        module.render_nginx(replace(config, upstream_url="http://unsafe:80"))
++
++
++def test_cli_exclusive_output_and_static_private_failures(tmp_path, capsys):
++    module = gateway_module()
++    config, output = tmp_path / "operator-secret.toml", tmp_path / "nginx.conf"
++    config.write_text(VALID, encoding="utf-8")
++    assert module.main(["--config", str(config), "--output", str(output)]) == 0
++    original = output.read_bytes()
++    assert module.main(["--config", str(config), "--output", str(output)]) == 1
++    assert output.read_bytes() == original
++    assert module.main(["--config", "secret-not-found", "--output", str(output)]) == 1
++    assert module.main(["--unrecognized-secret"]) == 1
++    capture = capsys.readouterr()
++    assert capture.out == "Patient gateway configuration written.\n"
++    assert capture.err == "Patient gateway configuration failed.\n" * 3
++    config.write_bytes(b"private-invalid-value")
++    run = subprocess.run([sys.executable, "-m", "medical_rag.patient_gateway", "--config", str(config),
++                          "--output", str(tmp_path / "absent")], capture_output=True, text=True, check=False)
++    assert run.returncode == 1
++    assert run.stdout == "" and run.stderr == "Patient gateway configuration failed.\n"
++    assert not (tmp_path / "absent").exists()
++
++
++@pytest.mark.integration
++def test_synthetic_tls_headers_limits_and_streaming(tmp_path):
++    if os.environ.get("RUN_PATIENT_GATEWAY_INTEGRATION") != "1":
++        pytest.skip("select the disposable patient gateway socket suite explicitly")
++    from patient_gateway_runtime import synthetic_proof
++
++    synthetic_proof(tmp_path)
++
++
++@pytest.mark.integration
++def test_dedicated_compose_without_dotenv(tmp_path):
++    if os.environ.get("RUN_PATIENT_GATEWAY_INTEGRATION") != "1":
++        pytest.skip("select the disposable patient gateway socket suite explicitly")
++    from patient_gateway_runtime import compose_proof
++
++    compose_proof(tmp_path)
++
++
++@pytest.mark.integration
++def test_actual_isolated_application_through_verified_tls(tmp_path):
++    if os.environ.get("RUN_PATIENT_GATEWAY_INTEGRATION") != "1":
++        pytest.skip("select the disposable patient gateway socket suite explicitly")
++    assert importlib.util.find_spec("medical_rag.patient_gateway") is not None
++    from patient_gateway_runtime import actual_application_proof
++
++    actual_application_proof(tmp_path)
+diff --git a/tests/patient_gateway_runtime.py b/tests/patient_gateway_runtime.py
+new file mode 100644
+index 0000000..14001a7
+--- /dev/null
++++ b/tests/patient_gateway_runtime.py
+@@ -0,0 +1,406 @@
++"""Owned TLS sockets: real isolated app/PG and separate synthetic transport proof.
++
++Never print Docker output, credentials, response bodies or fixture state on failure.
++All keys are disposable and generated below an ignored pytest output directory.
++"""
++
++import json
++import logging
++import os
++import secrets
++import socket
++import ssl
++import subprocess
++import threading
++import time
++from contextlib import contextmanager
++from pathlib import Path
++from uuid import uuid4
++
++import httpx
++import psycopg
++import pytest
++import uvicorn
++from cryptography.hazmat.primitives.asymmetric import rsa
++from keycloak_runtime import certificates
++
++from medical_rag.identity_sessions import SessionStore
++from medical_rag.oidc_identity import VerifiedIdentity
++from medical_rag.oidc_login import LoginConfiguration
++from medical_rag.patient_gateway import load_configuration, render_nginx
++from medical_rag.patient_service import HealthNotice
++from medical_rag.security_config import PatientConfiguration
++from medical_rag.security_server import _application
++
++ROOT = Path(__file__).resolve().parents[1]
++NGINX = "nginx:1.30.6-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949"
++TENANT = "00000000-0000-0000-0000-000000000101"
++ISSUER = "https://identity.example.org/realms/fictional"
++
++
++def check(condition: bool, message: str) -> None:
++    """Only a static diagnostic, not assertion rewriting of private operands."""
++    if not condition:
++        pytest.fail(message, pytrace=False)
++
++
++def docker(*args: str, stdin: bytes | None = None) -> str:
++    try:
++        run = subprocess.run(["docker", *args], input=stdin, capture_output=True, timeout=45, check=False)
++        if run.returncode:
++            raise RuntimeError()
++        return run.stdout.decode().strip()
++    except (OSError, subprocess.SubprocessError, RuntimeError, UnicodeError):
++        raise RuntimeError("Owned gateway infrastructure command failed") from None
++
++
++def free_port() -> int:
++    with socket.socket() as sock:
++        sock.bind(("127.0.0.1", 0))
++        return sock.getsockname()[1]
++
++
++class Owned:
++    """Resource IDs are private, cleanup requires the exact unique owner label."""
++
++    def __init__(self, directory: Path):
++        self.directory = directory
++        self.owner = "patient-gateway-" + secrets.token_hex(8)
++        self.resources = []
++        self.gateway_port = free_port()
++        self.origin = f"https://127.0.0.1:{self.gateway_port}"
++
++    def __repr__(self):
++        return "<Owned patient gateway fixture>"
++
++    def network(self, suffix: str, internal: bool = False) -> str:
++        name = self.owner + suffix
++        docker("network", "create", "--label", "medical-rag.fixture=" + self.owner,
++               *(["--internal"] if internal else []), name)
++        self.resources.append(("network", name))
++        return name
++
++    def container(self, *args: str) -> str:
++        name = self.owner + "-" + secrets.token_hex(4)
++        docker("create", "--name", name, "--label", "medical-rag.fixture=" + self.owner, *args)
++        self.resources.append(("container", name))
++        return name
++
++    def cleanup(self):
++        failed = False
++        for kind, name in reversed(self.resources):
++            try:
++                path = ".Config.Labels" if kind == "container" else ".Labels"
++                owner = docker(kind, "inspect", name, "--format", '{{index ' + path + ' "medical-rag.fixture"}}')
++                if owner != self.owner:
++                    raise RuntimeError()
++                docker(kind, "rm", *( ["-f"] if kind == "container" else []), name)
++            except Exception:  # noqa: BLE001 -- attempt all owned cleanup, static error only
++                failed = True
++        for name in ("server.key", "server.pem", "ca.pem"):
++            (self.directory / name).unlink(missing_ok=True)
++        check(not failed, "Owned gateway cleanup failed")
++
++    def browser(self):
++        context = ssl.create_default_context(cafile=str(self.directory / "ca.pem"))
++        return httpx.Client(base_url=self.origin, verify=context, trust_env=False,
++                            timeout=httpx.Timeout(8, connect=2), follow_redirects=False)
++
++    def host_ipv4(self) -> str:
++        """Resolve Docker Desktop's IPv4 host route without relying on DNS order."""
++        return docker(
++            "run", "--rm", "--label", "medical-rag.fixture=" + self.owner,
++            "--add-host", "host.docker.internal:host-gateway", "python:3.13-alpine",
++            "python", "-c",
++            "import socket;print(socket.getaddrinfo('host.docker.internal',None,socket.AF_INET)[0][4][0])",
++        )
++
++    def gateway(self, upstream: str, *, tls_name: str = "localhost", ca: str = "ca.pem"):
++        fields = {
++            "public_origin": self.origin, "upstream_url": upstream, "upstream_tls_name": tls_name,
++            "tls_certificate": "/fixture/server.pem", "tls_key": "/fixture/server.key",
++            "upstream_ca": "/fixture/" + ca,
++        }
++        config = load_configuration("\n".join(f"{key} = {json.dumps(value)}" for key, value in fields.items()).encode())
++        target = self.directory / ("nginx-" + secrets.token_hex(4) + ".conf")
++        target.write_text(render_nginx(config), encoding="utf-8")
++        edge = self.network("-edge-" + secrets.token_hex(3))
++        container = self.container(
++            "--network", edge, "-p", f"127.0.0.1:{self.gateway_port}:8443",
++            "--user", "101:101", "--read-only", "--cap-drop", "ALL",
++            "--security-opt", "no-new-privileges", "--pids-limit", "32", "--memory", "128m",
++            "--tmpfs", "/tmp:rw,noexec,nosuid,size=64m,uid=101,gid=101",
++            "--mount", f"type=bind,source={target},target=/etc/nginx/nginx.conf,readonly",
++            "--mount", f"type=bind,source={self.directory},target=/fixture,readonly",
++            "--mount", f"type=bind,source={ROOT / 'deploy/patient-gateway/start.sh'},target=/start.sh,readonly",
++            "--entrypoint", "/bin/sh", NGINX, "/start.sh",
++        )
++        docker("network", "connect", self.backend, container)
++        docker("start", container)
++        with self.browser() as client:
++            ready = False
++            for _ in range(60):
++                try:
++                    ready = client.get("/not-allowed").status_code == 404
++                    if ready:
++                        break
++                except httpx.HTTPError:
++                    pass
++                time.sleep(0.1)
++            check(ready, "Owned gateway HTTPS readiness failed")
++        return container
++
++
++@contextmanager
++def infrastructure(directory: Path):
++    owned = Owned(directory)
++    try:
++        for image in (NGINX, "postgres:18.6-alpine", "python:3.13-alpine"):
++            docker("image", "inspect", image, "--format", "{{.Id}}")
++        certificates(directory)
++        owned.backend = owned.network("-backend", internal=True)
++        yield owned
++    except Exception:  # noqa: BLE001 -- external/private fixtures must not reach pytest repr
++        pytest.fail("Owned gateway socket proof failed", pytrace=False)
++    finally:
++        owned.cleanup()
++
++
++def database(owned: Owned):
++    password = secrets.token_urlsafe(24)
++    pg = owned.container(
++        "-p", "127.0.0.1::5432", "--tmpfs", "/var/lib/postgresql:rw,size=256m",
++        "--tmpfs", "/run/fixture:rw,noexec,nosuid,size=1m,mode=0700",
++        "-e", "POSTGRES_PASSWORD_FILE=/run/fixture/password", "-e", "POSTGRES_INITDB_ARGS=--no-sync",
++        "--entrypoint", "/bin/sh", "postgres:18.6-alpine", "-c",
++        'i=0; while [ ! -s /run/fixture/password ]; do i=$((i+1)); [ "$i" -lt 300 ] || exit 1; sleep .1; done; exec docker-entrypoint.sh postgres',
++    )
++    docker("start", pg)
++    docker("exec", "-i", pg, "/bin/sh", "-c",
++           "umask 077; cat > /run/fixture/pending && mv /run/fixture/pending /run/fixture/password",
++           stdin=password.encode())
++    port = int(docker("port", pg, "5432/tcp").rsplit(":", 1)[1])
++    admin = {"host": "127.0.0.1", "port": port, "dbname": "postgres", "user": "postgres", "password": password,
++             "connect_timeout": 2, "autocommit": True}
++    for _ in range(100):
++        try:
++            connection = psycopg.connect(**admin)
++            break
++        except psycopg.OperationalError:
++            time.sleep(0.1)
++    else:
++        raise RuntimeError("Owned PostgreSQL readiness failed")
++    with connection as db:
++        for migration in sorted((ROOT / "database/migrations").glob("*.sql")):
++            db.execute(migration.read_text(encoding="utf-8"))
++        db.execute(psycopg.sql.SQL("CREATE ROLE gateway_runtime LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS").format(
++            psycopg.sql.Literal(password)))
++        grants = (ROOT / "database/patient_runtime_grants.sql").read_text(encoding="utf-8")
++        grants = "\n".join(line for line in grants.splitlines() if not line.startswith("\\"))
++        db.execute(grants.replace(':"runtime_role"', '"gateway_runtime"'))
++        db.execute("INSERT INTO medical_rag.tenants(tenant_id) VALUES (%s)", (TENANT,))
++        for number in (1, 2):
++            account, patient = str(uuid4()), str(uuid4())
++            db.execute("INSERT INTO medical_rag.identity_accounts(tenant_id,account_id,issuer,subject) VALUES (%s,%s,%s,%s)",
++                       (TENANT, account, ISSUER, f"fictional-{number}"))
++            db.execute("INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'patient')", (TENANT, account))
++            db.execute("INSERT INTO medical_rag.patient_subjects"
++                       "(tenant_id,patient_id,age_classification,identity_verified) VALUES (%s,%s,'adult',true)",
++                       (TENANT, patient))
++            db.execute("INSERT INTO medical_rag.identity_bindings VALUES (%s,%s,%s,true)", (TENANT, account, patient))
++    return dict(admin, user="gateway_runtime", autocommit=False), admin
++
++
++@contextmanager
++def application(owned: Owned):
++    runtime, admin = database(owned)
++    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    login = LoginConfiguration(
++        issuer=ISSUER, authorization_endpoint=ISSUER + "/auth", token_endpoint=ISSUER + "/token",
++        callback_uri=owned.origin + "/auth/callback", client_id="fictional-gateway",
++        client_secret=secrets.token_urlsafe(32), public_key=key.public_key(),
++        mfa_acr_values=frozenset({"urn:fictional:mfa"}),
++    )
++    port = free_port()
++    config = PatientConfiguration(
++        tenant_id=TENANT, database_dsn=psycopg.conninfo.make_conninfo(**{k: v for k, v in runtime.items() if k != "autocommit"}),
++        transaction_key=secrets.token_bytes(32), frontend_dist=ROOT / "frontend/dist-patient",
++        listen_host="127.0.0.1", listen_port=port,
++        tls_cert_file=owned.directory / "server.pem", tls_key_file=owned.directory / "server.key",
++        login=login, notice=HealthNotice("fictional-v1", "Fictional test notice only.", 3600),
++    )
++    app = _application(config)  # Real schema/privilege preflight and real isolated factory.
++    sessions = SessionStore(lambda: psycopg.connect(**runtime), tenant_id=TENANT)
++    first = sessions.issue(VerifiedIdentity(ISSUER, "fictional-1", True))
++    second = sessions.issue(VerifiedIdentity(ISSUER, "fictional-2", True))
++    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
++        logging.getLogger(name).disabled = True
++    server = uvicorn.Server(uvicorn.Config(
++        app, host=config.listen_host, port=port, ssl_certfile=str(config.tls_cert_file),
++        ssl_keyfile=str(config.tls_key_file), proxy_headers=False, access_log=False,
++        server_header=False, log_config=None, log_level="critical", limit_concurrency=100,
++    ))
++    thread = threading.Thread(target=server.run, daemon=True)
++    thread.start()
++    try:
++        for _ in range(100):
++            if server.started:
++                break
++            time.sleep(0.05)
++        check(server.started, "Actual isolated TLS app readiness failed")
++        yield port, first, second, admin
++    finally:
++        server.should_exit = True
++        thread.join(timeout=10)
++        check(not thread.is_alive(), "Actual isolated TLS app cleanup failed")
++
++
++def _headers(owned, session):
++    return {"Cookie": "__Host-medical-session=" + session.token,
++            "X-CSRF-Token": session.csrf_token, "Origin": owned.origin}
++
++
++def actual_application_proof(directory: Path):
++    with infrastructure(directory) as owned, application(owned) as private:
++        port, first, second, admin = private
++        owned.gateway(f"https://{owned.host_ipv4()}:{port}")
++        with owned.browser() as client:
++            response = client.get("/")
++            check(response.status_code == 200 and 'type="module"' in response.text, "Real frontend retrieval failed")
++            asset = next((ROOT / "frontend/dist-patient/assets").glob("*.js"))
++            check(client.get("/assets/" + asset.name).status_code == 200, "Real asset retrieval failed")
++            check(client.get("/me").status_code == 401, "Missing session was not denied")
++            check(client.get("/me", headers={"Authorization": "Bearer fictional", "X-User-ID": "fictional-1", "X-Role": "admin"}).status_code == 401,
++                  "Forged identity was not denied")
++            headers = _headers(owned, first)
++            response = client.get("/me", headers=headers | {"X-Request-ID": "forged", "X-Gateway-Request-ID": "forged", "X-Tenant-ID": "other"})
++            check(response.status_code == 200 and response.json()["data"]["tenant_id"] == TENANT, "Current fictional session identity failed")
++            request_id = response.headers.get("x-request-id")
++            gateway_id = response.headers.get("x-gateway-request-id")
++            check(bool(request_id and gateway_id and request_id != gateway_id and "forged" not in (request_id, gateway_id)), "Independent trace IDs failed")
++            check(len(response.headers.get_list("x-request-id")) == 1, "Duplicate app request ID")
++            with psycopg.connect(**admin) as db:
++                check(db.execute("SELECT count(*) FROM medical_rag.security_audit_events WHERE request_id=%s", (request_id,)).fetchone()[0] > 0,
++                      "Application audit correlation lost")
++            check(client.get("/me", headers=headers | {"Host": "wrong.example"}).status_code == 400, "Wrong Host accepted")
++            check(client.get("/me", headers=headers | {"Origin": "https://wrong.example"}).status_code == 403, "Wrong Origin accepted")
++            check(client.post("/me/consents/health", headers={"Cookie": headers["Cookie"], "Origin": owned.origin},
++                              json={"version": "fictional-v1", "accepted": True}).status_code in (401, 403), "Missing CSRF accepted")
++            check(client.post("/me/consents/health", headers=headers,
++                              json={"version": "fictional-v1", "accepted": True}).status_code == 200, "Cookie/CSRF consent mutation failed")
++            response = client.post("/conversations", headers=headers, json={"title": "Fictional owned conversation"})
++            check(response.status_code == 200, "Owned resource creation failed")
++            path = "/conversations/" + response.json()["data"]["id"]
++            check(client.get(path, headers=headers).status_code == 200, "Owned resource access failed")
++            other = _headers(owned, second)
++            check(client.post("/me/consents/health", headers=other,
++                              json={"version": "fictional-v1", "accepted": True}).status_code == 200, "Second fictional consent failed")
++            denied = client.get(path, headers=other)
++            check(denied.status_code == 404 and denied.json()["error"]["code"] == "RESOURCE_NOT_FOUND", "Foreign owner was not denied by real app")
++            check(client.get("/audit", headers=headers).status_code == 403, "Real application role denial changed")
++            for path in ("/ui", "/api", "/settings", "/documents", "/docs", "/unknown", "/me/unknown"):
++                response = client.get(path, headers=headers)
++                check(response.status_code == 404 and response.json()["error"]["code"] == "GATEWAY_NOT_FOUND", "Closed path reached application")
++            check("nginx/" not in response.headers.get("server", ""), "Server version disclosed")
++
++
++def synthetic_proof(directory: Path):
++    with infrastructure(directory) as owned:
++        synthetic = owned.container(
++            "--network", owned.backend, "--network-alias", "synthetic", "--read-only",
++            "--cap-drop", "ALL", "--security-opt", "no-new-privileges", "--pids-limit", "64", "--memory", "128m",
++            "--mount", f"type=bind,source={directory},target=/fixture,readonly",
++            "--mount", f"type=bind,source={ROOT / 'tests/fixtures/patient_gateway_synthetic.py'},target=/synthetic.py,readonly",
++            "python:3.13-alpine", "python", "-B", "/synthetic.py",
++        )
++        docker("start", synthetic)
++        gateway = owned.gateway("https://synthetic:8443")
++        with owned.browser() as client:
++            response = client.post("/me", content=b"fictional-body", headers={
++                "Cookie": "opaque=fictional", "Origin": owned.origin, "X-CSRF-Token": "fictional-csrf",
++                "Content-Type": "text/plain", "Accept": "application/json", "Accept-Language": "en",
++                "Authorization": "Bearer private", "Forwarded": "for=forged;proto=http",
++                "X-Forwarded-For": "192.0.2.4", "X-Forwarded-Host": "forged.example", "X-Forwarded-Proto": "http",
++                "X-User-ID": "forged", "X-Tenant-ID": "forged", "X-Role": "admin", "X-Request-ID": "forged",
++                "X-Arbitrary-Identity": "forged",
++            })
++            check(response.status_code == 200, "Synthetic verified upstream unreachable")
++            payload = response.json()
++            received = {key.lower(): value for key, value in payload["headers"].items()}
++            check(set(received) == {"host", "content-length", "cookie", "origin", "content-type", "accept", "accept-language", "x-csrf-token"},
++                  "Request header allowlist violated")
++            check(received["host"] == owned.origin.removeprefix("https://") and received["content-length"] == "14" and payload["length"] == 14,
++                  "Port-preserving Host or request framing failed")
++            check(received["cookie"] == "opaque=fictional" and received["x-csrf-token"] == "fictional-csrf", "Allowed Cookie/CSRF lost")
++            check(response.headers.get_list("x-request-id") == ["synthetic-application-id"] and response.headers["x-gateway-request-id"] != "forged-upstream-gateway-id",
++                  "Upstream response ID semantics changed")
++            for status in (401, 403, 404, 409, 429, 302):
++                time.sleep(0.21)
++                response = client.get(f"/assets/status-{status}")
++                check(response.status_code == status and response.json()["synthetic"] is True, "Application status/body intercepted")
++                check(response.headers["location"] == "https://identity.example.org/authorize?state=fictional", "Provider redirect rewritten")
++            for chunks, expected in (([b"x" * 100000], 200), ([b"x" * 50000, b"x" * 50001], 413)):
++                time.sleep(0.21)
++                response = client.post("/me", content=iter(chunks))
++                check(response.status_code == expected, "Chunked body boundary failed")
++                if expected == 413:
++                    check(response.json()["error"]["code"] == "GATEWAY_BODY_LIMIT", "Body failure was not static")
++            response = client.post("/me", content=b"x" * 100001)
++            check(response.status_code == 413, "Fixed length body limit failed")
++            started = time.monotonic()
++            with client.stream("GET", "/assets/stream") as response:
++                lines = response.iter_lines()
++                check(next(lines) == "data: first" and time.monotonic() - started < 2, "SSE first chunk buffered")
++                check("data: complete" in list(lines) and time.monotonic() - started >= 3, "SSE completion missing")
++            statuses = []
++            limited = None
++            for index in range(80):
++                response = client.get("/me", headers={"X-Forwarded-For": f"192.0.2.{index}", "Cookie": f"fake={index}"})
++                statuses.append(response.status_code)
++                if response.status_code == 429:
++                    limited = response
++                    break
++            check(429 in statuses and 200 in statuses, "Source-IP development admission not enforced")
++            check(limited is not None and limited.json()["error"]["code"] == "GATEWAY_RATE_LIMIT",
++                  "Rate-limit failure was not static")
++        # Each negative case creates a new gateway with an otherwise identical
++        # fixed rendered configuration. The upstream remains strictly TLS-only.
++        docker("stop", "--time", "1", gateway)
++        foreign = directory / "foreign"
++        foreign.mkdir()
++        certificates(foreign)
++        (directory / "wrong-ca.pem").write_bytes((foreign / "ca.pem").read_bytes())
++        for name in ("server.key", "server.pem", "ca.pem"):
++            (foreign / name).unlink()
++        for upstream, tls_name, ca in (("https://synthetic:8443", "localhost", "wrong-ca.pem"),
++                                       ("https://synthetic:8443", "wrong.example.org", "ca.pem"),
++                                       ("https://synthetic:9443", "localhost", "ca.pem")):
++            gateway = owned.gateway(upstream, tls_name=tls_name, ca=ca)
++            with owned.browser() as client:
++                response = client.get("/me?private=fictional")
++                check(response.status_code == 502 and response.json() == {
++                    "success": False, "data": None, "error": {"code": "GATEWAY_UNAVAILABLE", "message": "Service unavailable"}},
++                    "Negative upstream TLS case did not fail closed")
++                check(docker("logs", gateway) == "", "Gateway request diagnostics leaked")
++            docker("stop", "--time", "1", gateway)
++
++
++def compose_proof(directory: Path):
++    empty = directory / "empty-env"
++    empty.write_bytes(b"")
++    env = os.environ | {
++        "COMPOSE_DISABLE_ENV_FILE": "1", "PATIENT_GATEWAY_CONFIG": str(directory / "rendered.conf"),
++        "PATIENT_GATEWAY_CERT": str(directory / "server.pem"), "PATIENT_GATEWAY_KEY": str(directory / "server.key"),
++        "PATIENT_GATEWAY_UPSTREAM_CA": str(directory / "ca.pem"),
++    }
++    result = subprocess.run(["docker", "compose", "--env-file", str(empty), "-f", str(ROOT / "docker-compose.patient-gateway.yml"),
++                             "config", "--format", "json"], env=env, capture_output=True, check=False, timeout=30)
++    check(result.returncode == 0, "Dedicated Compose config failed")
++    parsed = json.loads(result.stdout)
++    check(set(parsed["services"]) == {"patient-gateway"}, "Gateway Compose unexpectedly deploys another service")
++    service = parsed["services"]["patient-gateway"]
++    check(service["image"] == NGINX and service["read_only"] and service["user"] == "101:101", "Gateway container boundary changed")
++    check(service["cap_drop"] == ["ALL"] and "no-new-privileges:true" in service["security_opt"], "Gateway privileges changed")
++    check(service["ports"][0]["host_ip"] == "127.0.0.1" and len(service["ports"]) == 1, "Gateway publish boundary changed")
++    check(parsed["networks"]["backend"]["internal"] is True and "internal" not in parsed["networks"]["edge"], "Gateway networks not separated")
++    check(all(item["read_only"] and not item["bind"]["create_host_path"] for item in service["volumes"]), "Gateway mounts are not explicit read-only files")
+diff --git a/tests/fixtures/patient_gateway_synthetic.py b/tests/fixtures/patient_gateway_synthetic.py
+new file mode 100644
+index 0000000..73783a7
+--- /dev/null
++++ b/tests/fixtures/patient_gateway_synthetic.py
+@@ -0,0 +1,54 @@
++"""TLS-only synthetic transport fixture, never an application identity proof."""
++
++import json
++import ssl
++import time
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++
++
++class Handler(BaseHTTPRequestHandler):
++    protocol_version = "HTTP/1.1"
++
++    def log_message(self, *args):
++        pass
++
++    def do_GET(self):
++        self.respond()
++
++    def do_POST(self):
++        self.respond()
++
++    def respond(self):
++        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
++        if self.path == "/assets/stream":
++            self.send_response(200)
++            self.send_header("Content-Type", "text/event-stream")
++            self.send_header("Connection", "close")
++            self.end_headers()
++            self.wfile.write(b"data: first\n\n")
++            self.wfile.flush()
++            time.sleep(3)
++            self.wfile.write(b"data: complete\n\n")
++            self.close_connection = True
++            return
++        status = 200
++        if self.path.startswith("/assets/status-"):
++            status = int(self.path.rsplit("-", 1)[1])
++        payload = json.dumps({"headers": dict(self.headers), "length": len(body), "synthetic": True}).encode()
++        self.send_response(status)
++        self.send_header("Content-Type", "application/json")
++        self.send_header("Content-Length", str(len(payload)))
++        self.send_header("X-Request-ID", "synthetic-application-id")
++        self.send_header("X-Gateway-Request-ID", "forged-upstream-gateway-id")
++        self.send_header("Location", "https://identity.example.org/authorize?state=fictional")
++        self.end_headers()
++        self.wfile.write(payload)
++
++
++if __name__ == "__main__":
++    server = ThreadingHTTPServer(("0.0.0.0", 8443), Handler)
++    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    tls.minimum_version = ssl.TLSVersion.TLSv1_2
++    tls.load_cert_chain("/fixture/server.pem", "/fixture/server.key")
++    server.socket = tls.wrap_socket(server.socket, server_side=True)
++    server.serve_forever()
+diff --git a/deploy/patient-gateway/config.example.toml b/deploy/patient-gateway/config.example.toml
+new file mode 100644
+index 0000000..1bc1a95
+--- /dev/null
++++ b/deploy/patient-gateway/config.example.toml
+@@ -0,0 +1,8 @@
++# Placeholders only: operator provisioning and review are separate obligations.
++# POSIX paths are container mount targets, not host filenames or key contents.
++public_origin = "https://patient.example.org:8443"
++upstream_url = "https://patient-app:8443"
++upstream_tls_name = "patient.internal.example.org"
++tls_certificate = "/run/tls/gateway.pem"
++tls_key = "/run/tls/gateway.key"
++upstream_ca = "/run/tls/upstream-ca.pem"
+diff --git a/deploy/patient-gateway/start.sh b/deploy/patient-gateway/start.sh
+new file mode 100644
+index 0000000..4ff3845
+--- /dev/null
++++ b/deploy/patient-gateway/start.sh
+@@ -0,0 +1,8 @@
++#!/bin/sh
++# Fixed command only. Even nginx startup certificate/path diagnostics stay private.
++nginx -e /dev/null -g 'daemon off;' >/dev/null 2>&1
++status=$?
++if [ "$status" -ne 0 ]; then
++    printf '%s\n' 'Patient gateway unavailable.' >&2
++fi
++exit "$status"
+diff --git a/deploy/patient-gateway/README.md b/deploy/patient-gateway/README.md
+new file mode 100644
+index 0000000..e507252
+--- /dev/null
++++ b/deploy/patient-gateway/README.md
+@@ -0,0 +1,208 @@
++# Dedicated verified-TLS patient gateway (reference only)
++
++This directory configures a **separate** gateway for the isolated patient
++application served by `medical_rag.security_server`. It is not production
++deployment approval and does not replace the institution's ingress, network
++policy, certificate lifecycle, monitoring or identity registration.
++
++It is intentionally distinct from the legacy `deploy/gateway/nginx.conf` and
++`docker-compose.gateway.yml` experiment. That old configuration still uses a
++plaintext HTTP fake upstream; do not point it at the patient application and do
++not treat it as a substitute for this gateway.
++
++## Files
++
++| Path | Purpose |
++| --- | --- |
++| `config.example.toml` | Placeholders only; no institution-approved values |
++| `start.sh` | Fixed container command; startup diagnostics stay private |
++| `../../src/medical_rag/patient_gateway.py` | Bounded TOML loader, pure renderer and CLI |
++| `../../docker-compose.patient-gateway.yml` | Gateway-only, loopback-bound hardened container |
++
++The renderer does not read `.env`, the legacy `Settings`, the network or the
++filesystem. It validates an explicit operator file and prints only static
++messages, including on failure.
++
++## 1. Provision the operator files
++
++Create a private directory outside the repository containing:
++
++- the gateway certificate chain (PEM);
++- the gateway private key (PEM);
++- the CA bundle that signed the application certificate (PEM).
++
++The gateway container runs as UID/GID `101:101` on a read-only root filesystem.
++Make the mounted files readable by that user without making them world-readable
++where the host supports POSIX permissions. The private key must never be copied
++into the repository, a rendered nginx configuration, a Compose environment
++variable or a log. The container receives only read-only bind mounts.
++
++The application certificate must be valid for the configured
++`upstream_tls_name` (the verification DNS name), and its chain must verify
++against `upstream_ca`. The public gateway certificate must be valid for the
++public origin; clients must trust its issuer explicitly. Do not disable
++verification or use test certificates for real data.
++
++## 2. Write the gateway configuration
++
++Copy `config.example.toml` to the private directory and replace every
++placeholder. All six fields are required and unknown or duplicate keys are
++rejected:
++
++```toml
++public_origin = "https://patient.example.org:8443"
++upstream_url = "https://patient-app:8443"
++upstream_tls_name = "patient.internal.example.org"
++tls_certificate = "/run/tls/gateway.pem"
++tls_key = "/run/tls/gateway.key"
++upstream_ca = "/run/tls/upstream-ca.pem"
++```
++
++- `public_origin` is one canonical ASCII DNS, IPv4 or bracketed IPv6 authority
++  with an optional non-default port. It has no userinfo, path, query, fragment,
++  wildcard or control character. This exact authority is required in the HTTP
++  `Host` header before any request is proxied.
++- `upstream_url` is one explicit HTTPS `host:port`, resolved at gateway start.
++  It is not a variable URI, Unix socket or user-controlled target.
++- `upstream_tls_name` is the DNS name used for upstream SNI and certificate
++  hostname verification. It is independent of the public HTTP authority.
++- The three mount paths are absolute POSIX container paths with a fixed safe
++  character set. They are configuration values, not key material.
++
++The TOML file is an operator input, not a secret store. Protect it because it
++discloses topology, but never place certificate or key contents in it.
++
++## 3. Render the fixed nginx configuration
++
++Use a new output path each time; the CLI creates it exclusively and refuses to
++overwrite an existing file:
++
++```powershell
++.\.venv\Scripts\python.exe -m medical_rag.patient_gateway `
++  --config C:\secure\patient-gateway\gateway.toml `
++  --output C:\secure\patient-gateway\nginx.conf
++```
++
++Success prints only `Patient gateway configuration written.` Failure prints only
++`Patient gateway configuration failed.` and never echoes the received values,
++paths or generated configuration. Do not pipe a failure message into a shell
++command or retry with looser validation.
++
++Rendered output uses fixed directives, not a generic template language. Review
++the generated file before use. Re-rendering after a configuration or certificate
++change is a separate operator action; the gateway does not reload itself.
++
++## 4. Deploy only the gateway container
++
++Set explicit environment variables and disable Compose's implicit `.env`
++loading; the gateway must not consume the legacy application dotenv:
++
++```powershell
++$env:COMPOSE_DISABLE_ENV_FILE = '1'
++$env:PATIENT_GATEWAY_CONFIG = 'C:\secure\patient-gateway\nginx.conf'
++$env:PATIENT_GATEWAY_CERT = 'C:\secure\patient-gateway\gateway.pem'
++$env:PATIENT_GATEWAY_KEY = 'C:\secure\patient-gateway\gateway.key'
++$env:PATIENT_GATEWAY_UPSTREAM_CA = 'C:\secure\patient-gateway\upstream-ca.pem'
++$env:PATIENT_GATEWAY_PORT = '8443'
++docker compose -f docker-compose.patient-gateway.yml up -d
++```
++
++The Compose file deploys **only** `patient-gateway`. It does not deploy the
++patient application, PostgreSQL, the identity provider or the legacy RAG
++services. The gateway publishes one loopback port by default and joins:
++
++- `edge` - the published edge network;
++- `backend` - a separate internal network with no backend published port.
++
++Deploy the patient application independently over TLS and attach it to the
++`backend` network with a network alias equal to the upstream hostname:
++
++```powershell
++docker network connect <compose-project>_backend <patient-app-container> --alias patient-app
++```
++
++Start the application before the gateway: nginx resolves the configured
++upstream hostname at startup. If the application is recreated with a different
++address, restart the gateway. Do not expose `unsafe-local-demo`, the legacy API
++or the workers through this gateway. No Docker socket is mounted.
++
++## 5. Routing, headers and bounds
++
++Only the patient application's current paths are routed: `/auth/...`, `/me`,
++`/me/consents/health`, `/conversations...`, `/audit`, `/support/...`,
++`/patient.html`, `/assets/...` and `/`. Unknown paths and the legacy `/ui`,
++`/api`, `/settings` and `/documents` paths are answered by the gateway and never
++reach the application.
++
++The application remains authoritative for authentication, sessions, roles,
++ownership, consent, MFA and audit. The gateway does not validate identity
++headers and does not create a session. It forwards only `Cookie`, `Origin`,
++`Content-Type`, `Accept`, `Accept-Language` and `X-CSRF-Token`, plus its own
++`Host` and correct request framing. It strips `Authorization`, `Forwarded`,
++`X-Forwarded-*`, `X-User-ID`, `X-Tenant-ID`, `X-Role` and arbitrary identity
++headers. Application `X-Request-ID` values are preserved for audit correlation;
++the gateway's independent trace is `X-Gateway-Request-ID` and any upstream
++header of that name is discarded. The two identifiers are not a shared trace.
++
++Request bodies are bounded to 100,000 bytes with a 128 KiB memory buffer.
++Response buffering and proxy cache are off, HTTP/1.1 is used and upstream reads
++may last 180 seconds so a future streaming endpoint is not buffered. The
++current patient application does not expose clinical inference streaming;
++synthetic SSE tests prove transport capability only.
++
++Development admission is per connection source IP: 5 requests/second with a
++burst of 20, at most 32 concurrent connections, answering 429 with a static
++gateway body. Forwarded addresses and cookies are never used as rate keys this
++stage. **This is not institution-approved rate policy and not account-level
++rate limiting.** Account and tenant quotas remain a separate gate.
++
++## 6. TLS behavior
++
++The gateway listens with TLS 1.2/1.3 only and verifies the upstream certificate
++chain and hostname with the explicitly mounted CA, SNI and verification name.
++There is no HTTP fallback, insecure retry or certificate-verification bypass.
++Wrong CA, wrong verification name or an unavailable upstream produce only a
++static `502 GATEWAY_UNAVAILABLE` response.
++
++Certificate rotation, revocation response, private-key protection, backup and
++production ingress policy are operator-owned processes. This reference does not
++automate them. Restart the gateway after replacing mounted files, and review
++the rendered configuration whenever the public origin or upstream changes.
++
++## 7. Verification
++
++Prerequisites: Docker with the pinned `nginx:1.30.6-alpine`, disposable
++`postgres:18.6-alpine` and `python:3.13-alpine` images cached, a built
++`frontend/dist-patient`, and Python dependencies from `.[dev]`.
++
++```powershell
++# Pure loader/renderer/CLI tests and coverage.
++.\.venv\Scripts\python.exe -m pytest tests/test_patient_gateway.py -q -m "not integration" `
++  --cov=medical_rag.patient_gateway --cov-report=term-missing
++
++# Actual nginx HTTPS -> actual isolated application/PG plus synthetic transport.
++$env:RUN_PATIENT_GATEWAY_INTEGRATION = '1'
++.\.venv\Scripts\python.exe -m pytest tests/test_patient_gateway.py -q
++```
++
++The selected integration run fails when required infrastructure is unavailable;
++it must not silently become a mock or skip success. The tests create only
++uniquely labeled disposable networks/containers and remove them after checking
++the ownership label. They reuse cached images and do not prune other resources.
++Generated test certificates are self-signed fictions trusted explicitly by the
++test client; no real keys, accounts, DNS names or production certificate store
++are used.
++
++The actual-application test issues fixture sessions directly through the
++session store. That is not an OIDC browser login and does not prove full
++identity-provider interoperability; the separate Keycloak tests cover protocol,
++not a full authenticated browser E2E.
++
++## 8. Explicit non-claims
++
++This gateway is repository engineering evidence, not production acceptance. It
++does not provide institution-approved rate limits, real hospital identity
++proofing, network segmentation review, certificate automation, monitoring,
++backup, incident response, load testing, clinical validation or legal/privacy
++approval. Do not process real patient information through it until those gates
++are independently completed and signed off.
+diff --git a/docker-compose.patient-gateway.yml b/docker-compose.patient-gateway.yml
+new file mode 100644
+index 0000000..611c919
+--- /dev/null
++++ b/docker-compose.patient-gateway.yml
+@@ -0,0 +1,47 @@
++services:
++  patient-gateway:
++    image: nginx:1.30.6-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
++    entrypoint: ["/bin/sh", "/run/patient-gateway/start.sh"]
++    user: "101:101"
++    read_only: true
++    cap_drop: [ALL]
++    security_opt: [no-new-privileges:true]
++    pids_limit: 32
++    mem_limit: 128m
++    cpus: 1.0
++    tmpfs:
++      - /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=101
++    ports:
++      - "127.0.0.1:${PATIENT_GATEWAY_PORT:-8443}:8443"
++    volumes:
++      - type: bind
++        source: ${PATIENT_GATEWAY_CONFIG:?Set the reviewed rendered configuration file}
++        target: /etc/nginx/nginx.conf
++        read_only: true
++        bind: {create_host_path: false}
++      - type: bind
++        source: ./deploy/patient-gateway/start.sh
++        target: /run/patient-gateway/start.sh
++        read_only: true
++        bind: {create_host_path: false}
++      - type: bind
++        source: ${PATIENT_GATEWAY_CERT:?Set the operator certificate file}
++        target: /run/tls/gateway.pem
++        read_only: true
++        bind: {create_host_path: false}
++      - type: bind
++        source: ${PATIENT_GATEWAY_KEY:?Set the operator private key file}
++        target: /run/tls/gateway.key
++        read_only: true
++        bind: {create_host_path: false}
++      - type: bind
++        source: ${PATIENT_GATEWAY_UPSTREAM_CA:?Set the operator upstream CA file}
++        target: /run/tls/upstream-ca.pem
++        read_only: true
++        bind: {create_host_path: false}
++    networks: [edge, backend]
++
++networks:
++  edge: {}
++  backend:
++    internal: true
+diff --git a/outputs/patient-gateway-baseline-20261103/tests__keycloak_runtime.py b/tests/keycloak_runtime.py
+index ca648a4..1aae9a6 100644
+--- a/outputs/patient-gateway-baseline-20261103/tests__keycloak_runtime.py
++++ b/tests/keycloak_runtime.py
+@@ -85,6 +85,9 @@ def certificates(directory: Path) -> None:
+             x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+             True,
+         )
++        .add_extension(
++            x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), False
++        )
+         .sign(ca_key, hashes.SHA256())
+     )
+     cert = (
+@@ -96,6 +99,13 @@ def certificates(directory: Path) -> None:
+         .not_valid_before(now - timedelta(minutes=1))
+         .not_valid_after(now + timedelta(days=1))
+         .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
++        .add_extension(
++            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False
++        )
++        .add_extension(
++            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()),
++            False,
++        )
+         .add_extension(
+             x509.SubjectAlternativeName(
+                 [

@@ -7,6 +7,7 @@ from time import monotonic, perf_counter
 from typing import Literal
 from uuid import uuid4
 
+from ..public_errors import public_error
 from ..types import ApiError, Evidence
 from .agentic_runtime import AgentRuntime
 from .contracts import (
@@ -218,11 +219,11 @@ class WorkflowEngine:
                         node_id=node_id,
                         status="failed",
                         duration_ms=duration_ms,
-                        error={"code": error.code, "message": error.message},
+                        error=public_error(error.code).data(),
                     )
                 )
                 return WorkflowRunResult(run_id, "failed", {}, context.trace)
-            except Exception:
+            except Exception:  # noqa: BLE001 - never expose a node's internal failure
                 duration_ms = max(0, int((perf_counter() - started) * 1000))
                 context.trace.append(
                     NodeTrace(
@@ -245,7 +246,7 @@ class WorkflowEngine:
                         status="failed",
                         duration_ms=duration_ms,
                         error=self._safe_node_error(result.error),
-                        metadata=dict(result.metadata),
+                        metadata={},
                     )
                 )
                 return WorkflowRunResult(run_id, "failed", {}, context.trace)

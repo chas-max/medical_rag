@@ -1,0 +1,2772 @@
+# Task6 actual Keycloak / trusted private CA review package
+
+Uncommitted exact task scope. Base: outputs/keycloak-integration-baseline-20261103 snapshots captured after Task5 frozen, beforeTask6 source. Head: frozen working tree. No commit range represents this task.
+
+
+
+## src/medical_rag/oidc_login.py
+
+diff --git a/outputs/keycloak-integration-baseline-20261103/src__medical_rag__oidc_login.py b/src/medical_rag/oidc_login.py
+index ed308a7..3ad767b 100644
+--- a/outputs/keycloak-integration-baseline-20261103/src__medical_rag__oidc_login.py
++++ b/src/medical_rag/oidc_login.py
+@@ -1,538 +1,544 @@
+ """Experimental, isolated OIDC login application; never mounted on the legacy API.
+ 
+ This provides authorization-code + S256 PKCE, browser-bound one-use PostgreSQL
+ login transactions, ID-token verification, and opaque sessions. It is not a
+-production deployment or patient authorization system. An institution must
++production deployment; login alone is not patient authorization. An institution must
+ independently configure a real provider, approved MFA mapping, keys/rotation,
+ TLS and trusted proxy handling, request limits, database privileges and audit.
+ The signed provider-logout profile requires exact IdP registration/support.
+ Provider tokens are discarded; local account/role/patient
+ provisioning remains a separate trusted process. Existing endpoints/workers
+ stay locked. The returned session identity is a per-operation snapshot, not
+ permission to process patient content or a way to interrupt in-flight work.
+ Pending login state is institution-version-bound, but cannot bind an unknown
+ account's version before the provider reveals its subject. Account disable/
+ re-enable during a pending login still requires an institution-approved policy.
+ Signed provider fences prevent pre-logout authentication from reissuing local
+ authority; they do not interrupt in-flight work or push-clear idle browser UI.
+ 
+ The AES-GCM key must come from institutional secret management, not the DB or
+ clients. Expired login rows require a bounded operational cleanup policy. Do
+ not enable request/response body or callback query logging at any proxy/server;
+ in particular Uvicorn must run with access_log=False/--no-access-log. This app
+ does not configure or override external server/proxy loggers.
+ """
+ 
+ import asyncio
+ import ipaddress
+ import json
+ import re
+ from collections.abc import Callable
+ from contextlib import AbstractContextManager, contextmanager
+ from dataclasses import dataclass, field
+ from hashlib import sha256
++from pathlib import Path
+ from secrets import token_bytes, token_urlsafe
+ from urllib.parse import urlsplit
+ from uuid import UUID
+ 
+ import httpx
+ from authlib.integrations.httpx_client import AsyncOAuth2Client
+ from cryptography.exceptions import InvalidTag
+ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+ from fastapi import FastAPI, Request
+ from fastapi.responses import JSONResponse, RedirectResponse
+ from psycopg import Connection
+ from psycopg.pq import TransactionStatus
+ from starlette.concurrency import run_in_threadpool
+ from starlette.exceptions import HTTPException as StarletteHTTPException
+ 
+ from .access_policy import Principal
+ from .identity_sessions import AuthenticationDenied, IssuedSession, SessionStore
+ from .oidc_identity import InvalidIdentity, OIDCIdentityVerifier
+ from .provider_logout import (
+     InvalidProviderLogout,
+     ProviderLogoutVerifier,
+     read_logout_token,
+ )
++from .provider_tls import provider_ssl_context
+ from .security_audit import (
+     AuditAction,
+     AuditStore,
+     AuditUnavailable,
+     unavailable_response,
+ )
+ 
+ _OPAQUE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+ _LOGIN_COOKIE = "__Host-medical-oidc"
+ _SESSION_COOKIE = "__Host-medical-session"
+ _CSRF_COOKIE = "__Host-medical-csrf"
+ _MAX_TOKEN_RESPONSE = 65536
+ ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
+ 
+ 
+ class InvalidLogin(Exception):
+     """Missing, expired, already consumed or wrong-browser login request."""
+ 
+ 
+ def _https_url(value: object):
+     if (type(value) is not str or "?" in value or "#" in value
+             or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
+         raise ValueError("Invalid trusted OIDC configuration")
+     try:
+         parsed = urlsplit(value)
+         if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                 or parsed.query or parsed.fragment):
+             raise ValueError("Invalid trusted OIDC configuration")
+         _ = parsed.port
+         return parsed
+     except (TypeError, ValueError):
+         raise ValueError("Invalid trusted OIDC configuration") from None
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class LoginConfiguration:
+     """Fixed, trusted institutional settings, never derived from a request."""
+ 
+     issuer: str
+     authorization_endpoint: str
+     token_endpoint: str
+     callback_uri: str
+     client_id: str
+     client_secret: str = field(repr=False)
+     public_key: RSAPublicKey = field(repr=False)
+     mfa_acr_values: frozenset[str]
+     max_authentication_age_seconds: int = 600
++    provider_ca_file: Path | None = field(default=None, repr=False)
+ 
+     def __post_init__(self) -> None:
+         issuer = _https_url(self.issuer)
+         authorization = _https_url(self.authorization_endpoint)
+         token = _https_url(self.token_endpoint)
+         callback = _https_url(self.callback_uri)
+         if (authorization.netloc != issuer.netloc or token.netloc != issuer.netloc
+                 or not authorization.path.startswith(issuer.path.rstrip("/") + "/")
+                 or not token.path.startswith(issuer.path.rstrip("/") + "/")
+                 or callback.path != "/auth/callback" or type(self.client_secret) is not str
+                 or not self.client_secret or any(ord(char) < 32 for char in self.client_secret)):
+             raise ValueError("Invalid trusted OIDC configuration")
+         OIDCIdentityVerifier(issuer=self.issuer, audience=self.client_id, public_key=self.public_key,
+                              mfa_acr_values=self.mfa_acr_values,
+                              max_authentication_age_seconds=self.max_authentication_age_seconds)
++        if self.provider_ca_file is not None:
++            provider_ssl_context(self.provider_ca_file)
+ 
+     @property
+     def app_origin(self) -> str:
+         parsed = urlsplit(self.callback_uri)
+         return "https://" + parsed.netloc
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class LoginChallenge:
+     state: str = field(repr=False)
+     browser_token: str = field(repr=False)
+     nonce: str = field(repr=False)
+     code_verifier: str = field(repr=False)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ConsumedLogin:
+     nonce: str = field(repr=False)
+     code_verifier: str = field(repr=False)
+     tenant_version: int
+ 
+ 
+ def _hash(value: object) -> bytes:
+     if type(value) is not str or _OPAQUE.fullmatch(value) is None:
+         raise InvalidLogin()
+     return sha256(value.encode("ascii")).digest()
+ 
+ 
+ class LoginTransactionStore:
+     """Encrypt PKCE material and consume a browser-bound flow exactly once."""
+ 
+     def __init__(self, connection_factory: ConnectionFactory, *, tenant_id: str,
+                  encryption_key: bytes, lifetime_seconds: int = 300) -> None:
+         try:
+             self._tenant = UUID(tenant_id)
+         except (TypeError, ValueError, AttributeError):
+             raise ValueError("Invalid institution configuration") from None
+         if (type(encryption_key) is not bytes or len(encryption_key) != 32
+                 or type(lifetime_seconds) is not int or not 1 <= lifetime_seconds <= 600):
+             raise ValueError("Invalid login storage configuration")
+         self._cipher = AESGCM(encryption_key)
+         self._connection_factory = connection_factory
+         self.lifetime_seconds = lifetime_seconds
+ 
+     @contextmanager
+     def _transaction(self):
+         with self._connection_factory() as connection:
+             if connection.info.transaction_status != TransactionStatus.IDLE:
+                 raise InvalidLogin()
+             with connection.transaction():
+                 connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
+                 connection.execute("SET LOCAL search_path TO pg_catalog")
+                 connection.execute("SET LOCAL lock_timeout = '3s'")
+                 connection.execute("SET LOCAL statement_timeout = '5s'")
+                 if connection.execute("SELECT medical_rag.runtime_role_basic_check() "
+                                       "AND NOT pg_catalog.pg_is_in_recovery()").fetchone() != (True,):
+                     raise InvalidLogin()
+                 yield connection
+ 
+     def create(self) -> LoginChallenge:
+         challenge = LoginChallenge(token_urlsafe(32), token_urlsafe(32), token_urlsafe(32), token_urlsafe(64))
+         digest = _hash(challenge.state)
+         iv = token_bytes(12)
+         payload = json.dumps({"nonce": challenge.nonce, "code_verifier": challenge.code_verifier}).encode("ascii")
+         context = iv + self._cipher.encrypt(iv, payload, self._tenant.bytes + digest)
+         with self._transaction() as connection:
+             row = connection.execute(
+                 "INSERT INTO medical_rag.oidc_login_transactions "
+                 "(tenant_id,state_hash,browser_hash,encrypted_context,tenant_version,expires_at) "
+                 "SELECT t.tenant_id,%s,%s,%s,t.session_version,clock_timestamp()+(%s*interval '1 second') "
+                 "FROM medical_rag.tenants t WHERE t.tenant_id=%s AND t.active RETURNING state_hash",
+                 (digest, _hash(challenge.browser_token), context, self.lifetime_seconds, self._tenant),
+             ).fetchone()
+             if row is None:
+                 raise InvalidLogin()
+         return challenge
+ 
+     def consume(self, state: str, browser_token: str) -> ConsumedLogin:
+         digest, browser = _hash(state), _hash(browser_token)
+         with self._transaction() as connection:
+             # Lock before evaluating time: a waiting statement must not extend
+             # the usable life of a flow whose expiry passed while it waited.
+             if connection.execute(
+                 "SELECT 1 FROM medical_rag.oidc_login_transactions "
+                 "WHERE tenant_id=%s AND state_hash=%s AND browser_hash=%s FOR UPDATE",
+                 (self._tenant, digest, browser),
+             ).fetchone() is None:
+                 raise InvalidLogin()
+             row = connection.execute(
+                 "DELETE FROM medical_rag.oidc_login_transactions f USING medical_rag.tenants t "
+                 "WHERE f.tenant_id=%s AND f.state_hash=%s AND f.browser_hash=%s "
+                 "AND f.expires_at>clock_timestamp() AND f.tenant_id=t.tenant_id AND t.active "
+                 "AND f.tenant_version=t.session_version "
+                 "RETURNING f.encrypted_context,f.tenant_version", (self._tenant, digest, browser),
+             ).fetchone()
+             if row is None:
+                 raise InvalidLogin()
+         # The committed deletion remains final, including on decrypt/provider
+         # failure. Neither a retry nor another worker can reuse this request.
+         try:
+             context = bytes(row[0])
+             values = json.loads(self._cipher.decrypt(context[:12], context[12:], self._tenant.bytes + digest))
+             nonce, verifier = values["nonce"], values["code_verifier"]
+             _hash(nonce)
+             if type(verifier) is not str or re.fullmatch(r"[A-Za-z0-9_-]{86}", verifier) is None:
+                 raise InvalidLogin()
+             return ConsumedLogin(nonce, verifier, row[1])
+         except (InvalidTag, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+             raise InvalidLogin() from None
+ 
+ 
+ class _LimitedStream(httpx.AsyncByteStream):
+     def __init__(self, stream: httpx.AsyncByteStream) -> None:
+         self._stream = stream
+ 
+     async def __aiter__(self):
+         length = 0
+         async for part in self._stream:
+             length += len(part)
+             if length > _MAX_TOKEN_RESPONSE:
+                 raise InvalidLogin()
+             yield part
+ 
+     async def aclose(self) -> None:
+         await self._stream.aclose()
+ 
+ 
+ class _LimitedTransport(httpx.AsyncBaseTransport):
+     def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+         self._inner = inner
+ 
+     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+         response = await self._inner.handle_async_request(request)
+         # A parseable, signed ID token is not an OAuth success response by
+         # itself. Reject HTTP errors/redirects before Authlib parses the body.
+         if (response.status_code != 200
+                 or response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
+                 or response.headers.get("content-encoding", "identity").lower() != "identity"
+                 or (response.is_stream_consumed and len(response.content) > _MAX_TOKEN_RESPONSE)):
+             await response.aclose()
+             raise InvalidLogin()
+         response.stream = _LimitedStream(response.stream)
+         return response
+ 
+     async def aclose(self) -> None:
+         await self._inner.aclose()
+ 
+ 
+ class OIDCLogin:
+     """A confidential OIDC client, fixed to one institution and provider."""
+ 
+     def __init__(self, config: LoginConfiguration, connection_factory: ConnectionFactory, *, tenant_id: str,
+                  transaction_encryption_key: bytes, transport: httpx.AsyncBaseTransport | None = None) -> None:
+         if type(config) is not LoginConfiguration:
+             raise ValueError("Trusted login configuration is required")
+         self.config = config
+         self.transactions = LoginTransactionStore(connection_factory, tenant_id=tenant_id,
+                                                    encryption_key=transaction_encryption_key)
+         self.sessions = SessionStore(connection_factory, tenant_id=tenant_id)
+         self._verifier = OIDCIdentityVerifier(issuer=config.issuer, audience=config.client_id,
+                                              public_key=config.public_key, mfa_acr_values=config.mfa_acr_values,
+                                              max_authentication_age_seconds=config.max_authentication_age_seconds)
+         self._test_transport = transport
+         self.provider_logout_verifier = ProviderLogoutVerifier(issuer=config.issuer, audience=config.client_id,
+                                                                public_key=config.public_key)
+ 
+     def _client(self) -> AsyncOAuth2Client:
+-        transport = self._test_transport or httpx.AsyncHTTPTransport(verify=True, trust_env=False, retries=0)
++        transport = self._test_transport or httpx.AsyncHTTPTransport(
++            verify=provider_ssl_context(self.config.provider_ca_file), trust_env=False, retries=0)
+         return AsyncOAuth2Client(
+             client_id=self.config.client_id, client_secret=self.config.client_secret,
+             token_endpoint_auth_method="client_secret_basic", redirect_uri=self.config.callback_uri,
+             scope="openid", code_challenge_method="S256", follow_redirects=False,
+             headers={"Accept-Encoding": "identity"},
+             trust_env=False, timeout=httpx.Timeout(5.0, connect=3.0), transport=_LimitedTransport(transport),
+         )
+ 
+     async def start(self) -> tuple[str, LoginChallenge]:
+         challenge = await run_in_threadpool(self.transactions.create)
+         async with self._client() as client:
+             url, _ = client.create_authorization_url(
+                 self.config.authorization_endpoint, state=challenge.state, nonce=challenge.nonce,
+                 code_verifier=challenge.code_verifier, max_age=self.config.max_authentication_age_seconds,
+             )
+         return url, challenge
+ 
+     async def finish(self, *, state: str, browser_token: str, code: str) -> IssuedSession:
+         if type(code) is not str or not 0 < len(code) <= 2048 or any(not 33 <= ord(char) <= 126 for char in code):
+             raise InvalidLogin()
+         flow = await run_in_threadpool(self.transactions.consume, state, browser_token)
+         try:
+             async with asyncio.timeout(10), self._client() as client:
+                 token = await client.fetch_token(
+                     self.config.token_endpoint, grant_type="authorization_code", code=code,
+                     code_verifier=flow.code_verifier,
+                 )
+             if not isinstance(token, dict):
+                 raise InvalidLogin()
+             access_token, token_type, id_token = token.get("access_token"), token.get("token_type"), token.get("id_token")
+             if (type(access_token) is not str or not 0 < len(access_token) <= 16384
+                     or any(not 33 <= ord(char) <= 126 for char in access_token)
+                     or type(token_type) is not str or token_type.lower() != "bearer"
+                     or type(id_token) is not str or not 0 < len(id_token) <= 16384):
+                 raise InvalidLogin()
+             identity = self._verifier.verify(id_token, expected_nonce=flow.nonce)
+         except InvalidIdentity:
+             raise InvalidLogin() from None
+         except Exception:  # noqa: BLE001 - upstream error text is never public
+             # OAuth/provider errors can include credentials and response bodies.
+             raise InvalidLogin() from None
+         return await run_in_threadpool(self.sessions.issue, identity, expected_tenant_version=flow.tenant_version)
+ 
+ 
+ def _cookie(request: Request, name: str) -> str:
+     occurrences = sum(1 for header in request.headers.getlist("cookie") for part in header.split(";")
+                       if part.partition("=")[0].strip() == name)
+     value = request.cookies.get(name)
+     if occurrences != 1 or not value:
+         raise InvalidLogin()
+     return value
+ 
+ 
+ def _failure(status: int) -> JSONResponse:
+     return JSONResponse({"success": False, "data": None,
+                          "error": {"code": "AUTHENTICATION_FAILED" if status != 503 else "AUTHENTICATION_UNAVAILABLE",
+                                    "message": "身份验证失败" if status != 503 else "身份服务暂不可用"}},
+                         status_code=status)
+ 
+ 
+ def _set_cookie(response, name: str, value: str, *, max_age: int | None = None) -> None:
+     response.set_cookie(name, value, max_age=max_age, secure=True, httponly=True, samesite="lax", path="/")
+ 
+ 
+ def _clear_cookie(response, name: str) -> None:
+     response.delete_cookie(name, secure=True, httponly=True, samesite="lax", path="/")
+ 
+ 
+ def _authorization_origin(endpoint: str) -> str:
+     """Serialize one fixed HTTPS CSP source, rejecting source-list injection."""
+     parsed = _https_url(endpoint)
+     host = parsed.hostname
+     try:
+         address = ipaddress.ip_address(host)
+         if getattr(address, "scope_id", None) is not None:
+             raise ValueError("Invalid trusted OIDC configuration")
+         authority = f"[{address}]" if address.version == 6 else str(address)
+     except ValueError:
+         if (not host or len(host) > 253 or any(
+                 re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
+                 for label in host.split("."))):
+             raise ValueError("Invalid trusted OIDC configuration") from None
+         authority = host.lower()
+     if parsed.port is not None:
+         if not 1 <= parsed.port <= 65535:
+             raise ValueError("Invalid trusted OIDC configuration")
+         authority += f":{parsed.port}"
+     return "https://" + authority
+ 
+ 
+ def create_auth_app(login: OIDCLogin, *, patient_html: bool = False, audit: AuditStore | None = None) -> FastAPI:
+     """Reuse auth protections; standalone headless no-audit is experimental only.
+ 
+     The patient factory always supplies its mandatory trusted AuditStore.
+     """
+     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+     origin = login.config.app_origin
+     authority = urlsplit(origin).netloc
+     # Fixed trusted factory choice only; never derive this policy from a request.
+     csp = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+            f"base-uri 'none'; form-action 'self' {_authorization_origin(login.config.authorization_endpoint)}; "
+            "frame-ancestors 'none'" if patient_html
+            else "default-src 'none'; frame-ancestors 'none'")
+ 
+     @app.middleware("http")
+     async def enforce_origin_and_headers(request: Request, call_next):
+         hosts = request.headers.getlist("host")
+         origins = request.headers.getlist("origin")
+         provider_post = request.method == "POST" and request.url.path == "/auth/backchannel-logout"
+         if (request.url.scheme != "https" or len(hosts) != 1 or hosts[0].lower() != authority.lower()
+                 or (request.method not in {"GET", "HEAD", "OPTIONS"} and origins != [origin]
+                     and not (provider_post and not origins))
+                 or (origins and origins != [origin] and request.url.path != "/auth/callback")):
+             response = _failure(403)
+         else:
+             try:
+                 response = await call_next(request)
+             except Exception:  # noqa: BLE001 - prevent sensitive ASGI tracebacks
+                 # Catch before ServerErrorMiddleware can re-raise a storage or
+                 # provider exception to an ASGI server's traceback logger.
+                 response = _failure(503)
+         response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
+                                  "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+                                  "Content-Security-Policy": csp,
+                                  "Cross-Origin-Resource-Policy": "same-origin"})
+         return response
+ 
+     @app.exception_handler(InvalidLogin)
+     @app.exception_handler(AuthenticationDenied)
+     async def deny(request: Request, error: Exception):
+         response = _failure(401)
+         if request.url.path == "/auth/callback":
+             _clear_cookie(response, _LOGIN_COOKIE)
+         return response
+ 
+     @app.exception_handler(Exception)
+     async def unavailable(request: Request, error: Exception):
+         return _failure(503)
+ 
+     @app.exception_handler(StarletteHTTPException)
+     async def framework_error(request: Request, error: StarletteHTTPException):
+         return _failure(error.status_code if error.status_code in {404, 405} else 400)
+ 
+     @app.post("/auth/login")
+     async def begin():
+         url, challenge = await login.start()
+         if audit is not None:
+             await run_in_threadpool(audit.record, AuditAction.LOGIN_START)
+         response = RedirectResponse(url, status_code=303)
+         _set_cookie(response, _LOGIN_COOKIE, challenge.browser_token, max_age=login.transactions.lifetime_seconds)
+         return response
+ 
+     @app.post("/auth/backchannel-logout")
+     async def provider_logout(request: Request):
+         # Deliberately never read cookies or forwarded identity. Only the fixed
+         # pinned-key signature supplies authority, not a local session or role.
+         if audit is None:
+             # Experimental headless auth must not enable unaudited provider
+             # authority. The protected patient factory always supplies audit.
+             return _failure(503)
+         try:
+             token = await read_logout_token(request)
+             event = await run_in_threadpool(login.provider_logout_verifier.verify, token)
+             await run_in_threadpool(login.sessions.provider_logout, event)
+         except InvalidProviderLogout:
+             return _failure(400)
+         except Exception:  # noqa: BLE001 -- static storage failure, no token/SQL logging
+             return _failure(503)
+         await run_in_threadpool(audit.record, AuditAction.PROVIDER_LOGOUT)
+         return JSONResponse({"success": True, "data": None, "error": None})
+ 
+     @app.get("/auth/callback")
+     async def callback(request: Request):
+         pairs = request.query_params.multi_items()
+         allowed = {"state", "code", "iss", "session_state"}
+         if (any(key not in allowed for key, _ in pairs) or len({key for key, _ in pairs}) != len(pairs)
+                 or ("iss" in request.query_params and request.query_params["iss"] != login.config.issuer)):
+             raise InvalidLogin()
+         session = await login.finish(state=request.query_params.get("state"), browser_token=_cookie(request, _LOGIN_COOKIE),
+                                      code=request.query_params.get("code"))
+         try:
+             # Finish replacing the previous session before recording a success.
+             # A storage failure here must not orphan an unexposed new session.
+             try:
+                 previous, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
+             except InvalidLogin:
+                 pass
+             else:
+                 try:
+                     await run_in_threadpool(login.sessions.revoke, previous, csrf_token=csrf)
+                 except AuthenticationDenied:
+                     pass
+             if audit is not None:
+                 # Current local authority, not submitted/provider claims. The
+                 # audit commits before either new browser cookie is emitted.
+                 def record_login() -> None:
+                     with audit.operation(session.token, AuditAction.LOGIN_FINISH,
+                                          mutation=True, csrf_token=session.csrf_token):
+                         pass
+                 await run_in_threadpool(record_login)
+         except Exception:  # revoke unexposed authority before propagating a static failure
+             try:
+                 await run_in_threadpool(login.sessions.revoke, session.token, csrf_token=session.csrf_token)
+             except Exception:  # noqa: BLE001,S110 -- best effort; logging could expose raw session/SQL
+                 pass
+             if audit is not None:
+                 raise AuditUnavailable() from None
+             raise
+         response = RedirectResponse("/", status_code=303)
+         _clear_cookie(response, _LOGIN_COOKIE)
+         _set_cookie(response, _SESSION_COOKIE, session.token)
+         _set_cookie(response, _CSRF_COOKIE, session.csrf_token)
+         return response
+ 
+     @app.get("/auth/session")
+     async def session_info(request: Request):
+         token, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
+         if audit is None:
+             principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=csrf)
+         else:
+             def read_session() -> Principal:
+                 with audit.operation(token, AuditAction.SESSION_READ, mutation=True, csrf_token=csrf) as authorized:
+                     return authorized.principal
+             principal = await run_in_threadpool(read_session)
+         return {"success": True, "data": {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
+                                           "roles": sorted(principal.roles), "csrf_token": csrf}, "error": None}
+ 
+     @app.post("/auth/logout")
+     async def logout(request: Request):
+         try:
+             headers = request.headers.getlist("x-csrf-token")
+             if len(headers) != 1:
+                 return _failure(403)
+             token = _cookie(request, _SESSION_COOKIE)
+             principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=headers[0])
+             await run_in_threadpool(login.sessions.revoke, token, csrf_token=headers[0])
+         except (InvalidLogin, AuthenticationDenied):
+             return _failure(403)
+         response = JSONResponse({"success": True, "data": None, "error": None})
+         if audit is not None:
+             try:
+                 await run_in_threadpool(audit.record, AuditAction.LOGOUT, principal=principal)
+             except AuditUnavailable:
+                 response = unavailable_response()
+         for name in (_SESSION_COOKIE, _CSRF_COOKIE, _LOGIN_COOKIE):
+             _clear_cookie(response, name)
+         return response
+ 
+     if audit is not None:
+         audit.install(app)
+     return app
+
+
+## src/medical_rag/security_config.py
+
+diff --git a/outputs/keycloak-integration-baseline-20261103/src__medical_rag__security_config.py b/src/medical_rag/security_config.py
+index c6fb24c..9960f8f 100644
+--- a/outputs/keycloak-integration-baseline-20261103/src__medical_rag__security_config.py
++++ b/src/medical_rag/security_config.py
+@@ -1,138 +1,141 @@
+ """Bounded trusted configuration; never imports legacy Settings or dotenv."""
+ 
+ import ipaddress
+ import ssl
+ import tomllib
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from uuid import UUID
+ 
+ from cryptography.hazmat.primitives.serialization import load_pem_public_key
+ 
+ from .oidc_login import LoginConfiguration
+ from .patient_service import HealthNotice
+ 
+ 
+ class StartupError(Exception):
+     """Only this static message may cross the startup boundary."""
+ 
+     def __str__(self) -> str:
+         return "患者服务启动失败，请联系机构运维。"
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class PatientConfiguration:
+     tenant_id: str
+     database_dsn: str = field(repr=False)
+     transaction_key: bytes = field(repr=False)
+     frontend_dist: Path
+     listen_host: str
+     listen_port: int
+     tls_cert_file: Path = field(repr=False)
+     tls_key_file: Path = field(repr=False)
+     login: LoginConfiguration = field(repr=False)
+     notice: HealthNotice = field(repr=False)
+ 
+ 
+ def _read(path: Path, limit: int) -> bytes:
+     with path.open("rb") as stream:
+         data = stream.read(limit + 1)
+     if not data or len(data) > limit:
+         raise StartupError()
+     return data
+ 
+ 
+-def _keys(value: object, expected: str) -> dict:
+-    if type(value) is not dict or set(value) != set(expected.split()):
++def _keys(value: object, expected: str, optional: str = "") -> dict:
++    required = set(expected.split())
++    if type(value) is not dict or not required <= set(value) or set(value) - required - set(optional.split()):
+         raise StartupError()
+     return value
+ 
+ 
+ def _string(value: object) -> str:
+     if (
+         type(value) is not str
+         or not value.strip()
+         or len(value) > 65536
+         or "\x00" in value
+     ):
+         raise StartupError()
+     return value
+ 
+ 
+ def load_configuration(path: Path) -> PatientConfiguration:
+     """Resolve all file paths relative to this operator-owned TOML file."""
+     try:
+         path = Path(path).resolve(strict=True)
+         data = _keys(
+             tomllib.loads(_read(path, 65536).decode("utf-8")),
+             "tenant_id database_dsn_file transaction_key_file frontend_dist listen_host listen_port "
+             "tls_cert_file tls_key_file oidc health_notice",
+         )
+         oidc = _keys(
+             data["oidc"],
+             "issuer authorization_endpoint token_endpoint callback_uri client_id "
+             "client_secret_file public_key_file mfa_acr_values",
++            "provider_ca_file",
+         )
+         notice = _keys(data["health_notice"], "version text_file validity_seconds")
+ 
+         def file(value: object) -> Path:
+             return (path.parent / _string(value)).resolve(strict=True)
+ 
+         def text(value: object, limit: int) -> str:
+             return _string(_read(file(value), limit).decode("utf-8").strip())
+ 
+         tenant = str(UUID(_string(data["tenant_id"])))
+         host = str(ipaddress.ip_address(_string(data["listen_host"])))
+         if ipaddress.ip_address(host).is_unspecified:
+             raise StartupError()
+         port = data["listen_port"]
+         if type(port) is not int or not 1 <= port <= 65535:
+             raise StartupError()
+         acr = oidc["mfa_acr_values"]
+         if (
+             type(acr) is not list
+             or not 1 <= len(acr) <= 32
+             or len(set(map(_string, acr))) != len(acr)
+         ):
+             raise StartupError()
+         login = LoginConfiguration(
+             **{
+                 key: _string(oidc[key])
+                 for key in (
+                     "issuer",
+                     "authorization_endpoint",
+                     "token_endpoint",
+                     "callback_uri",
+                     "client_id",
+                 )
+             },
+             client_secret=text(oidc["client_secret_file"], 16384),
+             public_key=load_pem_public_key(_read(file(oidc["public_key_file"]), 65536)),
+             mfa_acr_values=frozenset(acr),
++            provider_ca_file=file(oidc["provider_ca_file"]) if "provider_ca_file" in oidc else None,
+         )
+         encryption = _read(file(data["transaction_key_file"]), 32)
+         if len(encryption) != 32:
+             raise StartupError()
+         cert, key = file(data["tls_cert_file"]), file(data["tls_key_file"])
+         # Validate eagerly, before Uvicorn can print credential-path errors.
+         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+         context.minimum_version = ssl.TLSVersion.TLSv1_2
+         context.load_cert_chain(cert, key, password=lambda: b"")
+         return PatientConfiguration(
+             tenant,
+             text(data["database_dsn_file"], 16384),
+             encryption,
+             file(data["frontend_dist"]),
+             host,
+             port,
+             cert,
+             key,
+             login,
+             HealthNotice(
+                 _string(notice["version"]),
+                 text(notice["text_file"], 65536),
+                 notice["validity_seconds"],
+             ),
+         )
+     except Exception:  # noqa: BLE001 -- secret-bearing parser/crypto errors stay private
+         raise StartupError() from None
+
+
+## tests/test_security_server.py
+
+diff --git a/outputs/keycloak-integration-baseline-20261103/tests__test_security_server.py b/tests/test_security_server.py
+index c9f10a6..f8da715 100644
+--- a/outputs/keycloak-integration-baseline-20261103/tests__test_security_server.py
++++ b/tests/test_security_server.py
+@@ -1,759 +1,782 @@
+ """Trusted startup tests; loader doubles are separate from real PostgreSQL."""
+ 
+ # ruff: noqa: F401,F811 -- imported pytest fixtures
+ import os
+ import secrets
+ import socket
+ import ssl
+ import subprocess
+ import sys
+ import time
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+ 
+ import psycopg
+ import pytest
+ from cryptography import x509
+ from cryptography.hazmat.primitives import hashes, serialization
+ from cryptography.x509.oid import NameOID
+ from fastapi.testclient import TestClient
+ from test_oidc_login import APP_ORIGIN, TENANT, configuration
+ from test_patient_vertical import (
+     auth_system,
+     database,
+     oidc_database,
+     signing_key,
+     system,
+ )
+ 
+ from medical_rag import security_server
+ from medical_rag.security_config import StartupError, load_configuration
+ 
+ 
+ @pytest.fixture
+ def config_file(tmp_path, signing_key):
+     (tmp_path / "dsn").write_text(
+         "postgresql://fictional-secret@localhost/test", encoding="utf-8"
+     )
+     (tmp_path / "client-secret").write_text("fictional-secret", encoding="utf-8")
+     (tmp_path / "key").write_bytes(b"x" * 32)
+     (tmp_path / "notice").write_text(
+         "Institution-approved fictional test notice", encoding="utf-8"
+     )
+     (tmp_path / "public.pem").write_bytes(
+         signing_key.public_key().public_bytes(
+             serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
+         )
+     )
+     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "medical.example.org")])
+     cert = (
+         x509.CertificateBuilder()
+         .subject_name(name)
+         .issuer_name(name)
+         .public_key(signing_key.public_key())
+         .serial_number(x509.random_serial_number())
+         .not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
+         .not_valid_after(datetime.now(UTC) + timedelta(days=1))
+         .sign(signing_key, hashes.SHA256())
+     )
+     (tmp_path / "tls.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+     (tmp_path / "tls.key").write_bytes(
+         signing_key.private_bytes(
+             serialization.Encoding.PEM,
+             serialization.PrivateFormat.PKCS8,
+             serialization.NoEncryption(),
+         )
+     )
+     build = tmp_path / "dist-patient"
+     (build / "assets").mkdir(parents=True)
+     (build / "patient.html").write_text(
+         '<html><script type="module" src="/assets/patient.js"></script></html>',
+         encoding="utf-8",
+     )
+     (build / "assets/patient.js").write_text(
+         'document.title="patient"', encoding="utf-8"
+     )
+     config = tmp_path / "patient.toml"
+     config.write_text(
+         """tenant_id = "00000000-0000-0000-0000-000000000101"
+ database_dsn_file = "dsn"
+ transaction_key_file = "key"
+ frontend_dist = "dist-patient"
+ listen_host = "127.0.0.1"
+ listen_port = 8443
+ tls_cert_file = "tls.pem"
+ tls_key_file = "tls.key"
+ [oidc]
+ issuer = "https://identity.example.org/realms/hospital"
+ authorization_endpoint = "https://identity.example.org/realms/hospital/protocol/openid-connect/auth"
+ token_endpoint = "https://identity.example.org/realms/hospital/protocol/openid-connect/token"
+ callback_uri = "https://medical.example.org/auth/callback"
+ client_id = "medical-rag"
+ client_secret_file = "client-secret"
+ public_key_file = "public.pem"
+ mfa_acr_values = ["urn:hospital:mfa"]
+ [health_notice]
+ version = "fictional-v1"
+ text_file = "notice"
+ validity_seconds = 3600
+ """,
+         encoding="utf-8",
+     )
+     return config
+ 
+ 
+ def test_relative_config_is_bounded_and_environment_independent(
+     config_file, tmp_path, monkeypatch
+ ):
+     monkeypatch.chdir(tmp_path.parent)
+     monkeypatch.setenv("DATABASE_URL", "secret-ignored")
+     loaded = load_configuration(config_file)
+     assert loaded.frontend_dist == config_file.parent / "dist-patient"
+     assert loaded.notice.version == "fictional-v1"
+     assert "fictional-secret" not in repr(loaded)
+     assert loaded.login.client_id == "medical-rag"
+ 
+ 
+ @pytest.mark.parametrize(
+     "replace",
+     [
+         ("listen_port = 8443", "listen_port = true"),
+         ("listen_port = 8443", "listen_port = 0"),
+         ('listen_host = "127.0.0.1"', 'listen_host = "0.0.0.0"'),
+         ('listen_host = "127.0.0.1"', 'listen_host = "::"'),
+         ('listen_host = "127.0.0.1"', 'listen_host = "localhost"'),
+         ('tenant_id = "00000000-0000-0000-0000-000000000101"', 'tenant_id = "secret"'),
+         ('client_id = "medical-rag"', 'unknown = "secret"'),
+         ("listen_port = 8443", 'listen_port = 8443\nunknown = "secret"'),
+         ('mfa_acr_values = ["urn:hospital:mfa"]', 'mfa_acr_values = "secret"'),
+         ("validity_seconds = 3600", "validity_seconds = 31536001"),
+         ('database_dsn_file = "dsn"', "database_dsn_file = 5"),
+     ],
+ )
+ def test_invalid_configuration_is_sanitized(config_file, replace):
+     config_file.write_text(
+         config_file.read_text(encoding="utf-8").replace(*replace), encoding="utf-8"
+     )
+     with pytest.raises(StartupError, match="^患者服务启动失败，请联系机构运维。$"):
+         load_configuration(config_file)
+ 
+ 
+ @pytest.mark.parametrize(
+     "file,data",
+     [
+         ("key", b"x" * 31),
+         ("public.pem", b"invalid-secret"),
+         ("dsn", b"x" * 16385),
+         ("client-secret", b""),
+         ("notice", b"x" * 65537),
+         ("tls.key", b"secret"),
+         ("patient.toml", b"x" * 65537),
+     ],
+     ids=[
+         "key",
+         "publickey",
+         "dsn-bound",
+         "empty-secret",
+         "notice-bound",
+         "tls",
+         "config-bound",
+     ],
+ )
+ def test_bad_files_fail_without_sensitive_details(config_file, file, data):
+     (config_file.parent / file).write_bytes(data)
+     with pytest.raises(StartupError) as error:
+         load_configuration(config_file)
+     assert str(error.value) == "患者服务启动失败，请联系机构运维。"
+ 
+ 
+ def test_missing_files_and_dedicated_build_denied(config_file):
+     with pytest.raises(StartupError):
+         load_configuration(config_file.parent / "absent")
+     (config_file.parent / "dist-patient/patient.html").unlink()
+     with pytest.raises(StartupError):
+         security_server.load_patient_application(config_file)
+ 
+ 
+ def test_cli_fixed_failure_and_no_sensitive_logs(capsys):
+     assert security_server.main(["--config", "never-exists-secret"]) == 1
+     output = capsys.readouterr()
+     assert output.err.strip() == "患者服务启动失败，请联系机构运维。"
+     assert "secret" not in output.out + output.err
+ 
+ 
+ def test_direct_tls_invocation_guards(config_file, monkeypatch):
+     observed = {}
+     monkeypatch.setattr(security_server, "preflight", lambda *_: None)
+     monkeypatch.setattr(
+         security_server.uvicorn, "run", lambda app, **kwargs: observed.update(kwargs)
+     )
+     assert security_server.main(["--config", str(config_file)]) == 0
+     assert observed["access_log"] is False and observed["proxy_headers"] is False
+     assert observed["server_header"] is False and observed["log_config"] is None
+     assert observed["ssl_keyfile"] == str(config_file.parent / "tls.key")
+     assert observed["limit_concurrency"] == 100 and observed["timeout_keep_alive"] == 5
+ 
+ 
+ def test_app_mounts_only_dedicated_build_with_self_only_csp(config_file, monkeypatch):
+     monkeypatch.setattr(security_server, "preflight", lambda *_: None)
+     app = security_server.load_patient_application(config_file)
+     with TestClient(app, base_url=APP_ORIGIN, headers={}) as client:
+         response = client.get("/")
+         assert response.status_code == 200 and "/assets/patient.js" in response.text
+         assert client.get("/assets/patient.js").status_code == 200
+         assert client.get("/assets/").status_code == 404
+         for path in [
+             "/ui",
+             "/chat",
+             "/api/chat",
+             "/settings",
+             "/docs",
+             "/openapi.json",
+             "/patient.toml",
+             "/assets/../patient.toml",
+         ]:
+             # This isolated asset-loader test deliberately has no live DB.
+             # Mandatory failed-attempt auditing therefore fails closed, rather
+             # than silently disabling audit to return an ordinary route404.
+             assert client.get(path).status_code == 503
+         registered = {getattr(route, "path", None) for route in app.routes}
+         assert not registered & {"/ui", "/chat", "/api/chat", "/settings", "/docs", "/openapi.json"}
+         csp = response.headers["content-security-policy"]
+         assert (
+             "script-src 'self'" in csp
+             and "unsafe-" not in csp
+             and "form-action 'self'" in csp
+         )
+         assert response.headers["cache-control"] == "no-store"
+         assert client.get("/", headers={"Host": "evil.example"}).status_code == 403
+         assert (
+             client.get("/", headers={"Origin": "https://evil.example"}).status_code
+             == 403
+         )
+         assert (
+             client.get("/", headers={"X-Forwarded-Host": "evil.example"}).status_code
+             == 200
+         )
+     with TestClient(app, base_url="http://medical.example.org", headers={}) as client:
+         assert (
+             client.get("/", headers={"X-Forwarded-Proto": "https"}).status_code == 403
+         )
+ 
+ 
+ def test_headless_csp_default_is_unchanged(signing_key):
+     from medical_rag.oidc_login import OIDCLogin, create_auth_app
+ 
+     login = OIDCLogin(
+         configuration(signing_key),
+         lambda: None,
+         tenant_id=TENANT,
+         transaction_encryption_key=b"x" * 32,
+     )
+     with TestClient(create_auth_app(login), base_url=APP_ORIGIN, headers={}) as client:
+         assert (
+             client.get("/absent").headers["content-security-policy"]
+             == "default-src 'none'; frame-ancestors 'none'"
+         )
+ 
+ 
+ def test_patient_form_csp_permits_only_trusted_fixed_idp_origin(signing_key):
+     from medical_rag.oidc_login import OIDCLogin, create_auth_app
+ 
+     login = OIDCLogin(
+         configuration(signing_key),
+         lambda: None,
+         tenant_id=TENANT,
+         transaction_encryption_key=b"x" * 32,
+     )
+     with TestClient(
+         create_auth_app(login, patient_html=True), base_url=APP_ORIGIN, headers={}
+     ) as client:
+         csp = client.get(
+             "/absent",
+             headers={
+                 "Forwarded": "host=evil.example",
+                 "X-Forwarded-Host": "evil.example",
+             },
+         ).headers["content-security-policy"]
+         directives = dict(part.strip().split(" ", 1) for part in csp.split(";"))
+         assert directives["form-action"] == "'self' https://identity.example.org"
+         assert (
+             directives["script-src"]
+             == directives["style-src"]
+             == directives["connect-src"]
+             == "'self'"
+         )
+         assert "evil" not in csp and "*" not in csp and "unsafe-" not in csp
+ 
+ 
+ @pytest.mark.parametrize(
+     "authority",
+     [
+         "*.example.org",
+         "identity.example.org;script-src",
+         "identity.example.org'",
+         "identity\\evil.example.org",
+         "[::1%25;upgrade-insecure-requests;]",
+         "[fe80::1%25eth0]",
+     ],
+ )
+ def test_patient_csp_rejects_unsafe_authority_syntax(authority):
+     from types import SimpleNamespace
+ 
+     from medical_rag.oidc_login import create_auth_app
+ 
+     login = SimpleNamespace(
+         config=SimpleNamespace(
+             app_origin=APP_ORIGIN,
+             authorization_endpoint="https://" + authority + "/authorize",
+         )
+     )
+     with pytest.raises(ValueError):
+         create_auth_app(login, patient_html=True)
+ 
+ 
+ @pytest.mark.integration
+ def test_owner_grant_recipe_supports_real_runtime_operations(
+     config_file, system, database
+ ):
+     from medical_rag.identity_sessions import SessionStore
+     from medical_rag.oidc_identity import VerifiedIdentity
+     from medical_rag.patient_service import PatientService
+ 
+     _, admin = database
+     role = "patient_recipe_" + secrets.token_hex(6)
+     with psycopg.connect(**admin) as db:
+         db.execute(
+             psycopg.sql.SQL(
+                 "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
+             ).format(
+                 psycopg.sql.Identifier(role), psycopg.sql.Literal(admin["password"])
+             )
+         )
+         recipe = (
+             Path(__file__).resolve().parents[1] / "database/patient_runtime_grants.sql"
+         ).read_text(encoding="utf-8")
+         recipe = "\n".join(
+             line for line in recipe.splitlines() if not line.startswith("\\")
+         )
+         db.execute(
+             recipe.replace(
+                 ':"runtime_role"', psycopg.sql.Identifier(role).as_string(db)
+             )
+         )
+     params = dict(admin, user=role, autocommit=False)
+     (config_file.parent / "dsn").write_text(
+         psycopg.conninfo.make_conninfo(
+             **{k: v for k, v in params.items() if k != "autocommit"}
+         ),
+         encoding="utf-8",
+     )
+     loaded = load_configuration(config_file)
+     security_server.preflight(loaded)
+     sessions = SessionStore(lambda: psycopg.connect(**params), tenant_id=TENANT)
+     issued = sessions.issue(VerifiedIdentity(loaded.login.issuer, "subject-1", True))
+     service = PatientService(sessions, loaded.notice)
+     assert service.change_consent(
+         issued.token,
+         csrf_token=issued.csrf_token,
+         granted=True,
+         version=loaded.notice.version,
+     )["granted"]
+     created = service.create_conversation(
+         issued.token, csrf_token=issued.csrf_token, title="fictional"
+     )
+     service.append_turn(
+         issued.token, created["id"], csrf_token=issued.csrf_token, content="fictional"
+     )
+     assert len(service.list_turns(issued.token, created["id"])["items"]) == 1
+     login = __import__("medical_rag.oidc_login", fromlist=["OIDCLogin"]).OIDCLogin(
+         loaded.login,
+         lambda: psycopg.connect(**params),
+         tenant_id=TENANT,
+         transaction_encryption_key=loaded.transaction_key,
+     )
+     flow = login.transactions.create()
+     assert (
+         login.transactions.consume(flow.state, flow.browser_token).tenant_version >= 0
+     )
++    # Real append/revoke/fence/replay using ONLY the exact owner-run recipe
++    # role above. Not a second broader fixture role or synthetic DB grants.
++    from medical_rag.identity_sessions import AuthenticationDenied
++    from medical_rag.provider_logout import VerifiedProviderLogout
++
++    when = int(time.time())
++    old = sessions.issue(VerifiedIdentity(loaded.login.issuer, "subject-1", False,
++                                        "recipe-provider-session", when))
++    event = VerifiedProviderLogout(loaded.login.issuer, secrets.token_urlsafe(24),
++                                   "subject-1", "recipe-provider-session", when, when + 120)
++    sessions.provider_logout(event)
++    with pytest.raises(AuthenticationDenied):
++        sessions.authenticate(old.token)
++    with pytest.raises(AuthenticationDenied):
++        sessions.issue(VerifiedIdentity(loaded.login.issuer, "subject-1", False,
++                                       "recipe-provider-session", when))
++    fresh = sessions.issue(VerifiedIdentity(loaded.login.issuer, "subject-1", False,
++                                          "recipe-provider-session", when + 1))
++    sessions.provider_logout(event)
++    sessions.authenticate(fresh.token)
++    with psycopg.connect(**admin) as db:
++        assert db.execute("SELECT count(*) FROM medical_rag.provider_logout_events WHERE issuer=%s",
++                          (loaded.login.issuer,)).fetchone() == (1,)
+ 
+ 
+ @pytest.mark.integration
+ def test_actual_recovery_postgres_denied(config_file, system, database):
+     """Create one OWN disposable clone; never change the existing primary."""
+     runtime, admin = database
+     # Resolve only the fixture's random primary port. Attach an OWN temporary
+     # network and create an OWN bounded-memory streaming standby container.
+     inventory = subprocess.run(
+         ["docker", "ps", "--format", "{{.ID}} {{.Ports}}"],
+         capture_output=True,
+         text=True,
+         check=True,
+     ).stdout.splitlines()
+     containers = [
+         line.split()[0]
+         for line in inventory
+         if f"127.0.0.1:{admin['port']}->5432" in line
+     ]
+     assert len(containers) == 1
+     container = containers[0]
+     network = "patient-recovery-" + secrets.token_hex(6)
+     standby = None
+     subprocess.run(
+         ["docker", "network", "create", network],
+         capture_output=True,
+         check=True,
+         timeout=10,
+     )
+     try:
+         subprocess.run(
+             [
+                 "docker",
+                 "network",
+                 "connect",
+                 "--alias",
+                 "patient-primary",
+                 network,
+                 container,
+             ],
+             capture_output=True,
+             check=True,
+             timeout=10,
+         )
+         # Only this test's disposable primary: permit password-authenticated
+         # replication on the isolated temporary Docker network.
+         with psycopg.connect(**admin) as db:
+             hba = db.execute("SHOW hba_file").fetchone()[0]
+         subprocess.run(
+             [
+                 "docker",
+                 "exec",
+                 container,
+                 "sh",
+                 "-c",
+                 f"printf '\\nhost replication postgres all scram-sha-256\\n' >> '{hba}'",
+             ],
+             capture_output=True,
+             check=True,
+             timeout=10,
+         )
+         with psycopg.connect(**admin) as db:
+             db.execute("SELECT pg_reload_conf()")
+         standby = subprocess.run(
+             [
+                 "docker",
+                 "run",
+                 "-d",
+                 "--network",
+                 network,
+                 "-p",
+                 "127.0.0.1::5432",
+                 "--tmpfs",
+                 "/standby:rw,size=256m,uid=70,gid=70,mode=0700",
+                 "--user",
+                 "postgres",
+                 "-e",
+                 f"PGPASSWORD={admin['password']}",
+                 "--entrypoint",
+                 "sh",
+                 "postgres:18.6-alpine",
+                 "-c",
+                 "pg_basebackup -c fast -h patient-primary -U postgres -D /standby -R -X stream && exec postgres -D /standby -c listen_addresses='*'",
+             ],
+             capture_output=True,
+             text=True,
+             check=True,
+             timeout=10,
+         ).stdout.strip()
+         port = (
+             subprocess.run(
+                 ["docker", "port", standby, "5432/tcp"],
+                 capture_output=True,
+                 text=True,
+                 check=True,
+                 timeout=10,
+             )
+             .stdout.strip()
+             .rsplit(":", 1)[1]
+         )
+         params = dict(runtime, port=int(port))
+         for _ in range(100):
+             try:
+                 with psycopg.connect(**params) as db:
+                     assert db.execute("SELECT pg_is_in_recovery()").fetchone() == (
+                         True,
+                     )
+                 break
+             except psycopg.OperationalError:
+                 time.sleep(0.1)
+         else:
+             pytest.fail("disposable recovery server did not become ready")
+         (config_file.parent / "dsn").write_text(
+             psycopg.conninfo.make_conninfo(
+                 **{k: v for k, v in params.items() if k != "autocommit"}
+             ),
+             encoding="utf-8",
+         )
+         with pytest.raises(StartupError):
+             security_server.load_patient_application(config_file)
+     finally:
+         if standby:
+             subprocess.run(
+                 ["docker", "rm", "-f", standby],
+                 capture_output=True,
+                 timeout=15,
+                 check=False,
+             )
+         subprocess.run(
+             ["docker", "network", "disconnect", network, container],
+             capture_output=True,
+             timeout=10,
+             check=False,
+         )
+         subprocess.run(
+             ["docker", "network", "rm", network],
+             capture_output=True,
+             timeout=10,
+             check=False,
+         )
+ 
+ 
+ @pytest.mark.integration
+ def test_actual_primary_least_privilege_startup_and_authority_denials(
+     config_file, system, database
+ ):
+     runtime, admin = database
+     dsn = config_file.parent / "dsn"
+     dsn.write_text(
+         psycopg.conninfo.make_conninfo(
+             **{k: v for k, v in runtime.items() if k != "autocommit"}
+         ),
+         encoding="utf-8",
+     )
+     assert security_server.load_patient_application(config_file) is not None
+     with psycopg.connect(**admin) as db:
+         for grant, revoke in [
+             (
+                 "GRANT UPDATE(active) ON medical_rag.tenants TO login_test",
+                 "REVOKE UPDATE(active) ON medical_rag.tenants FROM login_test",
+             ),
+             (
+                 "GRANT INSERT(role) ON medical_rag.identity_roles TO login_test",
+                 "REVOKE INSERT(role) ON medical_rag.identity_roles FROM login_test",
+             ),
+             (
+                 "GRANT UPDATE(identity_verified) ON medical_rag.patient_subjects TO login_test",
+                 "REVOKE UPDATE(identity_verified) ON medical_rag.patient_subjects FROM login_test",
+             ),
+             (
+                 "GRANT UPDATE(granted) ON medical_rag.patient_consent_events TO login_test",
+                 "REVOKE UPDATE(granted) ON medical_rag.patient_consent_events FROM login_test",
+             ),
+             (
+                 "GRANT DELETE ON medical_rag.patient_consent_events TO login_test",
+                 "REVOKE DELETE ON medical_rag.patient_consent_events FROM login_test",
+             ),
+         ]:
+             db.execute(grant)
+             try:
+                 with pytest.raises(StartupError):
+                     security_server.load_patient_application(config_file)
+             finally:
+                 db.execute(revoke)
+         db.execute(
+             "UPDATE medical_rag.tenants SET active=false WHERE tenant_id=%s", (TENANT,)
+         )
+         with pytest.raises(StartupError):
+             security_server.load_patient_application(config_file)
+         db.execute(
+             "UPDATE medical_rag.tenants SET active=true WHERE tenant_id=%s", (TENANT,)
+         )
+     dsn.write_text(
+         psycopg.conninfo.make_conninfo(
+             **{k: v for k, v in admin.items() if k != "autocommit"}
+         ),
+         encoding="utf-8",
+     )
+     with pytest.raises(StartupError):
+         security_server.load_patient_application(config_file)
+ 
+ 
+ @pytest.mark.integration
+ def test_actual_wrong_tenant_missing_schema_denied(config_file, system, database):
+     runtime, admin = database
+     (config_file.parent / "dsn").write_text(
+         psycopg.conninfo.make_conninfo(
+             **{k: v for k, v in runtime.items() if k != "autocommit"}
+         ),
+         encoding="utf-8",
+     )
+     original = config_file.read_text(encoding="utf-8")
+     config_file.write_text(
+         original.replace(TENANT, "00000000-0000-0000-0000-000000000999"),
+         encoding="utf-8",
+     )
+     with pytest.raises(StartupError):
+         security_server.load_patient_application(config_file)
+     config_file.write_text(original, encoding="utf-8")
+     with psycopg.connect(**admin) as db:
+         db.execute(
+             "ALTER TABLE medical_rag.patient_subjects RENAME COLUMN age_classification TO missing_age"
+         )
+         try:
+             with pytest.raises(StartupError):
+                 security_server.load_patient_application(config_file)
+         finally:
+             db.execute(
+                 "ALTER TABLE medical_rag.patient_subjects RENAME COLUMN missing_age TO age_classification"
+             )
+ 
+ 
+ @pytest.mark.integration
+ def test_required_dml_and_forced_rls_are_checked(config_file, system, database):
+     runtime, admin = database
+     (config_file.parent / "dsn").write_text(
+         psycopg.conninfo.make_conninfo(
+             **{k: v for k, v in runtime.items() if k != "autocommit"}
+         ),
+         encoding="utf-8",
+     )
+     with psycopg.connect(**admin) as db:
+         for table in ["patient_consent_events", "conversations", "identity_sessions"]:
+             db.execute(f"REVOKE INSERT ON medical_rag.{table} FROM login_test")
+             try:
+                 with pytest.raises(StartupError):
+                     security_server.load_patient_application(config_file)
+             finally:
+                 db.execute(f"GRANT INSERT ON medical_rag.{table} TO login_test")
+         db.execute("ALTER TABLE medical_rag.conversations NO FORCE ROW LEVEL SECURITY")
+         try:
+             with pytest.raises(StartupError):
+                 security_server.load_patient_application(config_file)
+         finally:
+             db.execute("ALTER TABLE medical_rag.conversations FORCE ROW LEVEL SECURITY")
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("change,restore", [
+     ("ALTER TABLE medical_rag.provider_logout_events RENAME TO missing_provider_logout",
+      "ALTER TABLE medical_rag.missing_provider_logout RENAME TO provider_logout_events"),
+     ("ALTER TABLE medical_rag.identity_sessions RENAME COLUMN authenticated_at TO missing_authenticated_at",
+      "ALTER TABLE medical_rag.identity_sessions RENAME COLUMN missing_authenticated_at TO authenticated_at"),
+     ("ALTER TABLE medical_rag.provider_logout_events NO FORCE ROW LEVEL SECURITY",
+      "ALTER TABLE medical_rag.provider_logout_events FORCE ROW LEVEL SECURITY"),
+     ("GRANT UPDATE(issued_at) ON medical_rag.provider_logout_events TO login_test",
+      "REVOKE UPDATE(issued_at) ON medical_rag.provider_logout_events FROM login_test"),
+     ("GRANT DELETE ON medical_rag.provider_logout_events TO login_test",
+      "REVOKE DELETE ON medical_rag.provider_logout_events FROM login_test"),
+     ("GRANT TRUNCATE ON medical_rag.provider_logout_events TO login_test",
+      "REVOKE TRUNCATE ON medical_rag.provider_logout_events FROM login_test"),
+     ("GRANT INSERT(recorded_at) ON medical_rag.provider_logout_events TO login_test",
+      "REVOKE INSERT(recorded_at) ON medical_rag.provider_logout_events FROM login_test"),
+     ("REVOKE INSERT(issued_at) ON medical_rag.provider_logout_events FROM login_test",
+      "GRANT INSERT(issued_at) ON medical_rag.provider_logout_events TO login_test"),
+ ])
+ def test_schema6_preflight_rejects_missing_or_broad_provider_authority(config_file, system, database, change, restore):
+     runtime, admin = database
+     (config_file.parent / "dsn").write_text(psycopg.conninfo.make_conninfo(
+         **{k: v for k, v in runtime.items() if k != "autocommit"}), encoding="utf-8")
+     config = load_configuration(config_file)
+     with psycopg.connect(**admin) as db:
+         db.execute(change)
+         try:
+             with pytest.raises(StartupError):
+                 security_server.preflight(config)
+         finally:
+             db.execute(restore)
+ 
+ 
+ @pytest.mark.parametrize(
+     "dsn",
+     [
+         "host=db.example.org dbname=postgres user=patient password=secret sslmode=disable",
+         "host=127.0.0.1,db.example.org dbname=postgres user=patient password=secret",
+         "host=127.0.0.1 hostaddr=203.0.113.1 dbname=postgres user=patient password=secret",
+     ],
+ )
+ def test_unsafe_remote_database_transport_denied(config_file, dsn, monkeypatch):
+     (config_file.parent / "dsn").write_text(dsn, encoding="utf-8")
+     connected = []
+     monkeypatch.setattr(
+         security_server.psycopg,
+         "connect",
+         lambda *args, **kwargs: connected.append(True),
+     )
+     with pytest.raises(StartupError):
+         security_server._connect(load_configuration(config_file))
+     assert connected == []
+ 
+ 
+ def test_help_succeeds_without_startup_or_secret_access(capsys):
+     assert security_server.main(["--help"]) == 0
+     assert "启动失败" not in capsys.readouterr().err
+ 
+ 
+ @pytest.mark.integration
+ def test_real_direct_tls_process_serves_only_dedicated_build(
+     config_file, system, database
+ ):
+     runtime, _ = database
+     (config_file.parent / "dsn").write_text(
+         psycopg.conninfo.make_conninfo(
+             **{k: v for k, v in runtime.items() if k != "autocommit"}
+         ),
+         encoding="utf-8",
+     )
+     with socket.socket() as reserved:
+         reserved.bind(("127.0.0.1", 0))
+         port = reserved.getsockname()[1]
+     config_file.write_text(
+         config_file.read_text(encoding="utf-8").replace(
+             "listen_port = 8443", f"listen_port = {port}"
+         ),
+         encoding="utf-8",
+     )
+     process = subprocess.Popen(
+         [
+             sys.executable,
+             "-m",
+             "medical_rag.security_server",
+             "--config",
+             str(config_file),
+         ],
+         stdout=subprocess.PIPE,
+         stderr=subprocess.PIPE,
+         env=dict(
+             os.environ,
+             PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
+         ),
+     )
+     context = ssl.create_default_context(cafile=str(config_file.parent / "tls.pem"))
+     try:
+         for _ in range(100):
+             try:
+                 with (
+                     socket.create_connection(("127.0.0.1", port), timeout=0.2) as raw,
+                     context.wrap_socket(
+                         raw, server_hostname="medical.example.org"
+                     ) as tls,
+                 ):
+                     tls.sendall(
+                         b"GET / HTTP/1.1\r\nHost: medical.example.org\r\nConnection: close\r\n\r\n"
+                     )
+                     response = b""
+                     while chunk := tls.recv(65536):
+                         response += chunk
+                 break
+             except (ConnectionError, TimeoutError):
+                 time.sleep(0.1)
+         else:
+             pytest.fail("direct TLS test listener did not become ready")
+         assert (
+             response.startswith(b"HTTP/1.1 200") and b"/assets/patient.js" in response
+         )
+         assert b"server: uvicorn" not in response.lower()
+         assert b"cache-control: no-store" in response.lower()
+     finally:
+         process.terminate()
+         stdout, stderr = process.communicate(timeout=10)
+     assert stdout == b"" and stderr == b""
+
+
+## deploy/patient/config.example.toml
+
+diff --git a/outputs/keycloak-integration-baseline-20261103/deploy__patient__config.example.toml b/deploy/patient/config.example.toml
+index 62b42e0..cf6f40b 100644
+--- a/outputs/keycloak-integration-baseline-20261103/deploy__patient__config.example.toml
++++ b/deploy/patient/config.example.toml
+@@ -1,28 +1,31 @@
+ # Operator-owned example only. All paths resolve relative to this file.
+ # No .env is read. Provision migrations 1-6, verified authority and audited
+ # runtime grants separately. No accounts/consent/identity are created here.
+ tenant_id = "00000000-0000-0000-0000-000000000101"
+ database_dsn_file = "secrets/database-dsn.txt"
+ transaction_key_file = "secrets/login-aes256.raw"
+ frontend_dist = "../../frontend/dist-patient"
+ listen_host = "127.0.0.1"
+ listen_port = 8443
+ tls_cert_file = "secrets/tls-chain.pem"
+ tls_key_file = "secrets/tls-private-key.pem"
+ 
+ [oidc]
++# Optional operator-owned PUBLIC PEM trust bundle, resolved relative to this file.
++# Omit to retain verified system/public-CA trust. Never supply a private key here.
++# provider_ca_file = "institution-provider-ca.pem"
+ issuer = "https://identity.example.org/realms/institution"
+ authorization_endpoint = "https://identity.example.org/realms/institution/protocol/openid-connect/auth"
+ token_endpoint = "https://identity.example.org/realms/institution/protocol/openid-connect/token"
+ # Exact public TLS origin including port, if non-default. This listener does
+ # NOT trust Forwarded/X-Forwarded-* or integrate the legacy nginx HTTP upstream.
+ callback_uri = "https://patient.example.org:8443/auth/callback"
+ client_id = "institution-provisioned-patient-client"
+ client_secret_file = "secrets/oidc-client-secret.txt"
+ public_key_file = "secrets/oidc-rs256-public-key.pem"
+ mfa_acr_values = ["urn:institution:approved-mfa"]
+ 
+ [health_notice]
+ version = "institution-approved-version-required"
+ text_file = "institution-approved-health-notice.txt"
+ validity_seconds = 86400
+
+
+## pyproject.toml
+
+diff --git a/outputs/keycloak-integration-baseline-20261103/pyproject.toml b/pyproject.toml
+index ff209bc..796fcad 100644
+--- a/outputs/keycloak-integration-baseline-20261103/pyproject.toml
++++ b/pyproject.toml
+@@ -1,35 +1,36 @@
+ [build-system]
+ requires = ["setuptools>=75"]
+ build-backend = "setuptools.build_meta"
+ 
+ [project]
+ name = "medical-rag"
+ version = "0.1.0"
+ description = "Evidence-grounded retrieval over public Chinese medical materials"
+ requires-python = ">=3.11"
+ dependencies = [
+     "aio-pika==10.2.1",
+     "fastapi>=0.115",
+     "uvicorn>=0.30",
+     "python-multipart>=0.0.9",
+     "pydantic-settings>=2.0",
+     "pypdf>=5.0",
+     "pymilvus>=2.5.11,<2.7",
+     "sentence-transformers>=3.0",
+     "openai>=1.60",
+     "httpx>=0.27",
++    "certifi>=2024.2.2",
+     "psycopg[binary]>=3.2,<4",
+     "PyJWT[crypto]>=2.15.1,<3",
+     "Authlib>=1.9.1,<2",
+ ]
+ 
+ [project.optional-dependencies]
+ dev = ["pytest>=8", "pytest-cov>=5", "pytest-asyncio>=1.0", "pymupdf>=1.25", "ruff>=0.9"]
+ 
+ [tool.setuptools.packages.find]
+ where = ["src"]
+ 
+ [tool.pytest.ini_options]
+ testpaths = ["tests"]
+ pythonpath = ["src"]
+ markers = ["integration: requires running Milvus Standalone"]
+
+
+## src/medical_rag/provider_tls.py (new file)
+
+--- /dev/null
++++ b/src/medical_rag/provider_tls.py
+@@ -0,0 +1,42 @@
++"""Fresh verified TLS contexts from bounded operator-owned provider trust."""
++
++import re
++import ssl
++from pathlib import Path
++
++import certifi
++
++_CERTIFICATE = re.compile(
++    rb"-----BEGIN CERTIFICATE-----\s+[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----"
++)
++
++
++def provider_ssl_context(ca_file: Path | None) -> ssl.SSLContext:
++    """Use only fixed operator PEM trust; never environment or request overrides.
++
++    Re-read explicit trust on every transport construction, so changed/missing
++    trust fails closed. No global trust store is modified.
++    """
++    try:
++        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
++        context.minimum_version = ssl.TLSVersion.TLSv1_2
++        if ca_file is None:
++            # Same public CA bundle as HTTPX verify=True/trust_env=False;
++            # OpenSSL default paths would honor SSL_CERT_FILE/SSL_CERT_DIR.
++            context.load_verify_locations(cafile=certifi.where())
++        else:
++            if not isinstance(ca_file, Path):
++                raise ValueError()
++            with ca_file.open("rb") as stream:
++                pem = stream.read(65537)
++            if (
++                not pem
++                or len(pem) > 65536
++                or not _CERTIFICATE.search(pem)
++                or _CERTIFICATE.sub(b"", pem).strip()
++            ):
++                raise ValueError()
++            context.load_verify_locations(cadata=pem.decode("ascii"))
++        return context
++    except Exception:  # noqa: BLE001 -- file/crypto errors can contain private paths
++        raise ValueError("Invalid trusted provider TLS configuration") from None
+
+## tests/test_provider_tls.py (new file)
+
+--- /dev/null
++++ b/tests/test_provider_tls.py
+@@ -0,0 +1,125 @@
++"""Operator-only bounded provider trust, independent of environment trust."""
++# ruff: noqa: F401,F811 -- imported pytest fixtures
++
++import importlib.util
++import ssl
++from dataclasses import replace
++
++import pytest
++from test_oidc_login import configuration, signing_key
++from test_security_server import config_file
++
++from medical_rag.security_config import StartupError, load_configuration
++
++
++def test_provider_tls_helper_exists():
++    assert importlib.util.find_spec("medical_rag.provider_tls") is not None
++
++
++def test_optional_relative_ca_is_private_and_validated(config_file):
++    original = config_file.read_text(encoding="utf-8")
++    config_file.write_text(
++        original.replace("[oidc]", '[oidc]\nprovider_ca_file = "tls.pem"'),
++        encoding="utf-8",
++    )
++    loaded = load_configuration(config_file)
++    assert loaded.login.provider_ca_file == config_file.parent / "tls.pem"
++    assert str(loaded.login.provider_ca_file) not in repr(loaded.login)
++
++
++def test_old_configuration_retains_public_trust(config_file):
++    assert load_configuration(config_file).login.provider_ca_file is None
++
++
++@pytest.mark.parametrize(
++    "content",
++    [b"", b"not-a-certificate", b"x" * 65537, b"\xff"],
++    ids=["empty", "malformed", "oversized", "nonascii"],
++)
++def test_invalid_ca_has_static_startup_error(config_file, content):
++    config_file.write_text(
++        config_file.read_text(encoding="utf-8").replace(
++            "[oidc]", '[oidc]\nprovider_ca_file = "private-ca.pem"'
++        ),
++        encoding="utf-8",
++    )
++    (config_file.parent / "private-ca.pem").write_bytes(content)
++    with pytest.raises(StartupError, match="^患者服务启动失败，请联系机构运维。$"):
++        load_configuration(config_file)
++
++
++@pytest.mark.parametrize("value", ['"absent.pem"', "true", '""'])
++def test_missing_or_wrong_type_ca_denied(config_file, value):
++    config_file.write_text(
++        config_file.read_text(encoding="utf-8").replace(
++            "[oidc]", "[oidc]\nprovider_ca_file = " + value
++        ),
++        encoding="utf-8",
++    )
++    with pytest.raises(StartupError):
++        load_configuration(config_file)
++
++
++def test_fresh_verified_context_and_no_environment_override(config_file, monkeypatch):
++    from medical_rag.provider_tls import provider_ssl_context
++
++    monkeypatch.setenv("SSL_CERT_FILE", "nonexistent-private-path")
++    monkeypatch.setenv("SSL_CERT_DIR", "nonexistent-private-path")
++    path = config_file.parent / "tls.pem"
++    first, second = provider_ssl_context(path), provider_ssl_context(path)
++    assert first is not second
++    for context in (first, second, provider_ssl_context(None)):
++        assert context.check_hostname and context.verify_mode == ssl.CERT_REQUIRED
++        assert context.minimum_version >= ssl.TLSVersion.TLSv1_2
++    assert first.cert_store_stats()["x509"] == 1
++    monkeypatch.setenv("SSL_CERT_FILE", str(path))
++    assert provider_ssl_context(None).cert_store_stats()["x509"] > 1
++
++
++def test_later_invalid_or_unreadable_ca_fails_closed(config_file, signing_key):
++    from medical_rag.oidc_login import OIDCLogin
++
++    path = config_file.parent / "tls.pem"
++    login = OIDCLogin(
++        replace(configuration(signing_key), provider_ca_file=path),
++        lambda: None,
++        tenant_id="00000000-0000-0000-0000-000000000101",
++        transaction_encryption_key=b"x" * 32,
++    )
++    path.write_bytes(b"invalid-private-ca-CANARY")
++    with pytest.raises(
++        ValueError, match="^Invalid trusted provider TLS configuration$"
++    ):
++        login._client()
++    path.unlink()
++    with pytest.raises(ValueError):
++        login._client()
++
++
++def test_pem_bundle_rejects_extra_non_certificate_content(config_file):
++    from medical_rag.provider_tls import provider_ssl_context
++
++    path = config_file.parent / "tls.pem"
++    path.write_bytes(path.read_bytes() + b"\nPRIVATE-CANARY")
++    with pytest.raises(ValueError):
++        provider_ssl_context(path)
++
++
++def test_bundle_and_inclusive_byte_bound(config_file):
++    from medical_rag.provider_tls import provider_ssl_context
++
++    path = config_file.parent / "tls.pem"
++    pem = path.read_bytes()
++    path.write_bytes(pem + pem)
++    assert provider_ssl_context(path).cert_store_stats()["x509"] == 1
++    path.write_bytes(pem + b" " * (65536 - len(pem)))
++    assert provider_ssl_context(path).cert_store_stats()["x509"] == 1
++
++
++def test_wrong_direct_ca_type_is_rejected():
++    from medical_rag.provider_tls import provider_ssl_context
++
++    with pytest.raises(
++        ValueError, match="^Invalid trusted provider TLS configuration$"
++    ):
++        provider_ssl_context("private-path")
+
+## tests/test_keycloak_runtime.py (new file)
+
+--- /dev/null
++++ b/tests/test_keycloak_runtime.py
+@@ -0,0 +1,40 @@
++"""Diagnostic privacy of test infrastructure, not an upstream provider fake."""
++
++import subprocess
++from types import SimpleNamespace
++
++import pytest
++from keycloak_runtime import docker, identity_runtime
++
++
++@pytest.mark.parametrize("failure", ["timeout", "oserror", "exit"])
++def test_infrastructure_errors_do_not_disclose_command_or_output(monkeypatch, failure):
++    def fail(*args, **kwargs):
++        if failure == "timeout":
++            raise subprocess.TimeoutExpired(
++                ["docker", "PRIVATE-CANARY"], 30, output="PRIVATE-CANARY"
++            )
++        if failure == "oserror":
++            raise OSError("PRIVATE-CANARY")
++        return SimpleNamespace(
++            returncode=1, stdout="PRIVATE-CANARY", stderr="PRIVATE-CANARY"
++        )
++
++    monkeypatch.setattr(subprocess, "run", fail)
++    with pytest.raises(RuntimeError) as error:
++        docker("PRIVATE-CANARY")
++    assert str(error.value) == "Disposable identity infrastructure command failed"
++    assert error.value.__suppress_context__ or failure == "exit"
++
++
++def test_explicit_provider_selection_without_docker_is_failure(monkeypatch, tmp_path):
++    monkeypatch.setenv("RUN_KEYCLOAK_INTEGRATION", "1")
++    monkeypatch.setattr("keycloak_runtime.shutil.which", lambda _: None)
++    with (
++        pytest.raises(
++            pytest.fail.Exception,
++            match="Actual Keycloak suite selected but Docker unavailable",
++        ),
++        identity_runtime(tmp_path),
++    ):
++        pytest.fail("Missing infrastructure unexpectedly yielded")
+
+## tests/test_keycloak_identity.py (new file)
+
+--- /dev/null
++++ b/tests/test_keycloak_identity.py
+@@ -0,0 +1,363 @@
++"""Actual pinned Keycloak native code/PKCE/TLS integration; fictional users only.
++
++Provider HTTPS uses real sockets and signatures; app HTTP runs in TestClient on
++the exact fixed HTTPS origin. This is not full-browser/full-socket E2E.
++"""
++
++import json
++import logging
++import secrets
++import time
++from dataclasses import replace
++from urllib.parse import parse_qs, urlsplit
++from uuid import uuid4
++
++import httpx
++import jwt
++import psycopg
++import pytest
++from fastapi.testclient import TestClient
++from keycloak_forms import password_redirect, provider_logout
++from keycloak_runtime import APP_ORIGIN, CLIENT_ID, certificates, identity_runtime
++
++from medical_rag.oidc_login import LoginConfiguration, OIDCLogin
++from medical_rag.patient_api import create_patient_app
++from medical_rag.patient_service import HealthNotice
++from medical_rag.provider_logout import InvalidProviderLogout
++
++pytestmark = pytest.mark.integration
++
++
++@pytest.fixture(autouse=True)
++def no_provider_url_logging(monkeypatch):
++    """Never emit authorization/callback queries through transport loggers."""
++    for name in ("httpx", "httpcore"):
++        monkeypatch.setattr(logging.getLogger(name), "disabled", True)
++
++
++@pytest.fixture(scope="module")
++def provider(tmp_path_factory):
++    with identity_runtime(tmp_path_factory.mktemp("actual-keycloak")) as runtime:
++        yield runtime
++
++
++@pytest.fixture
++def application(provider):
++    tenant = str(uuid4())
++    accounts = {}
++    with psycopg.connect(**provider.admin) as db:
++        db.execute("INSERT INTO medical_rag.tenants(tenant_id) VALUES (%s)", (tenant,))
++        for name, user in provider.users.items():
++            if name == "unprovisioned":
++                continue
++            account, patient = str(uuid4()), str(uuid4())
++            accounts[name] = account
++            db.execute(
++                "INSERT INTO medical_rag.identity_accounts(tenant_id,account_id,issuer,subject,active) "
++                "VALUES (%s,%s,%s,%s,%s)",
++                (tenant, account, provider.issuer, user["id"], name != "disabled"),
++            )
++            db.execute(
++                "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,%s)",
++                (tenant, account, "org_admin" if name == "admin" else "patient"),
++            )
++            if name == "admin":
++                db.execute(
++                    "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'auditor')",
++                    (tenant, account),
++                )
++            db.execute(
++                "INSERT INTO medical_rag.patient_subjects(tenant_id,patient_id,age_classification,identity_verified) "
++                "VALUES (%s,%s,'adult',true)",
++                (tenant, patient),
++            )
++            db.execute(
++                "INSERT INTO medical_rag.identity_bindings VALUES (%s,%s,%s,%s)",
++                (tenant, account, patient, name != "unverified"),
++            )
++    config = LoginConfiguration(
++        issuer=provider.issuer,
++        authorization_endpoint=provider.issuer + "/protocol/openid-connect/auth",
++        token_endpoint=provider.issuer + "/protocol/openid-connect/token",
++        callback_uri=APP_ORIGIN + "/auth/callback",
++        client_id=CLIENT_ID,
++        client_secret=provider.client_secret,
++        public_key=provider.public_key,
++        mfa_acr_values=frozenset({"urn:institution:real-mfa-required"}),
++        provider_ca_file=provider.ca_file,
++    )
++    login = OIDCLogin(
++        config,
++        lambda: psycopg.connect(**provider.database),
++        tenant_id=tenant,
++        transaction_encryption_key=secrets.token_bytes(32),
++    )
++    notice = HealthNotice(
++        "fictional-v1", "Fictional identity interoperability test notice only.", 3600
++    )
++    with TestClient(
++        create_patient_app(login, notice), base_url=APP_ORIGIN, headers={}
++    ) as client:
++        yield client, login, tenant, accounts
++
++
++def authenticate(client, browser, provider, name, *, wrong_password=False):
++    """No fake upstream response/signature/transport and no bearer disclosure."""
++    response = client.post(
++        "/auth/login", headers={"Origin": APP_ORIGIN}, follow_redirects=False
++    )
++    assert response.status_code == 303
++    authorization = response.headers["location"]
++    query = parse_qs(urlsplit(authorization).query)
++    assert query["code_challenge_method"] == ["S256"]
++    assert query["redirect_uri"] == [APP_ORIGIN + "/auth/callback"]
++    redirect = password_redirect(
++        browser,
++        authorization,
++        name,
++        "fictional-wrong-password"
++        if wrong_password
++        else provider.users[name]["password"],
++    )
++    if redirect is None:
++        return None
++    if urlsplit(redirect)[:3] != urlsplit(APP_ORIGIN + "/auth/callback")[:3]:
++        raise RuntimeError("Unexpected callback origin/path")
++    return client.get(redirect, follow_redirects=False)
++
++
++def csrf_headers(client):
++    response = client.get("/auth/session")
++    assert response.status_code == 200
++    return {"Origin": APP_ORIGIN, "X-CSRF-Token": response.json()["data"]["csrf_token"]}
++
++
++def grant(client):
++    response = client.post(
++        "/me/consents/health",
++        headers=csrf_headers(client),
++        json={"version": "fictional-v1", "accepted": True},
++    )
++    assert response.status_code == 200
++
++
++def test_actual_provider_own_records_and_local_authority(application, provider):
++    client, _, _, accounts = application
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, "patient1").status_code == 303
++    me = client.get("/me").json()["data"]
++    assert me["user_id"] == accounts["patient1"] and me["roles"] == ["patient"]
++    assert (
++        me["permissions"]["audit"] is False
++    )  # upstream realm role admin is not local authority
++    assert client.get("/conversations").status_code == 403
++    assert client.get("/me/consents/health").json()["data"]["granted"] is False
++    grant(client)
++    response = client.post(
++        "/conversations",
++        headers=csrf_headers(client),
++        json={"title": "Fictional private record"},
++    )
++    assert response.status_code == 200
++    path = "/conversations/" + response.json()["data"]["id"]
++    assert (
++        client.post(
++            path + "/turns",
++            headers=csrf_headers(client),
++            json={"content": "Fictional patient text"},
++        ).status_code
++        == 200
++    )
++    assert (
++        client.get(path).status_code == client.get(path + "/turns").status_code == 200
++    )
++    client.cookies.clear()
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, "patient2").status_code == 303
++    grant(client)
++    assert client.get(path).status_code == 404
++    assert client.get(path + "/turns").status_code == 404
++    assert client.get("/conversations").json()["data"]["items"] == []
++
++
++@pytest.mark.parametrize("name", ["disabled", "unprovisioned"])
++def test_actual_provider_cannot_provision_or_enable_local_accounts(
++    application, provider, name
++):
++    client, _, _, _ = application
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, name).status_code == 401
++    has_session = bool(client.cookies.get("__Host-medical-session"))
++    assert not has_session
++    assert client.get("/me").status_code == 401
++
++
++def test_actual_wrong_password_does_not_issue_local_session(application, provider):
++    client, _, _, _ = application
++    with provider.browser() as browser:
++        assert (
++            authenticate(client, browser, provider, "patient1", wrong_password=True)
++            is None
++        )
++    has_session = bool(client.cookies.get("__Host-medical-session"))
++    assert not has_session
++    assert client.get("/auth/session").status_code == 401
++
++
++@pytest.mark.parametrize("name", ["unverified", "admin"])
++def test_actual_password_is_not_verified_binding_or_admin_mfa(
++    application, provider, name
++):
++    client, _, _, _ = application
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, name).status_code == 303
++    assert client.get("/me/consents/health").status_code in (401, 403)
++    assert client.get("/conversations").status_code in (401, 403)
++    assert client.get("/audit").status_code == 403
++    if name == "unverified":
++        assert client.get("/me").status_code == 200
++        assert client.get("/me").json()["data"]["binding"] == {"verified": False}
++    else:
++        assert client.get("/me").status_code == 200
++        assert client.get("/me").json()["data"]["permissions"]["audit"] is False
++        assert (
++            application[1]
++            .sessions.authenticate(client.cookies.get("__Host-medical-session"))
++            .mfa_verified
++            is False
++        )
++
++
++def test_actual_ca_mismatch_handshake_and_exchange_fail_closed(
++    application, provider, tmp_path
++):
++    client, login, _, _ = application
++    certificates(tmp_path)
++    wrong_ca = tmp_path / "ca.pem"
++    from medical_rag.provider_tls import provider_ssl_context
++
++    with (
++        httpx.Client(
++            verify=provider_ssl_context(wrong_ca), trust_env=False, timeout=3
++        ) as browser,
++        pytest.raises(httpx.ConnectError),
++    ):
++        browser.get(provider.issuer)
++    login.config = replace(login.config, provider_ca_file=wrong_ca)
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, "patient1").status_code == 401
++    has_session = bool(client.cookies.get("__Host-medical-session"))
++    assert not has_session
++
++
++@pytest.mark.parametrize("corruption", ["invalid", "missing"])
++def test_changed_ca_after_login_start_fails_closed(
++    application, provider, tmp_path, corruption
++):
++    """Valid startup trust cannot silently fall back after a later file change."""
++    client, login, _, _ = application
++    path = tmp_path / "operator-ca.pem"
++    path.write_bytes(provider.ca_file.read_bytes())
++    login.config = replace(login.config, provider_ca_file=path)
++    started = client.post(
++        "/auth/login", headers={"Origin": APP_ORIGIN}, follow_redirects=False
++    )
++    assert started.status_code == 303
++    with provider.browser() as browser:
++        callback = password_redirect(
++            browser,
++            started.headers["location"],
++            "patient1",
++            provider.users["patient1"]["password"],
++        )
++    if corruption == "invalid":
++        path.write_bytes(b"INVALID-PRIVATE-CA-CANARY")
++    else:
++        path.unlink()
++    response = client.get(callback, follow_redirects=False)
++    assert response.status_code == 401
++    has_session = bool(client.cookies.get("__Host-medical-session"))
++    safe_response = (
++        str(path) not in response.text
++        and "INVALID-PRIVATE-CA-CANARY" not in response.text
++    )
++    assert not has_session and safe_response
++
++
++def test_actual_provider_backchannel_and_fresh_login_survives_replay(
++    application, provider, caplog
++):
++    client, login, tenant, _ = application
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, "patient1").status_code == 303
++        old_cookie = client.cookies.get("__Host-medical-session")
++        provider_logout(browser, provider.issuer, CLIENT_ID, APP_ORIGIN + "/")
++        deadline = time.monotonic() + 10
++        while time.monotonic() < deadline:
++            capture = browser.get(provider.collector_url)
++            if capture.content:
++                break
++            time.sleep(0.1)
++        else:
++            pytest.fail("Actual provider backchannel capture missing")
++    body = capture.content
++    # Only structural metadata on conflict; never token or raw claim values.
++    token = parse_qs(body.decode("utf-8"))["logout_token"][0]
++    try:
++        event = login.provider_logout_verifier.verify(token)
++    except InvalidProviderLogout:
++        header = jwt.get_unverified_header(token)
++        claims = jwt.decode(token, options={"verify_signature": False})
++        structural = {
++            "header": {k: header.get(k) for k in ("alg", "typ")},
++            "claim_types": {k: type(v).__name__ for k, v in claims.items()},
++            "lifetime": claims.get("exp", 0) - claims.get("iat", 0),
++        }
++        pytest.fail("Actual provider profile conflict: " + json.dumps(structural))
++    response = client.post(
++        "/auth/backchannel-logout",
++        content=body,
++        headers={"Content-Type": "application/x-www-form-urlencoded"},
++    )
++    assert response.status_code == 200
++    assert client.get("/me").status_code == 401
++    with psycopg.connect(**provider.admin) as db:
++        row = db.execute(
++            "SELECT operator_id,action,resource_type,outcome,reason_code FROM medical_rag.security_audit_events "
++            "WHERE tenant_id=%s AND action='provider.logout'",
++            (tenant,),
++        ).fetchone()
++        assert row[0] is None and row[1] == "provider.logout"
++        audit = json.dumps(
++            db.execute(
++                "SELECT * FROM medical_rag.security_audit_events WHERE tenant_id=%s",
++                (tenant,),
++            ).fetchall(),
++            default=str,
++        )
++    safe_tokens = (
++        token not in audit + caplog.text and old_cookie not in audit + caplog.text
++    )
++    safe_subject = provider.users["patient1"]["id"] not in audit
++    assert safe_tokens and safe_subject, "Audit/log privacy boundary failed"
++    while time.time() <= event.issued_at + 1:
++        time.sleep(0.1)
++    client.cookies.clear()
++    with provider.browser() as browser:
++        assert authenticate(client, browser, provider, "patient1").status_code == 303
++    fresh_cookie = client.cookies.get("__Host-medical-session")
++    assert client.get("/me").status_code == 200
++    assert (
++        client.post(
++            "/auth/backchannel-logout",
++            content=body,
++            headers={"Content-Type": "application/x-www-form-urlencoded"},
++        ).status_code
++        == 200
++    )
++    assert client.get("/me").status_code == 200
++    from medical_rag.identity_sessions import AuthenticationDenied
++
++    with pytest.raises(AuthenticationDenied):
++        login.sessions.authenticate(old_cookie)
++    login.sessions.authenticate(fresh_cookie)
+
+## tests/keycloak_runtime.py (new file)
+
+--- /dev/null
++++ b/tests/keycloak_runtime.py
+@@ -0,0 +1,409 @@
++"""Owned, disposable official Keycloak HTTPS + collector + PostgreSQL fixture."""
++
++import ipaddress
++import json
++import os
++import secrets
++import shutil
++import subprocess
++import time
++from collections.abc import Iterator
++from contextlib import contextmanager
++from dataclasses import dataclass, field
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++from uuid import uuid4
++
++import httpx
++import psycopg
++import pytest
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.hazmat.primitives.asymmetric import rsa
++from cryptography.x509.oid import NameOID
++
++from medical_rag.provider_tls import provider_ssl_context
++
++IMAGE = "quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332"
++ROOT = Path(__file__).resolve().parents[1]
++APP_ORIGIN = "https://medical.example.org"
++CLIENT_ID = "medical-rag"
++
++
++def docker(*args: str) -> str:
++    """Keep credential-bearing command errors and daemon output private."""
++    try:
++        result = subprocess.run(
++            ["docker", *args], capture_output=True, text=True, timeout=30, check=False
++        )
++    except (OSError, subprocess.SubprocessError):
++        raise RuntimeError(
++            "Disposable identity infrastructure command failed"
++        ) from None
++    if result.returncode:
++        raise RuntimeError("Disposable identity infrastructure command failed")
++    return result.stdout.strip()
++
++
++def certificates(directory: Path) -> None:
++    """Generate fixture CA/server certs, never upstream identity signatures."""
++    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
++    name = x509.Name(
++        [x509.NameAttribute(NameOID.COMMON_NAME, "Fictional disposable CA")]
++    )
++    now = datetime.now(UTC)
++    ca = (
++        x509.CertificateBuilder()
++        .subject_name(name)
++        .issuer_name(name)
++        .public_key(ca_key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(now - timedelta(minutes=1))
++        .not_valid_after(now + timedelta(days=1))
++        .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
++        .add_extension(
++            x509.KeyUsage(False, False, False, False, False, True, True, False, False),
++            True,
++        )
++        .sign(ca_key, hashes.SHA256())
++    )
++    cert = (
++        x509.CertificateBuilder()
++        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
++        .issuer_name(name)
++        .public_key(key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(now - timedelta(minutes=1))
++        .not_valid_after(now + timedelta(days=1))
++        .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
++        .add_extension(
++            x509.SubjectAlternativeName(
++                [
++                    x509.DNSName("localhost"),
++                    x509.DNSName("collector"),
++                    x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
++                ]
++            ),
++            False,
++        )
++        .sign(ca_key, hashes.SHA256())
++    )
++    (directory / "ca.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
++    (directory / "server.pem").write_bytes(
++        cert.public_bytes(serialization.Encoding.PEM)
++    )
++    (directory / "server.key").write_bytes(
++        key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.PKCS8,
++            serialization.NoEncryption(),
++        )
++    )
++
++
++@dataclass(repr=False)
++class Runtime:
++    """Private fixture handles; no credentials or upstream values in repr."""
++
++    issuer: str
++    collector_url: str
++    ca_file: Path
++    client_secret: str = field(repr=False)
++    users: dict = field(repr=False)
++    public_key: object = field(repr=False)
++    database: dict = field(repr=False)
++    admin: dict = field(repr=False)
++
++    def browser(self) -> httpx.Client:
++        """Use the fixture CA with real HTTPX sockets and bounded deadlines."""
++        return httpx.Client(
++            verify=provider_ssl_context(self.ca_file),
++            trust_env=False,
++            timeout=httpx.Timeout(5, connect=2),
++            follow_redirects=False,
++            headers={"Accept-Encoding": "identity"},
++        )
++
++
++def _ready(browser: httpx.Client, url: str, seconds: int = 90) -> bytes:
++    """Bound readiness duration and response bytes before parsing."""
++    deadline = time.monotonic() + seconds
++    while time.monotonic() < deadline:
++        try:
++            with browser.stream("GET", url) as response:
++                data = bytearray()
++                for part in response.iter_bytes():
++                    if len(data) + len(part) > 65536:
++                        raise RuntimeError(
++                            "Disposable provider readiness response limit"
++                        )
++                    data.extend(part)
++                if response.status_code == 200:
++                    return bytes(data)
++        except httpx.HTTPError:
++            pass
++        time.sleep(0.2)
++    raise RuntimeError("Disposable identity HTTPS readiness deadline exceeded")
++
++
++@contextmanager
++def identity_runtime(directory: Path) -> Iterator[Runtime]:
++    """Explicit selection fails when infra absent; clean only verified ownership."""
++    if os.environ.get("RUN_KEYCLOAK_INTEGRATION") != "1":
++        pytest.skip("set RUN_KEYCLOAK_INTEGRATION=1 for actual disposable provider")
++    if not shutil.which("docker"):
++        pytest.fail("Actual Keycloak suite selected but Docker unavailable")
++    for image in (IMAGE, "python:3.13-alpine", "postgres:18.6-alpine"):
++        docker("image", "inspect", image, "--format", "{{.Id}}")
++    owner = "task6-" + secrets.token_hex(8)
++    label = "medical-rag.fixture=" + owner
++    network = owner + "-network"
++    containers = []
++    certificates(directory)
++    realm = "fictional-" + secrets.token_hex(6)
++    client_secret = secrets.token_urlsafe(32)
++    users = {
++        name: {"id": str(uuid4()), "password": secrets.token_urlsafe(24)}
++        for name in (
++            "patient1",
++            "patient2",
++            "disabled",
++            "unprovisioned",
++            "unverified",
++            "admin",
++        )
++    }
++    imported = {
++        "realm": realm,
++        "enabled": True,
++        "sslRequired": "all",
++        "registrationAllowed": False,
++        "resetPasswordAllowed": False,
++        "loginWithEmailAllowed": False,
++        "accessTokenLifespan": 120,
++        "roles": {"realm": [{"name": "admin"}]},
++        "clients": [
++            {
++                "clientId": CLIENT_ID,
++                "secret": client_secret,
++                "protocol": "openid-connect",
++                "publicClient": False,
++                "standardFlowEnabled": True,
++                "implicitFlowEnabled": False,
++                "directAccessGrantsEnabled": False,
++                "serviceAccountsEnabled": False,
++                "redirectUris": [APP_ORIGIN + "/auth/callback"],
++                "webOrigins": [APP_ORIGIN],
++                "protocolMappers": [
++                    {
++                        "name": "fictional-id-token-roles",
++                        "protocol": "openid-connect",
++                        "protocolMapper": "oidc-usermodel-realm-role-mapper",
++                        "config": {
++                            "claim.name": "roles",
++                            "jsonType.label": "String",
++                            "multivalued": "true",
++                            "id.token.claim": "true",
++                            "access.token.claim": "true",
++                        },
++                    }
++                ],
++                "attributes": {
++                    "pkce.code.challenge.method": "S256",
++                    "post.logout.redirect.uris": APP_ORIGIN + "/",
++                    "backchannel.logout.url": "https://collector:8443/capture",
++                    "backchannel.logout.session.required": "true",
++                },
++            }
++        ],
++        "users": [
++            {
++                "id": user["id"],
++                "username": name,
++                "enabled": True,
++                "firstName": "Fictional",
++                "lastName": "Fixture",
++                "email": name + "@invalid.example",
++                "emailVerified": True,
++                "realmRoles": ["admin"],
++                "requiredActions": [],
++                "credentials": [
++                    {"type": "password", "value": user["password"], "temporary": False}
++                ],
++            }
++            for name, user in users.items()
++        ],
++    }
++    (directory / "realm.json").write_text(json.dumps(imported), encoding="utf-8")
++    docker("network", "create", "--label", label, network)
++    try:
++
++        def launch(
++            name: str,
++            image: str,
++            *,
++            options: tuple[str, ...] = (),
++            arguments: tuple[str, ...] = (),
++            ports: tuple[int, ...] = (),
++        ) -> str:
++            """Remember every successfully created, explicitly labeled target."""
++            command = [
++                "run",
++                "-d",
++                "--pull=never",
++                "--name",
++                owner + "-" + name,
++                "--label",
++                label,
++                "--network",
++                network,
++            ]
++            for port in ports:
++                command += ["-p", "127.0.0.1::" + str(port)]
++            container = docker(*command, *options, image, *arguments)
++            containers.append(container)
++            return container
++
++        collector = launch(
++            "collector",
++            "python:3.13-alpine",
++            ports=(8443,),
++            options=(
++                "--network-alias",
++                "collector",
++                "-v",
++                f"{directory}:/fixture:ro",
++                "-v",
++                f"{ROOT / 'tests/fixtures/keycloak_collector.py'}:/collector.py:ro",
++            ),
++            arguments=("python", "-u", "/collector.py"),
++        )
++        collector_port = docker("port", collector, "8443/tcp").rsplit(":", 1)[1]
++        # Test-only dynamic issuer is derived from the loopback listener;
++        # hostname-strict=false is never a production configuration recipe.
++        idp = launch(
++            "idp",
++            IMAGE,
++            ports=(8443,),
++            options=(
++                "-v",
++                f"{directory}:/fixture:ro",
++                "-v",
++                f"{directory / 'realm.json'}:/opt/keycloak/data/import/realm.json:ro",
++            ),
++            arguments=(
++                "start-dev",
++                "--http-enabled=false",
++                "--https-certificate-file=/fixture/server.pem",
++                "--https-certificate-key-file=/fixture/server.key",
++                "--hostname-strict=false",
++                "--truststore-paths=/fixture/ca.pem",
++                "--import-realm",
++                "--log-level=error",
++            ),
++        )
++        idp_port = docker("port", idp, "8443/tcp").rsplit(":", 1)[1]
++        issuer = f"https://localhost:{idp_port}/realms/{realm}"
++        password = secrets.token_urlsafe(24)
++        pg = launch(
++            "pg",
++            "postgres:18.6-alpine",
++            ports=(5432,),
++            options=(
++                "--tmpfs",
++                "/var/lib/postgresql:rw,size=256m",
++                "-e",
++                "POSTGRES_PASSWORD=" + password,
++                "-e",
++                "POSTGRES_INITDB_ARGS=--no-sync",
++            ),
++        )
++        port = docker("port", pg, "5432/tcp").rsplit(":", 1)[1]
++        admin = {
++            "host": "127.0.0.1",
++            "port": int(port),
++            "dbname": "postgres",
++            "user": "postgres",
++            "password": password,
++            "autocommit": True,
++            "connect_timeout": 2,
++        }
++        deadline = time.monotonic() + 30
++        while True:
++            try:
++                db = psycopg.connect(**admin)
++                break
++            except psycopg.OperationalError:
++                if time.monotonic() >= deadline:
++                    raise RuntimeError(
++                        "Disposable provider database readiness deadline exceeded"
++                    ) from None
++                time.sleep(0.2)
++        with db:
++            for migration in sorted((ROOT / "database/migrations").glob("*.sql")):
++                db.execute(migration.read_text(encoding="utf-8"))
++            db.execute(
++                psycopg.sql.SQL(
++                    "CREATE ROLE patient_runtime LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION"
++                ).format(psycopg.sql.Literal(password))
++            )
++            recipe = (ROOT / "database/patient_runtime_grants.sql").read_text(
++                encoding="utf-8"
++            )
++            db.execute(
++                "\n".join(
++                    line for line in recipe.splitlines() if not line.startswith("\\")
++                ).replace(':"runtime_role"', '"patient_runtime"')
++            )
++        with httpx.Client(
++            verify=provider_ssl_context(directory / "ca.pem"),
++            trust_env=False,
++            timeout=3,
++            follow_redirects=False,
++        ) as browser:
++            _ready(browser, f"https://localhost:{collector_port}/")
++            response = _ready(browser, issuer)
++            public = json.loads(response)["public_key"]
++            key = serialization.load_pem_public_key(
++                (
++                    "-----BEGIN PUBLIC KEY-----\n"
++                    + public
++                    + "\n-----END PUBLIC KEY-----\n"
++                ).encode()
++            )
++        yield Runtime(
++            issuer,
++            f"https://localhost:{collector_port}/",
++            directory / "ca.pem",
++            client_secret,
++            users,
++            key,
++            dict(admin, user="patient_runtime", autocommit=False),
++            admin,
++        )
++    finally:
++        for container in reversed(containers):
++            if (
++                docker(
++                    "inspect",
++                    container,
++                    "--format",
++                    '{{index .Config.Labels "medical-rag.fixture"}}',
++                )
++                != owner
++            ):
++                raise RuntimeError("Refusing unowned fixture container cleanup")
++            docker("rm", "-f", container)
++        if (
++            docker(
++                "network",
++                "inspect",
++                network,
++                "--format",
++                '{{index .Labels "medical-rag.fixture"}}',
++            )
++            != owner
++        ):
++            raise RuntimeError("Refusing unowned fixture network cleanup")
++        docker("network", "rm", network)
+
+## tests/keycloak_forms.py (new file)
+
+--- /dev/null
++++ b/tests/keycloak_forms.py
+@@ -0,0 +1,123 @@
++"""Bounded native form driver over real verified HTTPS, not browser E2E."""
++
++from html.parser import HTMLParser
++from urllib.parse import urljoin, urlsplit
++
++import httpx
++
++
++class NativeForm(HTMLParser):
++    """Accept one provider POST form and bounded successful control fields."""
++
++    def __init__(self, html: str, form_id: str | None) -> None:
++        super().__init__(convert_charrefs=True)
++        self.action = None
++        self.fields = {}
++        self._inside = False
++        self._matched = False
++        self._form_id = form_id
++        self.feed(html)
++        self.close()
++
++    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
++        attrs = dict(attrs)
++        if tag == "form" and (
++            self._form_id is None or attrs.get("id") == self._form_id
++        ):
++            if self._matched or attrs.get("method", "get").lower() != "post":
++                raise RuntimeError("Unexpected provider form")
++            self._matched = True
++            self.action, self._inside = attrs.get("action"), True
++        if tag == "input" and self._inside and attrs.get("name"):
++            value = attrs.get("value") or ""
++            if (
++                len(self.fields) >= 32
++                or attrs["name"] in self.fields
++                or len(attrs["name"]) > 256
++                or len(value) > 4096
++            ):
++                raise RuntimeError("Provider form limit")
++            self.fields[attrs["name"]] = value
++
++    def handle_endtag(self, tag: str) -> None:
++        if tag == "form":
++            self._inside = False
++
++
++def _request(
++    browser: httpx.Client, method: str, url: str, **kwargs
++) -> tuple[httpx.Response, bytes]:
++    """Bound bytes while reading, before HTML decoding or parsing."""
++    with browser.stream(method, url, **kwargs) as response:
++        body = bytearray()
++        for chunk in response.iter_bytes():
++            if len(body) + len(chunk) > 131072:
++                raise RuntimeError("Provider page limit")
++            body.extend(chunk)
++        return response, bytes(body)
++
++
++def _page(
++    response: httpx.Response, body: bytes, form_id: str | None = "kc-form-login"
++) -> NativeForm:
++    """Parse only a bounded successful native HTML page."""
++    if response.status_code != 200:
++        raise RuntimeError("Unexpected provider page")
++    return NativeForm(body.decode("utf-8", errors="strict"), form_id)
++
++
++def _action(response: httpx.Response, form: NativeForm) -> str:
++    """Resolve one fixed provider-origin action, never follow external forms."""
++    if not form.action:
++        raise RuntimeError("Provider form missing")
++    action = urljoin(str(response.url), form.action)
++    parsed = urlsplit(action)
++    if (
++        len(action) > 4096
++        or parsed.username
++        or parsed.password
++        or parsed.fragment
++        or parsed[:2] != urlsplit(str(response.url))[:2]
++    ):
++        raise RuntimeError("Provider form origin mismatch")
++    return action
++
++
++def password_redirect(
++    browser: httpx.Client, authorization_url: str, username: str, password: str
++) -> str | None:
++    """Return the real provider redirect only after native password form POST."""
++    response, body = _request(browser, "GET", authorization_url)
++    form = _page(response, body)
++    response, body = _request(
++        browser,
++        "POST",
++        _action(response, form),
++        data=form.fields | {"username": username, "password": password},
++    )
++    if response.status_code == 200:
++        _page(response, body)  # ordinary failed login; no code/session
++        return None
++    if response.status_code != 302 or len(response.headers.get("location", "")) > 4096:
++        raise RuntimeError("Unexpected provider authentication result")
++    return response.headers["location"]
++
++
++def provider_logout(
++    browser: httpx.Client, issuer: str, client_id: str, post_logout: str
++) -> None:
++    response, body = _request(
++        browser,
++        "GET",
++        issuer + "/protocol/openid-connect/logout",
++        params={"client_id": client_id, "post_logout_redirect_uri": post_logout},
++    )
++    form = _page(response, body, form_id=None)
++    response, _ = _request(
++        browser,
++        "POST",
++        _action(response, form),
++        data=form.fields | {"confirmLogout": ""},
++    )
++    if response.status_code not in (200, 302):
++        raise RuntimeError("Provider logout did not complete")
+
+## tests/fixtures/keycloak_collector.py (new file)
+
+--- /dev/null
++++ b/tests/fixtures/keycloak_collector.py
+@@ -0,0 +1,39 @@
++"""Disposable fixture-only TLS backchannel capture; never logs requests."""
++
++import ssl
++from http.server import BaseHTTPRequestHandler, HTTPServer
++
++
++class Collector(BaseHTTPRequestHandler):
++    """Capture at most one bounded form in memory without logging values."""
++
++    captured = b""
++
++    def log_message(self, *args: object) -> None:
++        pass
++
++    def do_POST(self) -> None:
++        """Store the unchanged URL-encoded body without interpreting claims."""
++        size = int(self.headers.get("Content-Length", "0"))
++        if self.path != "/capture" or not 0 < size <= 32768:
++            self.send_error(400)
++            return
++        Collector.captured = self.rfile.read(size)
++        self.send_response(200)
++        self.end_headers()
++
++    def do_GET(self) -> None:
++        """Return the last capture to the fixture operator over verified TLS."""
++        self.send_response(200)
++        self.send_header("Content-Type", "application/x-www-form-urlencoded")
++        self.end_headers()
++        self.wfile.write(Collector.captured)
++
++
++if __name__ == "__main__":
++    server = HTTPServer(("0.0.0.0", 8443), Collector)
++    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    context.minimum_version = ssl.TLSVersion.TLSv1_2
++    context.load_cert_chain("/fixture/server.pem", "/fixture/server.key")
++    server.socket = context.wrap_socket(server.socket, server_side=True)
++    server.serve_forever()
+

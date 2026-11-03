@@ -1,0 +1,2457 @@
+# Task8 actual MFA review package
+
+Base: preTask8 snapshots outputs/actual-mfa-baseline-20261103.
+Head: uncommitted frozen source2026-11-03 16:00+08:00; latest manifest in actual-mfa-report.md.
+No git commit range represents task; HEAD889adac remains historical baseline.
+Full-context four existing files and complete six new source/policy/docs files.
+Brief/report separate inputs; no credentials or generated runtime artifacts.
+
+Files:
+- src/medical_rag/oidc_login.py
+- tests/test_oidc_login.py
+- tests/keycloak_runtime.py
+- tests/keycloak_forms.py
+- tests/keycloak_mfa.py
+- tests/test_keycloak_mfa.py
+- tests/test_keycloak_mfa_support.py
+- tests/test_keycloak_mfa_privacy.py
+- deploy/identity/keycloak-mfa-policy.json
+- deploy/identity/README.md
+
+diff --git a/outputs/actual-mfa-baseline-20261103/src__medical_rag__oidc_login.py b/src/medical_rag/oidc_login.py
+index 6d46a43..61768f2 100644
+--- a/outputs/actual-mfa-baseline-20261103/src__medical_rag__oidc_login.py
++++ b/src/medical_rag/oidc_login.py
+@@ -1,552 +1,554 @@
+ """Experimental, isolated OIDC login application; never mounted on the legacy API.
+ 
+ This provides authorization-code + S256 PKCE, browser-bound one-use PostgreSQL
+ login transactions, ID-token verification, and opaque sessions. It is not a
+ production deployment; login alone is not patient authorization. An institution must
+ independently configure a real provider, approved MFA mapping, keys/rotation,
+ TLS and trusted proxy handling, request limits, database privileges and audit.
+ The signed provider-logout profile requires exact IdP registration/support.
+ Provider tokens are discarded; local account/role/patient
+ provisioning remains a separate trusted process. Existing endpoints/workers
+ stay locked. The returned session identity is a per-operation snapshot, not
+ permission to process patient content or a way to interrupt in-flight work.
+ Pending login state is institution-version-bound, but cannot bind an unknown
+ account's version before the provider reveals its subject. Account disable/
+ re-enable during a pending login still requires an institution-approved policy.
+ Signed provider fences prevent pre-logout authentication from reissuing local
+ authority; they do not interrupt in-flight work or push-clear idle browser UI.
+ 
+ The AES-GCM key must come from institutional secret management, not the DB or
+ clients. Expired login rows require a bounded operational cleanup policy. Do
+ not enable request/response body or callback query logging at any proxy/server;
+ in particular Uvicorn must run with access_log=False/--no-access-log. This app
+ does not configure or override external server/proxy loggers.
+ """
+ 
+ import asyncio
+ import ipaddress
+ import json
+ import re
+ from collections.abc import Callable, Mapping
+ from contextlib import AbstractContextManager, contextmanager
+ from dataclasses import dataclass, field
+ from hashlib import sha256
+ from pathlib import Path
+ from secrets import token_bytes, token_urlsafe
+ from urllib.parse import urlsplit
+ from uuid import UUID
+ 
+ import httpx
+ from authlib.integrations.httpx_client import AsyncOAuth2Client
+ from cryptography.exceptions import InvalidTag
+ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+ from fastapi import FastAPI, Request
+ from fastapi.responses import JSONResponse, RedirectResponse
+ from psycopg import Connection
+ from psycopg.pq import TransactionStatus
+ from starlette.concurrency import run_in_threadpool
+ from starlette.exceptions import HTTPException as StarletteHTTPException
+ 
+ from .access_policy import Principal
+ from .identity_sessions import AuthenticationDenied, IssuedSession, SessionStore
+ from .oidc_identity import InvalidIdentity, OIDCIdentityVerifier
+ from .provider_logout import (
+     InvalidProviderLogout,
+     ProviderLogoutVerifier,
+     read_logout_token,
+ )
+ from .provider_tls import provider_ssl_context
+ from .security_audit import (
+     AuditAction,
+     AuditStore,
+     AuditUnavailable,
+     unavailable_response,
+ )
+ from .signing_keys import SigningKeys
+ 
+ _OPAQUE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+ _LOGIN_COOKIE = "__Host-medical-oidc"
+ _SESSION_COOKIE = "__Host-medical-session"
+ _CSRF_COOKIE = "__Host-medical-csrf"
+ _MAX_TOKEN_RESPONSE = 65536
+ ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
+ 
+ 
+ class InvalidLogin(Exception):
+     """Missing, expired, already consumed or wrong-browser login request."""
+ 
+ 
+ def _https_url(value: object):
+     if (type(value) is not str or "?" in value or "#" in value
+             or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
+         raise ValueError("Invalid trusted OIDC configuration")
+     try:
+         parsed = urlsplit(value)
+         if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                 or parsed.query or parsed.fragment):
+             raise ValueError("Invalid trusted OIDC configuration")
+         _ = parsed.port
+         return parsed
+     except (TypeError, ValueError):
+         raise ValueError("Invalid trusted OIDC configuration") from None
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class LoginConfiguration:
+     """Fixed, trusted institutional settings, never derived from a request."""
+ 
+     issuer: str
+     authorization_endpoint: str
+     token_endpoint: str
+     callback_uri: str
+     client_id: str
+     client_secret: str = field(repr=False)
+     public_key: RSAPublicKey | None = field(repr=False)
+     mfa_acr_values: frozenset[str]
+     max_authentication_age_seconds: int = 600
+     provider_ca_file: Path | None = field(default=None, repr=False)
+     verification_keys: Mapping[str, RSAPublicKey] | None = field(default=None, repr=False)
+ 
+     def __post_init__(self) -> None:
+         keys = SigningKeys(self.public_key, self.verification_keys)
+         object.__setattr__(self, "verification_keys", keys.verification_keys)
+         issuer = _https_url(self.issuer)
+         authorization = _https_url(self.authorization_endpoint)
+         token = _https_url(self.token_endpoint)
+         callback = _https_url(self.callback_uri)
+         if (authorization.netloc != issuer.netloc or token.netloc != issuer.netloc
+                 or not authorization.path.startswith(issuer.path.rstrip("/") + "/")
+                 or not token.path.startswith(issuer.path.rstrip("/") + "/")
+                 or callback.path != "/auth/callback" or type(self.client_secret) is not str
+                 or not self.client_secret or any(ord(char) < 32 for char in self.client_secret)):
+             raise ValueError("Invalid trusted OIDC configuration")
+         OIDCIdentityVerifier(issuer=self.issuer, audience=self.client_id, public_key=self.public_key,
+                              verification_keys=self.verification_keys,
+                              mfa_acr_values=self.mfa_acr_values,
+                              max_authentication_age_seconds=self.max_authentication_age_seconds)
+         if self.provider_ca_file is not None:
+             provider_ssl_context(self.provider_ca_file)
+ 
+     @property
+     def app_origin(self) -> str:
+         parsed = urlsplit(self.callback_uri)
+         return "https://" + parsed.netloc
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class LoginChallenge:
+     state: str = field(repr=False)
+     browser_token: str = field(repr=False)
+     nonce: str = field(repr=False)
+     code_verifier: str = field(repr=False)
+ 
+ 
+ @dataclass(frozen=True, slots=True)
+ class ConsumedLogin:
+     nonce: str = field(repr=False)
+     code_verifier: str = field(repr=False)
+     tenant_version: int
+ 
+ 
+ def _hash(value: object) -> bytes:
+     if type(value) is not str or _OPAQUE.fullmatch(value) is None:
+         raise InvalidLogin()
+     return sha256(value.encode("ascii")).digest()
+ 
+ 
+ class LoginTransactionStore:
+     """Encrypt PKCE material and consume a browser-bound flow exactly once."""
+ 
+     def __init__(self, connection_factory: ConnectionFactory, *, tenant_id: str,
+                  encryption_key: bytes, lifetime_seconds: int = 300) -> None:
+         try:
+             self._tenant = UUID(tenant_id)
+         except (TypeError, ValueError, AttributeError):
+             raise ValueError("Invalid institution configuration") from None
+         if (type(encryption_key) is not bytes or len(encryption_key) != 32
+                 or type(lifetime_seconds) is not int or not 1 <= lifetime_seconds <= 600):
+             raise ValueError("Invalid login storage configuration")
+         self._cipher = AESGCM(encryption_key)
+         self._connection_factory = connection_factory
+         self.lifetime_seconds = lifetime_seconds
+ 
+     @contextmanager
+     def _transaction(self):
+         with self._connection_factory() as connection:
+             if connection.info.transaction_status != TransactionStatus.IDLE:
+                 raise InvalidLogin()
+             with connection.transaction():
+                 connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
+                 connection.execute("SET LOCAL search_path TO pg_catalog")
+                 connection.execute("SET LOCAL lock_timeout = '3s'")
+                 connection.execute("SET LOCAL statement_timeout = '5s'")
+                 if connection.execute("SELECT medical_rag.runtime_role_basic_check() "
+                                       "AND NOT pg_catalog.pg_is_in_recovery()").fetchone() != (True,):
+                     raise InvalidLogin()
+                 yield connection
+ 
+     def create(self) -> LoginChallenge:
+         challenge = LoginChallenge(token_urlsafe(32), token_urlsafe(32), token_urlsafe(32), token_urlsafe(64))
+         digest = _hash(challenge.state)
+         iv = token_bytes(12)
+         payload = json.dumps({"nonce": challenge.nonce, "code_verifier": challenge.code_verifier}).encode("ascii")
+         context = iv + self._cipher.encrypt(iv, payload, self._tenant.bytes + digest)
+         with self._transaction() as connection:
+             row = connection.execute(
+                 "INSERT INTO medical_rag.oidc_login_transactions "
+                 "(tenant_id,state_hash,browser_hash,encrypted_context,tenant_version,expires_at) "
+                 "SELECT t.tenant_id,%s,%s,%s,t.session_version,clock_timestamp()+(%s*interval '1 second') "
+                 "FROM medical_rag.tenants t WHERE t.tenant_id=%s AND t.active RETURNING state_hash",
+                 (digest, _hash(challenge.browser_token), context, self.lifetime_seconds, self._tenant),
+             ).fetchone()
+             if row is None:
+                 raise InvalidLogin()
+         return challenge
+ 
+     def consume(self, state: str, browser_token: str) -> ConsumedLogin:
+         digest, browser = _hash(state), _hash(browser_token)
+         with self._transaction() as connection:
+             # Lock before evaluating time: a waiting statement must not extend
+             # the usable life of a flow whose expiry passed while it waited.
+             if connection.execute(
+                 "SELECT 1 FROM medical_rag.oidc_login_transactions "
+                 "WHERE tenant_id=%s AND state_hash=%s AND browser_hash=%s FOR UPDATE",
+                 (self._tenant, digest, browser),
+             ).fetchone() is None:
+                 raise InvalidLogin()
+             row = connection.execute(
+                 "DELETE FROM medical_rag.oidc_login_transactions f USING medical_rag.tenants t "
+                 "WHERE f.tenant_id=%s AND f.state_hash=%s AND f.browser_hash=%s "
+                 "AND f.expires_at>clock_timestamp() AND f.tenant_id=t.tenant_id AND t.active "
+                 "AND f.tenant_version=t.session_version "
+                 "RETURNING f.encrypted_context,f.tenant_version", (self._tenant, digest, browser),
+             ).fetchone()
+             if row is None:
+                 raise InvalidLogin()
+         # The committed deletion remains final, including on decrypt/provider
+         # failure. Neither a retry nor another worker can reuse this request.
+         try:
+             context = bytes(row[0])
+             values = json.loads(self._cipher.decrypt(context[:12], context[12:], self._tenant.bytes + digest))
+             nonce, verifier = values["nonce"], values["code_verifier"]
+             _hash(nonce)
+             if type(verifier) is not str or re.fullmatch(r"[A-Za-z0-9_-]{86}", verifier) is None:
+                 raise InvalidLogin()
+             return ConsumedLogin(nonce, verifier, row[1])
+         except (InvalidTag, ValueError, TypeError, KeyError, OverflowError, RecursionError):
+             raise InvalidLogin() from None
+ 
+ 
+ class _LimitedStream(httpx.AsyncByteStream):
+     def __init__(self, stream: httpx.AsyncByteStream) -> None:
+         self._stream = stream
+ 
+     async def __aiter__(self):
+         length = 0
+         async for part in self._stream:
+             length += len(part)
+             if length > _MAX_TOKEN_RESPONSE:
+                 raise InvalidLogin()
+             yield part
+ 
+     async def aclose(self) -> None:
+         await self._stream.aclose()
+ 
+ 
+ class _LimitedTransport(httpx.AsyncBaseTransport):
+     def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
+         self._inner = inner
+ 
+     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+         response = await self._inner.handle_async_request(request)
+         # A parseable, signed ID token is not an OAuth success response by
+         # itself. Reject HTTP errors/redirects before Authlib parses the body.
+         if (response.status_code != 200
+                 or response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
+                 or response.headers.get("content-encoding", "identity").lower() != "identity"
+                 or (response.is_stream_consumed and len(response.content) > _MAX_TOKEN_RESPONSE)):
+             await response.aclose()
+             raise InvalidLogin()
+         response.stream = _LimitedStream(response.stream)
+         return response
+ 
+     async def aclose(self) -> None:
+         await self._inner.aclose()
+ 
+ 
+ class OIDCLogin:
+     """A confidential OIDC client, fixed to one institution and provider."""
+ 
+     def __init__(self, config: LoginConfiguration, connection_factory: ConnectionFactory, *, tenant_id: str,
+                  transaction_encryption_key: bytes, transport: httpx.AsyncBaseTransport | None = None) -> None:
+         if type(config) is not LoginConfiguration:
+             raise ValueError("Trusted login configuration is required")
+         self.config = config
+         self.transactions = LoginTransactionStore(connection_factory, tenant_id=tenant_id,
+                                                    encryption_key=transaction_encryption_key)
+         self.sessions = SessionStore(connection_factory, tenant_id=tenant_id)
+         self._verifier = OIDCIdentityVerifier(issuer=config.issuer, audience=config.client_id,
+                                              verification_keys=config.verification_keys,
+                                              public_key=config.public_key, mfa_acr_values=config.mfa_acr_values,
+                                              max_authentication_age_seconds=config.max_authentication_age_seconds)
+         self._test_transport = transport
+         self.provider_logout_verifier = ProviderLogoutVerifier(issuer=config.issuer, audience=config.client_id,
+                                                                verification_keys=config.verification_keys,
+                                                                public_key=config.public_key)
+ 
+     def _client(self) -> AsyncOAuth2Client:
+         transport = self._test_transport or httpx.AsyncHTTPTransport(
+             verify=provider_ssl_context(self.config.provider_ca_file), trust_env=False, retries=0)
+         return AsyncOAuth2Client(
+             client_id=self.config.client_id, client_secret=self.config.client_secret,
+             token_endpoint_auth_method="client_secret_basic", redirect_uri=self.config.callback_uri,
+             scope="openid", code_challenge_method="S256", follow_redirects=False,
+             headers={"Accept-Encoding": "identity"},
+             trust_env=False, timeout=httpx.Timeout(5.0, connect=3.0), transport=_LimitedTransport(transport),
+         )
+ 
+     async def start(self) -> tuple[str, LoginChallenge]:
+         challenge = await run_in_threadpool(self.transactions.create)
+         async with self._client() as client:
++            assurance_request = ({"acr_values": " ".join(sorted(self.config.mfa_acr_values))}
++                                 if self.config.mfa_acr_values else {})
+             url, _ = client.create_authorization_url(
+                 self.config.authorization_endpoint, state=challenge.state, nonce=challenge.nonce,
+                 code_verifier=challenge.code_verifier, max_age=self.config.max_authentication_age_seconds,
++                **assurance_request,
+             )
+         return url, challenge
+ 
+     async def finish(self, *, state: str, browser_token: str, code: str) -> IssuedSession:
+         if type(code) is not str or not 0 < len(code) <= 2048 or any(not 33 <= ord(char) <= 126 for char in code):
+             raise InvalidLogin()
+         flow = await run_in_threadpool(self.transactions.consume, state, browser_token)
+         try:
+             async with asyncio.timeout(10), self._client() as client:
+                 token = await client.fetch_token(
+                     self.config.token_endpoint, grant_type="authorization_code", code=code,
+                     code_verifier=flow.code_verifier,
+                 )
+             if not isinstance(token, dict):
+                 raise InvalidLogin()
+             access_token, token_type, id_token = token.get("access_token"), token.get("token_type"), token.get("id_token")
+             if (type(access_token) is not str or not 0 < len(access_token) <= 16384
+                     or any(not 33 <= ord(char) <= 126 for char in access_token)
+                     or type(token_type) is not str or token_type.lower() != "bearer"
+                     or type(id_token) is not str or not 0 < len(id_token) <= 16384):
+                 raise InvalidLogin()
+             identity = self._verifier.verify(id_token, expected_nonce=flow.nonce)
+         except InvalidIdentity:
+             raise InvalidLogin() from None
+         except Exception:  # noqa: BLE001 - upstream error text is never public
+             # OAuth/provider errors can include credentials and response bodies.
+             raise InvalidLogin() from None
+         return await run_in_threadpool(self.sessions.issue, identity, expected_tenant_version=flow.tenant_version)
+ 
+ 
+ def _cookie(request: Request, name: str) -> str:
+     occurrences = sum(1 for header in request.headers.getlist("cookie") for part in header.split(";")
+                       if part.partition("=")[0].strip() == name)
+     value = request.cookies.get(name)
+     if occurrences != 1 or not value:
+         raise InvalidLogin()
+     return value
+ 
+ 
+ def _failure(status: int) -> JSONResponse:
+     return JSONResponse({"success": False, "data": None,
+                          "error": {"code": "AUTHENTICATION_FAILED" if status != 503 else "AUTHENTICATION_UNAVAILABLE",
+                                    "message": "身份验证失败" if status != 503 else "身份服务暂不可用"}},
+                         status_code=status)
+ 
+ 
+ def _set_cookie(response, name: str, value: str, *, max_age: int | None = None) -> None:
+     response.set_cookie(name, value, max_age=max_age, secure=True, httponly=True, samesite="lax", path="/")
+ 
+ 
+ def _clear_cookie(response, name: str) -> None:
+     response.delete_cookie(name, secure=True, httponly=True, samesite="lax", path="/")
+ 
+ 
+ def _authorization_origin(endpoint: str) -> str:
+     """Serialize one fixed HTTPS CSP source, rejecting source-list injection."""
+     parsed = _https_url(endpoint)
+     host = parsed.hostname
+     try:
+         address = ipaddress.ip_address(host)
+         if getattr(address, "scope_id", None) is not None:
+             raise ValueError("Invalid trusted OIDC configuration")
+         authority = f"[{address}]" if address.version == 6 else str(address)
+     except ValueError:
+         if (not host or len(host) > 253 or any(
+                 re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
+                 for label in host.split("."))):
+             raise ValueError("Invalid trusted OIDC configuration") from None
+         authority = host.lower()
+     if parsed.port is not None:
+         if not 1 <= parsed.port <= 65535:
+             raise ValueError("Invalid trusted OIDC configuration")
+         authority += f":{parsed.port}"
+     return "https://" + authority
+ 
+ 
+ def create_auth_app(login: OIDCLogin, *, patient_html: bool = False, audit: AuditStore | None = None) -> FastAPI:
+     """Reuse auth protections; standalone headless no-audit is experimental only.
+ 
+     The patient factory always supplies its mandatory trusted AuditStore.
+     """
+     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+     origin = login.config.app_origin
+     authority = urlsplit(origin).netloc
+     # Fixed trusted factory choice only; never derive this policy from a request.
+     csp = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+            f"base-uri 'none'; form-action 'self' {_authorization_origin(login.config.authorization_endpoint)}; "
+            "frame-ancestors 'none'" if patient_html
+            else "default-src 'none'; frame-ancestors 'none'")
+ 
+     @app.middleware("http")
+     async def enforce_origin_and_headers(request: Request, call_next):
+         hosts = request.headers.getlist("host")
+         origins = request.headers.getlist("origin")
+         provider_post = request.method == "POST" and request.url.path == "/auth/backchannel-logout"
+         if (request.url.scheme != "https" or len(hosts) != 1 or hosts[0].lower() != authority.lower()
+                 or (request.method not in {"GET", "HEAD", "OPTIONS"} and origins != [origin]
+                     and not (provider_post and not origins))
+                 or (origins and origins != [origin] and request.url.path != "/auth/callback")):
+             response = _failure(403)
+         else:
+             try:
+                 response = await call_next(request)
+             except Exception:  # noqa: BLE001 - prevent sensitive ASGI tracebacks
+                 # Catch before ServerErrorMiddleware can re-raise a storage or
+                 # provider exception to an ASGI server's traceback logger.
+                 response = _failure(503)
+         response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
+                                  "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+                                  "Content-Security-Policy": csp,
+                                  "Cross-Origin-Resource-Policy": "same-origin"})
+         return response
+ 
+     @app.exception_handler(InvalidLogin)
+     @app.exception_handler(AuthenticationDenied)
+     async def deny(request: Request, error: Exception):
+         response = _failure(401)
+         if request.url.path == "/auth/callback":
+             _clear_cookie(response, _LOGIN_COOKIE)
+         return response
+ 
+     @app.exception_handler(Exception)
+     async def unavailable(request: Request, error: Exception):
+         return _failure(503)
+ 
+     @app.exception_handler(StarletteHTTPException)
+     async def framework_error(request: Request, error: StarletteHTTPException):
+         return _failure(error.status_code if error.status_code in {404, 405} else 400)
+ 
+     @app.post("/auth/login")
+     async def begin():
+         url, challenge = await login.start()
+         if audit is not None:
+             await run_in_threadpool(audit.record, AuditAction.LOGIN_START)
+         response = RedirectResponse(url, status_code=303)
+         _set_cookie(response, _LOGIN_COOKIE, challenge.browser_token, max_age=login.transactions.lifetime_seconds)
+         return response
+ 
+     @app.post("/auth/backchannel-logout")
+     async def provider_logout(request: Request):
+         # Deliberately never read cookies or forwarded identity. Only the fixed
+         # pinned-key signature supplies authority, not a local session or role.
+         if audit is None:
+             # Experimental headless auth must not enable unaudited provider
+             # authority. The protected patient factory always supplies audit.
+             return _failure(503)
+         try:
+             token = await read_logout_token(request)
+             event = await run_in_threadpool(login.provider_logout_verifier.verify, token)
+             await run_in_threadpool(login.sessions.provider_logout, event)
+         except InvalidProviderLogout:
+             return _failure(400)
+         except Exception:  # noqa: BLE001 -- static storage failure, no token/SQL logging
+             return _failure(503)
+         await run_in_threadpool(audit.record, AuditAction.PROVIDER_LOGOUT)
+         return JSONResponse({"success": True, "data": None, "error": None})
+ 
+     @app.get("/auth/callback")
+     async def callback(request: Request):
+         pairs = request.query_params.multi_items()
+         allowed = {"state", "code", "iss", "session_state"}
+         if (any(key not in allowed for key, _ in pairs) or len({key for key, _ in pairs}) != len(pairs)
+                 or ("iss" in request.query_params and request.query_params["iss"] != login.config.issuer)):
+             raise InvalidLogin()
+         session = await login.finish(state=request.query_params.get("state"), browser_token=_cookie(request, _LOGIN_COOKIE),
+                                      code=request.query_params.get("code"))
+         try:
+             # Finish replacing the previous session before recording a success.
+             # A storage failure here must not orphan an unexposed new session.
+             try:
+                 previous, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
+             except InvalidLogin:
+                 pass
+             else:
+                 try:
+                     await run_in_threadpool(login.sessions.revoke, previous, csrf_token=csrf)
+                 except AuthenticationDenied:
+                     pass
+             if audit is not None:
+                 # Current local authority, not submitted/provider claims. The
+                 # audit commits before either new browser cookie is emitted.
+                 def record_login() -> None:
+                     with audit.operation(session.token, AuditAction.LOGIN_FINISH,
+                                          mutation=True, csrf_token=session.csrf_token):
+                         pass
+                 await run_in_threadpool(record_login)
+         except Exception:  # revoke unexposed authority before propagating a static failure
+             try:
+                 await run_in_threadpool(login.sessions.revoke, session.token, csrf_token=session.csrf_token)
+             except Exception:  # noqa: BLE001,S110 -- best effort; logging could expose raw session/SQL
+                 pass
+             if audit is not None:
+                 raise AuditUnavailable() from None
+             raise
+         response = RedirectResponse("/", status_code=303)
+         _clear_cookie(response, _LOGIN_COOKIE)
+         _set_cookie(response, _SESSION_COOKIE, session.token)
+         _set_cookie(response, _CSRF_COOKIE, session.csrf_token)
+         return response
+ 
+     @app.get("/auth/session")
+     async def session_info(request: Request):
+         token, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
+         if audit is None:
+             principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=csrf)
+         else:
+             def read_session() -> Principal:
+                 with audit.operation(token, AuditAction.SESSION_READ, mutation=True, csrf_token=csrf) as authorized:
+                     return authorized.principal
+             principal = await run_in_threadpool(read_session)
+         return {"success": True, "data": {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
+                                           "roles": sorted(principal.roles), "csrf_token": csrf}, "error": None}
+ 
+     @app.post("/auth/logout")
+     async def logout(request: Request):
+         try:
+             headers = request.headers.getlist("x-csrf-token")
+             if len(headers) != 1:
+                 return _failure(403)
+             token = _cookie(request, _SESSION_COOKIE)
+             principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=headers[0])
+             await run_in_threadpool(login.sessions.revoke, token, csrf_token=headers[0])
+         except (InvalidLogin, AuthenticationDenied):
+             return _failure(403)
+         response = JSONResponse({"success": True, "data": None, "error": None})
+         if audit is not None:
+             try:
+                 await run_in_threadpool(audit.record, AuditAction.LOGOUT, principal=principal)
+             except AuditUnavailable:
+                 response = unavailable_response()
+         for name in (_SESSION_COOKIE, _CSRF_COOKIE, _LOGIN_COOKIE):
+             _clear_cookie(response, name)
+         return response
+ 
+     if audit is not None:
+         audit.install(app)
+     return app
+-
+
+diff --git a/outputs/actual-mfa-baseline-20261103/tests__test_oidc_login.py b/tests/test_oidc_login.py
+index a3b4f39..83f33eb 100644
+--- a/outputs/actual-mfa-baseline-20261103/tests__test_oidc_login.py
++++ b/tests/test_oidc_login.py
+@@ -1,523 +1,536 @@
+ """Protocol tests use a fake provider, but a real disposable PostgreSQL store."""
+ 
+ import gzip
+ import os
+ import secrets
+ import shutil
+ import subprocess
+ import time
+ from base64 import urlsafe_b64encode
+ from concurrent.futures import ThreadPoolExecutor
+ from datetime import UTC, datetime, timedelta
+ from hashlib import sha256
+ from pathlib import Path
+ from urllib.parse import parse_qs, urlsplit
+ 
+ import httpx
+ import jwt
+ import pytest
+ from cryptography.hazmat.primitives.asymmetric import rsa
+ from fastapi.testclient import TestClient
+ 
+ from medical_rag.oidc_login import (
+     InvalidLogin,
+     LoginConfiguration,
+     LoginTransactionStore,
+     OIDCLogin,
+     create_auth_app,
+ )
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ TENANT = "00000000-0000-0000-0000-000000000101"
+ ACCOUNT = "00000000-0000-0000-0000-000000000201"
+ ISSUER = "https://identity.example.org/realms/hospital"
+ APP_ORIGIN = "https://medical.example.org"
+ 
+ 
+ @pytest.fixture(scope="module")
+ def signing_key():
+     return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+ 
+ 
+ def configuration(key, **overrides):
+     return LoginConfiguration(
+         **({"issuer": ISSUER, "authorization_endpoint": ISSUER + "/protocol/openid-connect/auth",
+             "token_endpoint": ISSUER + "/protocol/openid-connect/token",
+             "callback_uri": APP_ORIGIN + "/auth/callback", "client_id": "medical-rag",
+             "client_secret": "fictional-client-secret-with-32-characters", "public_key": key.public_key(),
+             "mfa_acr_values": frozenset({"urn:hospital:mfa"})} | overrides)
+     )
+ 
+ 
+ @pytest.fixture(scope="module")
+ def database():
+     if os.environ.get("RUN_POSTGRES_INTEGRATION") != "1":
+         pytest.skip("set RUN_POSTGRES_INTEGRATION=1 for disposable PostgreSQL tests")
+     if not shutil.which("docker"):
+         pytest.skip("Docker is required")
+     import psycopg
+     password = secrets.token_urlsafe(24)
+     container = subprocess.run([
+         "docker", "run", "-d", "--rm", "-p", "127.0.0.1::5432",
+         "--tmpfs", "/var/lib/postgresql:rw,size=256m", "-e", f"POSTGRES_PASSWORD={password}",
+         "-e", "POSTGRES_INITDB_ARGS=--no-sync", "postgres:18.6-alpine",
+     ], check=True, capture_output=True, text=True).stdout.strip()
+     try:
+         port = subprocess.run(["docker", "port", container, "5432/tcp"], check=True,
+                               capture_output=True, text=True).stdout.strip().rsplit(":", 1)[1]
+         admin = {"host": "127.0.0.1", "port": int(port), "dbname": "postgres", "user": "postgres",
+                  "password": password, "autocommit": True}
+         for _ in range(100):
+             try:
+                 connection = psycopg.connect(**admin)
+                 break
+             except psycopg.OperationalError:
+                 time.sleep(0.1)
+         else:
+             pytest.fail("disposable PostgreSQL did not become ready")
+         with connection:
+             for name in ("0001_patient_scope.sql", "0002_identity_sessions.sql", "0003_oidc_login.sql",
+                          "0004_patient_access.sql", "0005_security_audit.sql", "0006_provider_logout.sql"):
+                 connection.execute((ROOT / "database/migrations" / name).read_text(encoding="utf-8"))
+             connection.execute(psycopg.sql.SQL("CREATE ROLE login_test LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS")
+                                .format(psycopg.sql.Literal(password)))
+             connection.execute("GRANT USAGE ON SCHEMA medical_rag TO login_test")
+             connection.execute("GRANT SELECT ON medical_rag.tenants, medical_rag.identity_accounts, "
+                                "medical_rag.identity_roles, medical_rag.identity_bindings TO login_test")
+             connection.execute("GRANT SELECT,INSERT,UPDATE ON medical_rag.identity_sessions TO login_test")
+             connection.execute("GRANT SELECT,INSERT,UPDATE,DELETE ON medical_rag.oidc_login_transactions TO login_test")
+             connection.execute("GRANT SELECT ON medical_rag.provider_logout_events TO login_test")
+             connection.execute("GRANT INSERT (tenant_id,issuer,jti_hash,subject_hash,sid_hash,issued_at,expires_at) "
+                                "ON medical_rag.provider_logout_events TO login_test")
+         yield dict(admin, user="login_test", autocommit=False), admin
+     finally:
+         subprocess.run(["docker", "stop", "--time", "1", container], capture_output=True, check=False)
+ 
+ 
+ @pytest.fixture
+ def system(database, signing_key):
+     import psycopg
+     runtime, admin = database
+     with psycopg.connect(**admin) as connection:
+         # Audited patient fixtures add append-only history. Only this disposable
+         # database's owner may disable the truncate guard for per-test reset.
+         audited = connection.execute("SELECT to_regclass('medical_rag.security_audit_events')").fetchone()[0]
+         if audited:
+             connection.execute("ALTER TABLE medical_rag.security_audit_events DISABLE TRIGGER security_audit_no_truncate")
+         connection.execute("ALTER TABLE medical_rag.provider_logout_events DISABLE TRIGGER provider_logout_no_truncate")
+         connection.execute("TRUNCATE medical_rag.oidc_login_transactions, medical_rag.identity_sessions, "
+                            "medical_rag.identity_roles, medical_rag.identity_bindings, "
+                            "medical_rag.identity_accounts, medical_rag.tenants CASCADE")
+         if audited:
+             connection.execute("ALTER TABLE medical_rag.security_audit_events ENABLE TRIGGER security_audit_no_truncate")
+         connection.execute("ALTER TABLE medical_rag.provider_logout_events ENABLE TRIGGER provider_logout_no_truncate")
+         connection.execute("INSERT INTO medical_rag.tenants(tenant_id) VALUES (%s)", (TENANT,))
+         connection.execute("INSERT INTO medical_rag.identity_accounts(tenant_id,account_id,issuer,subject) "
+                            "VALUES (%s,%s,%s,'subject-1')", (TENANT, ACCOUNT, ISSUER))
+         connection.execute("INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'patient')", (TENANT, ACCOUNT))
+     provider = {"nonce": None, "calls": [], "mode": "valid"}
+ 
+     def response(request):
+         provider["calls"].append(request)
+         if provider["mode"] == "raise":
+             raise RuntimeError("provider-private-secret-NEVER-LOG")
+         if provider["mode"] == "reactivate":
+             with psycopg.connect(**admin) as connection:
+                 connection.execute("UPDATE medical_rag.tenants SET active=false")
+                 connection.execute("UPDATE medical_rag.tenants SET active=true")
+         if provider["mode"] == "redirect":
+             return httpx.Response(302, headers={"location": "https://attacker.example/steal"})
+         if provider["mode"] == "error":
+             return httpx.Response(400, json={"error": "fake-token-NEVER-LEAK", "error_description": "private-record"})
+         if provider["mode"] == "large":
+             return httpx.Response(200, content=b"x" * 100000)
+         now = datetime.now(UTC)
+         token = jwt.encode({"iss": ISSUER, "aud": "medical-rag", "sub": "subject-1",
+                             "iat": now, "exp": now + timedelta(minutes=5),
+                             "auth_time": int(now.timestamp()), "acr": "urn:hospital:mfa",
+                             "nonce": provider["nonce"] if provider["mode"] != "nonce" else "wrong-nonce"},
+                            signing_key, algorithm="RS256")
+         payload = {"access_token": "fake-access-NEVER-RETURN", "token_type": "Bearer",
+                    "refresh_token": "fake-refresh-NEVER-RETURN", "id_token": token}
+         mutations = {
+             "missing_access": ("access_token", None), "empty_access": ("access_token", ""),
+             "nonstring_access": ("access_token", {"secret": "fake-access-NEVER-RETURN"}),
+             "missing_type": ("token_type", None), "empty_type": ("token_type", ""),
+             "wrong_type": ("token_type", "MAC"), "missing_id": ("id_token", None),
+             "empty_id": ("id_token", ""),
+         }
+         if provider["mode"] in mutations:
+             field, value = mutations[provider["mode"]]
+             if value is None:
+                 del payload[field]
+             else:
+                 payload[field] = value
+         if provider["mode"] == "non_json":
+             import json
+             return httpx.Response(200, content=json.dumps(payload).encode(), headers={"Content-Type": "text/plain"})
+         if provider["mode"].startswith("valid_token_status_"):
+             status = int(provider["mode"].rsplit("_", 1)[1])
+             headers = {"Location": "https://attacker.example/steal"} if status == 302 else {}
+             result = httpx.Response(status, json=payload, headers=headers)
+             provider["non_success_response"] = result
+             return result
+         if provider["mode"] in {"large_valid", "large_stream", "compressed"}:
+             payload["padding"] = "x" * 100000
+         if provider["mode"] == "large_stream":
+             import json
+             body = json.dumps(payload).encode()
+             class ResponseStream(httpx.AsyncByteStream):
+                 async def __aiter__(self):
+                     for index in range(0, len(body), 1000):
+                         yield body[index:index + 1000]
+             return httpx.Response(200, stream=ResponseStream(), headers={"Content-Type": "application/json"})
+         if provider["mode"] == "compressed":
+             import json
+             return httpx.Response(200, content=gzip.compress(json.dumps(payload).encode()),
+                                   headers={"Content-Encoding": "gzip", "Content-Type": "application/json"})
+         return httpx.Response(200, json=payload)
+ 
+     login = OIDCLogin(configuration(signing_key), lambda: psycopg.connect(**runtime), tenant_id=TENANT,
+                       transaction_encryption_key=secrets.token_bytes(32), transport=httpx.MockTransport(response))
+     app = create_auth_app(login)
+     with TestClient(app, base_url=APP_ORIGIN, headers={}) as client:
+         yield client, login, provider, admin
+ 
+ 
+ def start(system):
+     client, _, provider, _ = system
+     response = client.post("/auth/login", headers={"Origin": APP_ORIGIN}, follow_redirects=False)
+     assert response.status_code == 303
+     query = parse_qs(urlsplit(response.headers["location"]).query)
+     provider["nonce"] = query["nonce"][0]
+     return response, query
+ 
+ 
+ @pytest.mark.integration
+ def test_login_uses_fixed_endpoints_pkce_and_secure_cookie(system):
+     response, query = start(system)
+     assert urlsplit(response.headers["location"]).path == "/realms/hospital/protocol/openid-connect/auth"
+     assert query["response_type"] == ["code"] and query["scope"] == ["openid"]
+     assert query["code_challenge_method"] == ["S256"]
+     assert query["redirect_uri"] == [APP_ORIGIN + "/auth/callback"]
+     assert query["max_age"] == ["600"]
+     assert query["state"] != query["nonce"]
+     assert "code_verifier" not in query and "client_secret" not in query
+     cookie = response.headers["set-cookie"]
+     assert cookie.startswith("__Host-medical-oidc=")
+     assert all(flag in cookie.lower() for flag in ("secure", "httponly", "samesite=lax", "path=/"))
+     assert "domain=" not in cookie.lower()
+ 
+ 
++@pytest.mark.integration
++@pytest.mark.parametrize("accepted", [frozenset({"urn:z:mfa", "urn:a:mfa"}), frozenset()])
++def test_login_requests_only_sorted_trusted_nonessential_acr(request, accepted):
++    from dataclasses import replace
++
++    system = request.getfixturevalue("system")
++    system[1].config = replace(system[1].config, mfa_acr_values=accepted)
++    _, query = start(system)
++    request_matches = query.get("acr_values") == ([" ".join(sorted(accepted))] if accepted else None)
++    assert request_matches, "Trusted ACR request must be sorted or omitted when empty"
++    nonessential = "claims" not in query
++    assert nonessential, "ACR request must not require an essential claim"
++
++
+ @pytest.mark.integration
+ def test_callback_verifies_identity_issues_session_and_never_returns_provider_tokens(system, caplog):
+     client, login, provider, _ = system
+     _, query = start(system)
+     response = client.get("/auth/callback", params={"code": "one-use-code", "state": query["state"][0], "iss": ISSUER},
+                           follow_redirects=False)
+     assert response.status_code == 303 and response.headers["location"] == "/"
+     assert len(provider["calls"]) == 1
+     request = provider["calls"][0]
+     form = parse_qs(request.content.decode())
+     assert form["grant_type"] == ["authorization_code"]
+     assert form["code"] == ["one-use-code"] and len(form["code_verifier"][0]) >= 43
+     assert form["redirect_uri"] == [APP_ORIGIN + "/auth/callback"]
+     challenge = urlsafe_b64encode(sha256(form["code_verifier"][0].encode("ascii")).digest()).rstrip(b"=").decode()
+     assert query["code_challenge"] == [challenge]
+     assert request.headers["accept-encoding"] == "identity"
+     session = client.cookies.get("__Host-medical-session")
+     assert login.sessions.authenticate(session).user_id == ACCOUNT
+     for cookie in response.headers.get_list("set-cookie"):
+         assert "httponly" in cookie.lower() and "secure" in cookie.lower()
+         assert "domain=" not in cookie.lower()
+     assert "fake-access-NEVER-RETURN" not in response.text + caplog.text
+     assert "fake-refresh-NEVER-RETURN" not in response.text + caplog.text
+     assert form["code_verifier"][0] not in caplog.text
+ 
+ 
+ @pytest.mark.integration
+ def test_callback_is_browser_bound_single_use_and_rejects_replay(system):
+     client, _, provider, _ = system
+     _, query = start(system)
+     state = query["state"][0]
+     cookie = client.cookies.get("__Host-medical-oidc")
+     client.cookies.clear()
+     assert client.get("/auth/callback", params={"code": "code", "state": state}).status_code == 401
+     assert provider["calls"] == []
+     client.cookies.set("__Host-medical-oidc", cookie)
+     assert client.get("/auth/callback", params={"code": "code", "state": state}, follow_redirects=False).status_code == 303
+     client.cookies.set("__Host-medical-oidc", cookie)
+     assert client.get("/auth/callback", params={"code": "code", "state": state}).status_code == 401
+     assert len(provider["calls"]) == 1
+ 
+ 
+ @pytest.mark.integration
+ def test_reauthentication_rotates_session_and_revokes_previous_session(system):
+     from medical_rag.identity_sessions import AuthenticationDenied
+ 
+     client, login, _, _ = system
+     _, first = start(system)
+     assert client.get("/auth/callback", params={"code": "first", "state": first["state"][0]},
+                       follow_redirects=False).status_code == 303
+     old = client.cookies.get("__Host-medical-session")
+     assert login.sessions.authenticate(old).user_id == ACCOUNT
+     _, second = start(system)
+     assert client.get("/auth/callback", params={"code": "second", "state": second["state"][0]},
+                       follow_redirects=False).status_code == 303
+     new = client.cookies.get("__Host-medical-session")
+     assert new != old
+     assert login.sessions.authenticate(new).user_id == ACCOUNT
+     with pytest.raises(AuthenticationDenied):
+         login.sessions.authenticate(old)
+ 
+ 
+ @pytest.mark.integration
+ def test_duplicate_session_cookies_are_rejected(system):
+     client, login, _, _ = system
+     _, query = start(system)
+     assert client.get("/auth/callback", params={"code": "code", "state": query["state"][0]},
+                       follow_redirects=False).status_code == 303
+     token = client.cookies.get("__Host-medical-session")
+     csrf = client.cookies.get("__Host-medical-csrf")
+     cookies = f"__Host-medical-session={token}; __Host-medical-session={token}; __Host-medical-csrf={csrf}"
+     response = client.get("/auth/session", headers={"Cookie": cookies})
+     assert response.status_code == 401
+     assert login.sessions.authenticate(token).user_id == ACCOUNT
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("mode", ["nonce", "error", "redirect", "large", "large_valid", "large_stream", "compressed", "raise",
+                                   "missing_access", "empty_access", "nonstring_access", "missing_type", "empty_type",
+                                   "wrong_type", "missing_id", "empty_id", "non_json"])
+ def test_provider_failures_are_generic_terminal_and_never_create_session(system, mode, caplog):
+     import psycopg
+     client, _, provider, admin = system
+     _, query = start(system)
+     browser = client.cookies.get("__Host-medical-oidc")
+     provider["mode"] = mode
+     response = client.get("/auth/callback", params={"code": "code", "state": query["state"][0]}, follow_redirects=False)
+     assert response.status_code == 401
+     assert response.json()["success"] is False
+     assert not client.cookies.get("__Host-medical-session")
+     assert len(provider["calls"]) == 1
+     assert "fake-token-NEVER-LEAK" not in response.text + caplog.text
+     assert "private-record" not in response.text + caplog.text
+     assert "provider-private-secret-NEVER-LOG" not in response.text + caplog.text
+     with psycopg.connect(**admin) as connection:
+         assert connection.execute("SELECT count(*) FROM medical_rag.identity_sessions").fetchone()[0] == 0
+         assert connection.execute("SELECT count(*) FROM medical_rag.oidc_login_transactions").fetchone()[0] == 0
+     client.cookies.set("__Host-medical-oidc", browser)
+     assert client.get("/auth/callback", params={"code": "code", "state": query["state"][0]}, follow_redirects=False).status_code == 401
+     assert len(provider["calls"]) == 1
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("status", [302, 400, 401])
+ def test_valid_id_token_in_non_200_response_is_rejected_and_flow_stays_consumed(system, status, caplog):
+     import psycopg
+     client, _, provider, admin = system
+     _, query = start(system)
+     browser = client.cookies.get("__Host-medical-oidc")
+     provider["mode"] = f"valid_token_status_{status}"
+     callback = {"code": "one-use-code", "state": query["state"][0]}
+     response = client.get("/auth/callback", params=callback, follow_redirects=False)
+     assert response.status_code == 401
+     assert response.json()["success"] is False
+     assert not client.cookies.get("__Host-medical-session")
+     assert provider["non_success_response"].is_closed
+     with psycopg.connect(**admin) as connection:
+         assert connection.execute("SELECT count(*) FROM medical_rag.identity_sessions").fetchone()[0] == 0
+         assert connection.execute("SELECT count(*) FROM medical_rag.oidc_login_transactions").fetchone()[0] == 0
+     # Restore the browser proof so this specifically checks durable consumption,
+     # rather than being rejected only because the failure cleared its cookie.
+     client.cookies.set("__Host-medical-oidc", browser)
+     assert client.get("/auth/callback", params=callback, follow_redirects=False).status_code == 401
+     assert len(provider["calls"]) == 1
+     assert "fake-access-NEVER-RETURN" not in response.text + caplog.text
+     assert "fake-refresh-NEVER-RETURN" not in response.text + caplog.text
+ 
+ 
+ @pytest.mark.integration
+ def test_logout_requires_session_bound_csrf_and_origin_and_revokes(system):
+     client, login, _, _ = system
+     _, query = start(system)
+     client.get("/auth/callback", params={"code": "code", "state": query["state"][0]}, follow_redirects=False)
+     session_token = client.cookies.get("__Host-medical-session")
+     info = client.get("/auth/session")
+     assert info.status_code == 200 and info.json()["data"]["user_id"] == ACCOUNT
+     csrf = info.json()["data"]["csrf_token"]
+     assert client.post("/auth/logout", headers={"Origin": APP_ORIGIN}).status_code == 403
+     assert client.post("/auth/logout", headers={"Origin": "https://attacker.example", "X-CSRF-Token": csrf}).status_code == 403
+     assert client.post("/auth/logout", headers={"Origin": APP_ORIGIN, "X-CSRF-Token": csrf}).status_code == 200
+     from medical_rag.identity_sessions import AuthenticationDenied
+     with pytest.raises(AuthenticationDenied):
+         login.sessions.authenticate(session_token)
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("query", ["state=x&state=y&code=x", "state=x&code=x&code=y", "state=x&code=x&id_token=evil", "state=x&code=x&iss=https://evil.example"])
+ def test_malformed_callback_never_contacts_token_endpoint(system, query):
+     client, _, provider, _ = system
+     start(system)
+     assert client.get("/auth/callback?" + query).status_code == 401
+     assert provider["calls"] == []
+ 
+ 
+ @pytest.mark.integration
+ def test_expired_login_transaction_and_stored_secrets_are_protected(system, database):
+     import psycopg
+     client, login, _, admin = system
+     _, query = start(system)
+     browser = client.cookies.get("__Host-medical-oidc")
+     with psycopg.connect(**admin) as connection:
+         stored = repr(connection.execute("SELECT * FROM medical_rag.oidc_login_transactions").fetchall())
+         assert query["state"][0] not in stored and query["nonce"][0] not in stored and browser not in stored
+         connection.execute("UPDATE medical_rag.oidc_login_transactions SET expires_at=clock_timestamp()-interval '1 second'")
+     assert client.get("/auth/callback", params={"code": "code", "state": query["state"][0]}).status_code == 401
+     assert login.config.client_secret not in repr(login.config)
+ 
+ 
+ @pytest.mark.integration
+ def test_tenant_disable_and_reenable_cannot_revive_pending_login(system):
+     import psycopg
+     client, _, provider, admin = system
+     _, query = start(system)
+     with psycopg.connect(**admin) as connection:
+         connection.execute("UPDATE medical_rag.tenants SET active=false")
+         connection.execute("UPDATE medical_rag.tenants SET active=true")
+     assert client.get("/auth/callback", params={"code": "code", "state": query["state"][0]}).status_code == 401
+     assert provider["calls"] == []
+ 
+ 
+ @pytest.mark.integration
+ def test_tenant_disable_and_reenable_during_token_exchange_cannot_issue_session(system):
+     client, _, provider, _ = system
+     _, query = start(system)
+     provider["mode"] = "reactivate"
+     response = client.get("/auth/callback", params={"code": "code", "state": query["state"][0]}, follow_redirects=False)
+     assert response.status_code == 401
+     assert not client.cookies.get("__Host-medical-session")
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("version", [True, "0", -1, 2**63])
+ def test_session_issuance_rejects_malformed_trusted_epoch(system, version):
+     from medical_rag.identity_sessions import AuthenticationDenied
+     from medical_rag.oidc_identity import VerifiedIdentity
+     _, login, _, _ = system
+     with pytest.raises(AuthenticationDenied):
+         login.sessions.issue(VerifiedIdentity(ISSUER, "subject-1", True), expected_tenant_version=version)
+ 
+ 
+ @pytest.mark.integration
+ def test_not_found_errors_use_the_api_envelope(system):
+     client, _, _, _ = system
+     response = client.get("/conversations")
+     assert response.status_code == 404
+     assert response.json()["success"] is False
+     assert response.json()["data"] is None and "error" in response.json()
+ 
+ 
+ @pytest.mark.integration
+ def test_unexpected_storage_exception_is_not_reraised_to_asgi_or_logged(system, monkeypatch, caplog):
+     client, login, _, _ = system
+     def fail():
+         raise RuntimeError("fictional-private-record-NEVER-LOG")
+     monkeypatch.setattr(login.transactions, "create", fail)
+     # TestClient re-raises unhandled ASGI errors by default. A fixed response
+     # alone is insufficient if ServerErrorMiddleware then logs the traceback.
+     response = client.post("/auth/login", headers={"Origin": APP_ORIGIN})
+     assert response.status_code == 503
+     assert "fictional-private-record-NEVER-LOG" not in response.text + caplog.text
+ 
+ 
+ @pytest.mark.integration
+ def test_consumption_is_atomic_across_workers(system, database):
+     import psycopg
+     _, _, _, _ = system
+     runtime, _ = database
+     key = secrets.token_bytes(32)
+     first = LoginTransactionStore(lambda: psycopg.connect(**runtime), tenant_id=TENANT, encryption_key=key)
+     challenge = first.create()
+     other = LoginTransactionStore(lambda: psycopg.connect(**runtime), tenant_id=TENANT,
+                                   encryption_key=key)
+     def consume(store):
+         try:
+             store.consume(challenge.state, challenge.browser_token)
+             return True
+         except InvalidLogin:
+             return False
+     with ThreadPoolExecutor(max_workers=2) as executor:
+         results = list(executor.map(consume, (first, other)))
+     assert sorted(results) == [False, True]
+ 
+ 
+ @pytest.mark.integration
+ def test_expiry_is_rechecked_after_waiting_for_login_row_lock(system, database):
+     import psycopg
+     _, _, _, admin = system
+     runtime, _ = database
+     key = secrets.token_bytes(32)
+     store = LoginTransactionStore(lambda: psycopg.connect(**runtime), tenant_id=TENANT, encryption_key=key)
+     challenge = store.create()
+     app_name = "oidc-lock-" + secrets.token_hex(8)
+     waiting = LoginTransactionStore(lambda: psycopg.connect(**dict(runtime, application_name=app_name)),
+                                     tenant_id=TENANT, encryption_key=key)
+     with psycopg.connect(**admin) as connection:
+         connection.execute("UPDATE medical_rag.oidc_login_transactions SET expires_at=clock_timestamp()+interval '2 seconds'")
+     with psycopg.connect(**dict(admin, autocommit=False)) as locker:
+         locker.execute("SELECT state_hash FROM medical_rag.oidc_login_transactions FOR UPDATE")
+         with ThreadPoolExecutor(max_workers=1) as executor:
+             pending = executor.submit(waiting.consume, challenge.state, challenge.browser_token)
+             try:
+                 deadline = time.monotonic() + 2
+                 with psycopg.connect(**admin) as observer:
+                     while time.monotonic() < deadline:
+                         row = observer.execute("SELECT wait_event_type FROM pg_catalog.pg_stat_activity WHERE application_name=%s",
+                                                (app_name,)).fetchone()
+                         if row and row[0] == "Lock":
+                             break
+                         time.sleep(0.03)
+                     else:
+                         pytest.fail("login consumption did not wait for row lock")
+                 time.sleep(2.1)
+             finally:
+                 locker.commit()
+             with pytest.raises(InvalidLogin):
+                 pending.result(timeout=5)
+ 
+ 
+ @pytest.mark.integration
+ def test_corrupted_encrypted_context_is_rejected_and_stays_consumed(system):
+     import psycopg
+     _, login, _, admin = system
+     challenge = login.transactions.create()
+     with psycopg.connect(**admin) as connection:
+         stored = repr(connection.execute("SELECT * FROM medical_rag.oidc_login_transactions").fetchall())
+         assert challenge.code_verifier not in stored and challenge.nonce not in stored
+         connection.execute("UPDATE medical_rag.oidc_login_transactions SET encrypted_context=%s", (b"corrupt",))
+     for _ in range(2):
+         with pytest.raises(InvalidLogin):
+             login.transactions.consume(challenge.state, challenge.browser_token)
+     with psycopg.connect(**admin) as connection:
+         assert connection.execute("SELECT count(*) FROM medical_rag.oidc_login_transactions").fetchone()[0] == 0
+ 
+ 
+ @pytest.mark.parametrize("field,value", [("issuer", "http://identity.example.org"),
+     ("token_endpoint", "https://evil.example/token"), ("authorization_endpoint", ISSUER + "/auth?next=evil"),
+     ("callback_uri", APP_ORIGIN + "/auth/callback?next=evil"), ("callback_uri", "http://medical.example.org/auth/callback"),
+     ("token_endpoint", ISSUER + "/token?"), ("issuer", ISSUER + "#")])
+ def test_untrusted_or_ambiguous_configuration_rejected(signing_key, field, value):
+     with pytest.raises(ValueError):
+         configuration(signing_key, **{field: value})
+ 
+ 
+ @pytest.mark.integration
+ def test_origin_and_host_cannot_change_trusted_login_configuration(system):
+     client, _, provider, _ = system
+     assert client.post("/auth/login", headers={"Origin": "https://evil.example"}).status_code == 403
+     assert client.post("/auth/login", headers={"Origin": APP_ORIGIN, "Host": "evil.example"}).status_code == 403
+     assert client.post("/auth/login").status_code == 403
+     assert client.get("/conversations").status_code == 404
+     assert provider["calls"] == []
+-
+
+diff --git a/outputs/actual-mfa-baseline-20261103/tests__keycloak_runtime.py b/tests/keycloak_runtime.py
+index 969011a..ca648a4 100644
+--- a/outputs/actual-mfa-baseline-20261103/tests__keycloak_runtime.py
++++ b/tests/keycloak_runtime.py
+@@ -1,459 +1,460 @@
+ """Owned, disposable official Keycloak HTTPS + collector + PostgreSQL fixture."""
+ 
+ import ipaddress
+ import json
+ import os
+ import secrets
+ import shutil
+ import subprocess
+ import sys
+ import time
+-from collections.abc import Iterator
++from collections.abc import Callable, Iterator
+ from contextlib import contextmanager
+ from dataclasses import dataclass, field
+ from datetime import UTC, datetime, timedelta
+ from pathlib import Path
+ from uuid import uuid4
+ 
+ import httpx
+ import psycopg
+ import pytest
+ from cryptography import x509
+ from cryptography.hazmat.primitives import hashes, serialization
+ from cryptography.hazmat.primitives.asymmetric import rsa
+ from cryptography.x509.oid import NameOID
+ 
+ from medical_rag.provider_tls import provider_ssl_context
+ 
+ IMAGE = "quay.io/keycloak/keycloak:26.8.1@sha256:3f3c5f8e03c614774b4bd9173b88391fefa4153bfc010d8012d59ad825377332"
+ ROOT = Path(__file__).resolve().parents[1]
+ APP_ORIGIN = "https://medical.example.org"
+ CLIENT_ID = "medical-rag"
+ 
+ 
+ def docker(*args: str) -> str:
+     """Keep credential-bearing command errors and daemon output private."""
+     try:
+         result = subprocess.run(
+             ["docker", *args], capture_output=True, text=True, timeout=30, check=False
+         )
+     except (OSError, subprocess.SubprocessError):
+         raise RuntimeError(
+             "Disposable identity infrastructure command failed"
+         ) from None
+     if result.returncode:
+         raise RuntimeError("Disposable identity infrastructure command failed")
+     return result.stdout.strip()
+ 
+ 
+ def import_realm(container: str, payload: bytes) -> None:
+     """Bound credentials in stdin into owned container tmpfs, never host files."""
+     if type(payload) is not bytes or not 0 < len(payload) <= 65536 or b"\n" in payload:
+         raise RuntimeError("Disposable identity import failed")
+     try:
+         result = subprocess.run(
+             ["docker", "exec", "-i", container, "/bin/bash", "-c",
+              ('umask 077; IFS= read -r payload && printf \'%s\' "$payload" > '
+              '/opt/keycloak/data/import/realm.pending && mv '
+              '/opt/keycloak/data/import/realm.pending /opt/keycloak/data/import/realm.json')],
+             input=payload + b"\n", capture_output=True, timeout=30, check=False,
+         )
+         if result.returncode:
+             raise RuntimeError()
+     except (OSError, subprocess.SubprocessError, RuntimeError):
+         raise RuntimeError("Disposable identity import failed") from None
+ 
+ 
+ def certificates(directory: Path) -> None:
+     """Generate fixture CA/server certs, never upstream identity signatures."""
+     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+     name = x509.Name(
+         [x509.NameAttribute(NameOID.COMMON_NAME, "Fictional disposable CA")]
+     )
+     now = datetime.now(UTC)
+     ca = (
+         x509.CertificateBuilder()
+         .subject_name(name)
+         .issuer_name(name)
+         .public_key(ca_key.public_key())
+         .serial_number(x509.random_serial_number())
+         .not_valid_before(now - timedelta(minutes=1))
+         .not_valid_after(now + timedelta(days=1))
+         .add_extension(x509.BasicConstraints(ca=True, path_length=0), True)
+         .add_extension(
+             x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+             True,
+         )
+         .sign(ca_key, hashes.SHA256())
+     )
+     cert = (
+         x509.CertificateBuilder()
+         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")]))
+         .issuer_name(name)
+         .public_key(key.public_key())
+         .serial_number(x509.random_serial_number())
+         .not_valid_before(now - timedelta(minutes=1))
+         .not_valid_after(now + timedelta(days=1))
+         .add_extension(x509.BasicConstraints(ca=False, path_length=None), True)
+         .add_extension(
+             x509.SubjectAlternativeName(
+                 [
+                     x509.DNSName("localhost"),
+                     x509.DNSName("collector"),
+                     x509.IPAddress(ipaddress.ip_address("127.0.0.1")),
+                 ]
+             ),
+             False,
+         )
+         .sign(ca_key, hashes.SHA256())
+     )
+     (directory / "ca.pem").write_bytes(ca.public_bytes(serialization.Encoding.PEM))
+     (directory / "server.pem").write_bytes(
+         cert.public_bytes(serialization.Encoding.PEM)
+     )
+     (directory / "server.key").write_bytes(
+         key.private_bytes(
+             serialization.Encoding.PEM,
+             serialization.PrivateFormat.PKCS8,
+             serialization.NoEncryption(),
+         )
+     )
+ 
+ 
+ @dataclass(repr=False)
+ class Runtime:
+     """Private fixture handles; no credentials or upstream values in repr."""
+ 
+     issuer: str
+     collector_url: str
+     ca_file: Path
+     client_secret: str = field(repr=False)
+     users: dict = field(repr=False)
+     public_key: object = field(repr=False)
+     database: dict = field(repr=False)
+     admin: dict = field(repr=False)
+     verification_keys: dict = field(default_factory=dict, repr=False)
+     operator: dict = field(default_factory=dict, repr=False)
+ 
+     def browser(self) -> httpx.Client:
+         """Use the fixture CA with real HTTPX sockets and bounded deadlines."""
+         return httpx.Client(
+             verify=provider_ssl_context(self.ca_file),
+             trust_env=False,
+             timeout=httpx.Timeout(5, connect=2),
+             follow_redirects=False,
+             headers={"Accept-Encoding": "identity"},
+         )
+ 
+ 
+ def _ready(browser: httpx.Client, url: str, seconds: int = 90) -> bytes:
+     """Bound readiness duration and response bytes before parsing."""
+     deadline = time.monotonic() + seconds
+     while time.monotonic() < deadline:
+         try:
+             with browser.stream("GET", url) as response:
+                 data = bytearray()
+                 for part in response.iter_bytes():
+                     if len(data) + len(part) > 65536:
+                         raise RuntimeError(
+                             "Disposable provider readiness response limit"
+                         )
+                     data.extend(part)
+                 if response.status_code == 200:
+                     return bytes(data)
+         except httpx.HTTPError:
+             pass
+         time.sleep(0.2)
+     raise RuntimeError("Disposable identity HTTPS readiness deadline exceeded")
+ 
+ 
+ def cleanup_owned(containers: list[str], network: str, owner: str,
+                   original: BaseException | None) -> None:
+     """Attempt every separate target, never delete on failed ownership proof."""
+     failed = False
+     for kind, target in [("container", item) for item in reversed(containers)] + [("network", network)]:
+         try:
+             inspect = (("inspect", target, "--format", '{{index .Config.Labels "medical-rag.fixture"}}')
+                        if kind == "container" else
+                        ("network", "inspect", target, "--format", '{{index .Labels "medical-rag.fixture"}}'))
+             if docker(*inspect) != owner:
+                 raise RuntimeError()
+             docker(*(("rm", "-f", target) if kind == "container" else ("network", "rm", target)))
+         except Exception:  # noqa: BLE001 -- daemon/credential context must stay private
+             failed = True
+     if failed:
+         if original is not None:
+             original.add_note("Disposable identity cleanup failed")
+         else:
+             raise RuntimeError("Disposable identity cleanup failed") from None
+ 
+ 
+ @contextmanager
+-def identity_runtime(directory: Path) -> Iterator[Runtime]:
++def identity_runtime(directory: Path, *, realm_transform: Callable[[dict, dict], None] | None = None) -> Iterator[Runtime]:
+     """Explicit selection fails when infra absent; clean only verified ownership."""
+     if os.environ.get("RUN_KEYCLOAK_INTEGRATION") != "1":
+         pytest.skip("set RUN_KEYCLOAK_INTEGRATION=1 for actual disposable provider")
+     if not shutil.which("docker"):
+         pytest.fail("Actual Keycloak suite selected but Docker unavailable")
+     for image in (IMAGE, "python:3.13-alpine", "postgres:18.6-alpine"):
+         docker("image", "inspect", image, "--format", "{{.Id}}")
+     owner = "task6-" + secrets.token_hex(8)
+     label = "medical-rag.fixture=" + owner
+     network = owner + "-network"
+     containers = []
+     certificates(directory)
+     realm = "fictional-" + secrets.token_hex(6)
+     client_secret = secrets.token_urlsafe(32)
+     operator = {"id": str(uuid4()), "username": "fixture-operator",
+                 "password": secrets.token_urlsafe(24), "client_secret": secrets.token_urlsafe(32)}
+     users = {
+         name: {"id": str(uuid4()), "password": secrets.token_urlsafe(24)}
+         for name in (
+             "patient1",
+             "patient2",
+             "disabled",
+             "unprovisioned",
+             "unverified",
+             "admin",
+         )
+     }
+     imported = {
+         "id": realm,
+         "realm": realm,
+         "enabled": True,
+         "sslRequired": "all",
+         "registrationAllowed": False,
+         "resetPasswordAllowed": False,
+         "loginWithEmailAllowed": False,
+         "accessTokenLifespan": 120,
+         "roles": {"realm": [{"name": "admin"}]},
+         "clients": [
+             {"clientId": "fixture-operator", "secret": operator["client_secret"],
+              "protocol": "openid-connect", "publicClient": False,
+              "standardFlowEnabled": True, "implicitFlowEnabled": False,
+              "directAccessGrantsEnabled": False, "serviceAccountsEnabled": False,
+              "redirectUris": ["https://fixture-operator.invalid/callback"],
+              "attributes": {"pkce.code.challenge.method": "S256"}},
+             {
+                 "clientId": CLIENT_ID,
+                 "secret": client_secret,
+                 "protocol": "openid-connect",
+                 "publicClient": False,
+                 "standardFlowEnabled": True,
+                 "implicitFlowEnabled": False,
+                 "directAccessGrantsEnabled": False,
+                 "serviceAccountsEnabled": False,
+                 "redirectUris": [APP_ORIGIN + "/auth/callback"],
+                 "webOrigins": [APP_ORIGIN],
+                 "protocolMappers": [
+                     {
+                         "name": "fictional-id-token-roles",
+                         "protocol": "openid-connect",
+                         "protocolMapper": "oidc-usermodel-realm-role-mapper",
+                         "config": {
+                             "claim.name": "roles",
+                             "jsonType.label": "String",
+                             "multivalued": "true",
+                             "id.token.claim": "true",
+                             "access.token.claim": "true",
+                         },
+                     }
+                 ],
+                 "attributes": {
+                     "pkce.code.challenge.method": "S256",
+                     "post.logout.redirect.uris": APP_ORIGIN + "/",
+                     "backchannel.logout.url": "https://collector:8443/capture",
+                     "backchannel.logout.session.required": "true",
+                 },
+             }
+         ],
+         "users": [
+             {"id": operator["id"], "username": operator["username"], "enabled": True,
+              "firstName": "Fictional", "lastName": "Operator", "emailVerified": True,
+              "email": "operator@invalid.example", "requiredActions": [],
+              "clientRoles": {"realm-management": ["manage-realm"]},
+              "credentials": [{"type": "password", "value": operator["password"], "temporary": False}]},
+             *[
+             {
+                 "id": user["id"],
+                 "username": name,
+                 "enabled": True,
+                 "firstName": "Fictional",
+                 "lastName": "Fixture",
+                 "email": name + "@invalid.example",
+                 "emailVerified": True,
+                 "realmRoles": ["admin"],
+                 "requiredActions": [],
+                 "credentials": [
+                     {"type": "password", "value": user["password"], "temporary": False}
+                 ],
+             }
+             for name, user in users.items()
+         ]],
+     }
++    if realm_transform is not None:
++        realm_transform(imported, users)
+     docker("network", "create", "--label", label, network)
+     try:
+ 
+         def launch(
+             name: str,
+             image: str,
+             *,
+             options: tuple[str, ...] = (),
+             arguments: tuple[str, ...] = (),
+             ports: tuple[int, ...] = (),
+         ) -> str:
+             """Remember every successfully created, explicitly labeled target."""
+             command = [
+                 "run",
+                 "-d",
+                 "--pull=never",
+                 "--name",
+                 owner + "-" + name,
+                 "--label",
+                 label,
+                 "--network",
+                 network,
+             ]
+             for port in ports:
+                 command += ["-p", "127.0.0.1::" + str(port)]
+             container = docker(*command, *options, image, *arguments)
+             containers.append(container)
+             return container
+ 
+         collector = launch(
+             "collector",
+             "python:3.13-alpine",
+             ports=(8443,),
+             options=(
+                 "--network-alias",
+                 "collector",
+                 "-v",
+                 f"{directory}:/fixture:ro",
+                 "-v",
+                 f"{ROOT / 'tests/fixtures/keycloak_collector.py'}:/collector.py:ro",
+             ),
+             arguments=("python", "-u", "/collector.py"),
+         )
+         collector_port = docker("port", collector, "8443/tcp").rsplit(":", 1)[1]
+         # Test-only dynamic issuer is derived from the loopback listener;
+         # hostname-strict=false is never a production configuration recipe.
+         idp = launch(
+             "idp",
+             IMAGE,
+             ports=(8443,),
+             options=(
+                 "-v",
+                 f"{directory}:/fixture:ro",
+                 "--tmpfs",
+                 "/opt/keycloak/data/import:rw,size=1m,mode=0700,uid=1000,gid=0",
+                 "--entrypoint",
+                 "/bin/bash",
+             ),
+             arguments=(
+                 "-c",
+                 ('for ((i=0;i<300;i++)); do [[ -s /opt/keycloak/data/import/realm.json ]] && '
+                  'exec /opt/keycloak/bin/kc.sh "$@"; sleep 0.1; done; exit 1'),
+                 "fixture-start",
+                 "start-dev",
+                 "--http-enabled=false",
+                 "--https-certificate-file=/fixture/server.pem",
+                 "--https-certificate-key-file=/fixture/server.key",
+                 "--hostname-strict=false",
+                 "--truststore-paths=/fixture/ca.pem",
+                 "--import-realm",
+                 "--log-level=error",
+             ),
+         )
+         import_realm(idp, json.dumps(imported).encode("utf-8"))
+         idp_port = docker("port", idp, "8443/tcp").rsplit(":", 1)[1]
+         issuer = f"https://localhost:{idp_port}/realms/{realm}"
+         password = secrets.token_urlsafe(24)
+         pg = launch(
+             "pg",
+             "postgres:18.6-alpine",
+             ports=(5432,),
+             options=(
+                 "--tmpfs",
+                 "/var/lib/postgresql:rw,size=256m",
+                 "-e",
+                 "POSTGRES_PASSWORD=" + password,
+                 "-e",
+                 "POSTGRES_INITDB_ARGS=--no-sync",
+             ),
+         )
+         port = docker("port", pg, "5432/tcp").rsplit(":", 1)[1]
+         admin = {
+             "host": "127.0.0.1",
+             "port": int(port),
+             "dbname": "postgres",
+             "user": "postgres",
+             "password": password,
+             "autocommit": True,
+             "connect_timeout": 2,
+         }
+         deadline = time.monotonic() + 30
+         while True:
+             try:
+                 db = psycopg.connect(**admin)
+                 break
+             except psycopg.OperationalError:
+                 if time.monotonic() >= deadline:
+                     raise RuntimeError(
+                         "Disposable provider database readiness deadline exceeded"
+                     ) from None
+                 time.sleep(0.2)
+         with db:
+             for migration in sorted((ROOT / "database/migrations").glob("*.sql")):
+                 db.execute(migration.read_text(encoding="utf-8"))
+             db.execute(
+                 psycopg.sql.SQL(
+                     "CREATE ROLE patient_runtime LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE NOREPLICATION"
+                 ).format(psycopg.sql.Literal(password))
+             )
+             recipe = (ROOT / "database/patient_runtime_grants.sql").read_text(
+                 encoding="utf-8"
+             )
+             db.execute(
+                 "\n".join(
+                     line for line in recipe.splitlines() if not line.startswith("\\")
+                 ).replace(':"runtime_role"', '"patient_runtime"')
+             )
+         with httpx.Client(
+             verify=provider_ssl_context(directory / "ca.pem"),
+             trust_env=False,
+             timeout=3,
+             follow_redirects=False,
+         ) as browser:
+             _ready(browser, f"https://localhost:{collector_port}/")
+             response = _ready(browser, issuer)
+             public = json.loads(response)["public_key"]
+             key = serialization.load_pem_public_key(
+                 (
+                     "-----BEGIN PUBLIC KEY-----\n"
+                     + public
+                     + "\n-----END PUBLIC KEY-----\n"
+                 ).encode()
+             )
+             # Fixture enrollment only, over verified TLS; never app discovery.
+             jwks = json.loads(_ready(browser, issuer + "/protocol/openid-connect/certs"))
+             from jwt.algorithms import RSAAlgorithm
+ 
+             verification_keys = {item["kid"]: RSAAlgorithm.from_jwk(item)
+                                  for item in jwks["keys"] if item.get("kty") == "RSA"
+                                  and item.get("alg") == "RS256" and item.get("use") == "sig"}
+         yield Runtime(
+             issuer,
+             f"https://localhost:{collector_port}/",
+             directory / "ca.pem",
+             client_secret,
+             users,
+             key,
+             dict(admin, user="patient_runtime", autocommit=False),
+             admin,
+             verification_keys,
+             operator,
+         )
+     finally:
+         cleanup_owned(containers, network, owner, sys.exception())
+-
+
+diff --git a/outputs/actual-mfa-baseline-20261103/tests__keycloak_forms.py b/tests/keycloak_forms.py
+index 177af17..912e05f 100644
+--- a/outputs/actual-mfa-baseline-20261103/tests__keycloak_forms.py
++++ b/tests/keycloak_forms.py
+@@ -1,124 +1,168 @@
+ """Bounded native form driver over real verified HTTPS, not browser E2E."""
+ 
++from dataclasses import dataclass
+ from html.parser import HTMLParser
+ from urllib.parse import urljoin, urlsplit
+ 
+ import httpx
+ 
+ 
+ class NativeForm(HTMLParser):
+     """Accept one provider POST form and bounded successful control fields."""
+ 
+     def __init__(self, html: str, form_id: str | None) -> None:
+         super().__init__(convert_charrefs=True)
+         self.action = None
+         self.fields = {}
+         self._inside = False
+         self._matched = False
+         self._form_id = form_id
+         self.feed(html)
+         self.close()
+ 
+     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+         attrs = dict(attrs)
+         if tag == "form" and (
+             self._form_id is None or attrs.get("id") == self._form_id
+         ):
+             if self._matched or attrs.get("method", "get").lower() != "post":
+                 raise RuntimeError("Unexpected provider form")
+             self._matched = True
+             self.action, self._inside = attrs.get("action"), True
+         if tag == "input" and self._inside and attrs.get("name"):
+             value = attrs.get("value") or ""
+             if (
+                 len(self.fields) >= 32
+                 or attrs["name"] in self.fields
+                 or len(attrs["name"]) > 256
+                 or len(value) > 4096
+             ):
+                 raise RuntimeError("Provider form limit")
+             self.fields[attrs["name"]] = value
+ 
+     def handle_endtag(self, tag: str) -> None:
+         if tag == "form":
+             self._inside = False
+ 
+ 
+ def _request(
+     browser: httpx.Client, method: str, url: str, **kwargs
+ ) -> tuple[httpx.Response, bytes]:
+     """Bound bytes while reading, before HTML decoding or parsing."""
+     with browser.stream(method, url, **kwargs) as response:
+         body = bytearray()
+         for chunk in response.iter_bytes():
+             if len(body) + len(chunk) > 131072:
+                 raise RuntimeError("Provider page limit")
+             body.extend(chunk)
+         return response, bytes(body)
+ 
+ 
+ def _page(
+     response: httpx.Response, body: bytes, form_id: str | None = "kc-form-login"
+ ) -> NativeForm:
+     """Parse only a bounded successful native HTML page."""
+     if response.status_code != 200:
+         raise RuntimeError("Unexpected provider page")
+     return NativeForm(body.decode("utf-8", errors="strict"), form_id)
+ 
+ 
+ def _action(response: httpx.Response, form: NativeForm) -> str:
+     """Resolve one fixed provider-origin action, never follow external forms."""
+     if not form.action:
+         raise RuntimeError("Provider form missing")
+     action = urljoin(str(response.url), form.action)
+     parsed = urlsplit(action)
+     if (
+         len(action) > 4096
+         or parsed.username
+         or parsed.password
+         or parsed.fragment
+         or parsed[:2] != urlsplit(str(response.url))[:2]
+     ):
+         raise RuntimeError("Provider form origin mismatch")
+     return action
+ 
+ 
+ def password_redirect(
+     browser: httpx.Client, authorization_url: str, username: str, password: str
+ ) -> str | None:
+     """Return the real provider redirect only after native password form POST."""
+     response, body = _request(browser, "GET", authorization_url)
+     form = _page(response, body)
+     response, body = _request(
+         browser,
+         "POST",
+         _action(response, form),
+         data=form.fields | {"username": username, "password": password},
+     )
+     if response.status_code == 200:
+         _page(response, body)  # ordinary failed login; no code/session
+         return None
+     if response.status_code != 302 or len(response.headers.get("location", "")) > 4096:
+         raise RuntimeError("Unexpected provider authentication result")
+     return response.headers["location"]
+ 
+ 
++@dataclass(repr=False)
++class OTPChallenge:
++    """Ephemeral native action and hidden fields, never useful in diagnostics."""
++
++    action: str
++    fields: dict[str, str]
++
++
++def _authentication_result(response: httpx.Response, body: bytes) -> tuple[OTPChallenge | None, str | None]:
++    if response.status_code == 200:
++        form = _page(response, body, "kc-otp-login-form")
++        if form.action:
++            return OTPChallenge(_action(response, form), form.fields), None
++        return None, None
++    location = response.headers.get("location", "")
++    if response.status_code != 302 or not location or len(location) > 4096:
++        raise RuntimeError("Unexpected provider authentication result")
++    return None, location
++
++
++def password_challenge(browser: httpx.Client, authorization_url: str,
++                       username: str, password: str) -> tuple[OTPChallenge | None, str | None]:
++    """Require native password acceptance before exposing a pending OTP form.
++
++    A later SSO request can start directly at OTP; no password is sent then.
++    A non-OTP page (failed password or enrollment) grants no redirect/session.
++    """
++    response, body = _request(browser, "GET", authorization_url)
++    login = _page(response, body)
++    if not login.action:
++        return _authentication_result(response, body)
++    response, body = _request(browser, "POST", _action(response, login),
++                              data=login.fields | {"username": username, "password": password})
++    return _authentication_result(response, body)
++
++
++def submit_otp(browser: httpx.Client, challenge: OTPChallenge,
++               code: str) -> tuple[OTPChallenge | None, str | None]:
++    """Submit to the provider, including bad values; never verify locally."""
++    response, body = _request(browser, "POST", challenge.action,
++                              data=challenge.fields | {"otp": code})
++    return _authentication_result(response, body)
++
++
+ def provider_logout(
+     browser: httpx.Client, issuer: str, client_id: str, post_logout: str
+ ) -> None:
+     response, body = _request(
+         browser,
+         "GET",
+         issuer + "/protocol/openid-connect/logout",
+         params={"client_id": client_id, "post_logout_redirect_uri": post_logout},
+     )
+     form = _page(response, body, form_id=None)
+     response, _ = _request(
+         browser,
+         "POST",
+         _action(response, form),
+         data=form.fields | {"confirmLogout": ""},
+     )
+     if response.status_code not in (200, 302):
+         raise RuntimeError("Provider logout did not complete")
+-
+
+diff --git a/tests/keycloak_mfa.py b/tests/keycloak_mfa.py
+new file mode 100644
+--- /dev/null
++++ b/tests/keycloak_mfa.py
+@@ -0,0 +1,61 @@
++"""Memory-only fictional MFA enrollment composing the same public fragment."""
++
++import base64
++import json
++import secrets
++import time
++from pathlib import Path
++from uuid import uuid4
++
++from cryptography.hazmat.primitives import hashes
++from cryptography.hazmat.primitives.twofactor.totp import TOTP
++
++ACR = "urn:medical-rag:reference:otp"
++POLICY = Path(__file__).resolve().parents[1] / "deploy/identity/keycloak-mfa-policy.json"
++
++
++def compose_mfa(imported: dict, users: dict) -> None:
++    """Inject public policy and process-private fictional credentials pre-import."""
++    policy = json.loads(POLICY.read_text(encoding="utf-8"))
++    imported["roles"]["realm"].extend(policy.pop("roles")["realm"])
++    imported.update(policy)
++    for name in ("staff", "staff_norole", "staff_unenrolled"):
++        user = {"id": str(uuid4()), "password": secrets.token_urlsafe(24)}
++        credentials = [{"type": "password", "value": user["password"], "temporary": False}]
++        if name != "staff_unenrolled":
++            seed = secrets.token_bytes(20)
++            user["otp_seed"] = seed
++            credentials.append({
++                "type": "otp", "userLabel": "fictional-reference-otp",
++                "secretData": json.dumps({"value": base64.b32encode(seed).decode().rstrip("=")}),
++                "credentialData": json.dumps({"subType": "totp", "digits": 6, "counter": 0,
++                                              "period": 30, "algorithm": "HmacSHA1", "secretEncoding": "BASE32"}),
++            })
++        users[name] = user
++        imported["users"].append({
++            "id": user["id"], "username": name, "enabled": True,
++            "firstName": "Fictional", "lastName": "Staff", "email": name + "@invalid.example",
++            "emailVerified": True, "requiredActions": [], "realmRoles": ["medical-staff-mfa"],
++            "credentials": credentials,
++        })
++
++
++def otp_code(user: dict) -> str:
++    """Use cryptography, not a custom OTP implementation; bounded rollover wait."""
++    now = time.time()
++    remaining = 30 - now % 30
++    if remaining < 3 or user.get("_last_otp_step") == int(now // 30):
++        time.sleep(remaining + 0.05)
++        now = time.time()
++    if user.get("_last_otp_step", -1) >= int(now // 30):
++        raise RuntimeError("Fixture OTP clock did not advance")
++    user["_last_otp_step"] = int(now // 30)
++    return TOTP(user["otp_seed"], 6, hashes.SHA1(), 30).generate(now).decode("ascii")
++
++
++def wrong_otp_code(user: dict) -> str:
++    """Six digits guaranteed different from adjacent default-window candidates."""
++    now = time.time()
++    totp = TOTP(user["otp_seed"], 6, hashes.SHA1(), 30)
++    candidates = {totp.generate(now + offset * 30).decode("ascii") for offset in range(-2, 3)}
++    return next(f"{candidate:06d}" for candidate in range(6) if f"{candidate:06d}" not in candidates)
+
+diff --git a/tests/test_keycloak_mfa.py b/tests/test_keycloak_mfa.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_keycloak_mfa.py
+@@ -0,0 +1,213 @@
++"""Actual native password+OTP, signed assurance and isolated auditor API.
++
++Provider boundary: pinned Keycloak real verified-HTTPS sockets. Application:
++fixed HTTPS TestClient, real disposable least-privilege PostgreSQL authority.
++"""
++
++# ruff: noqa: F401,F811 -- imported fixture functions
++import base64
++import json
++from dataclasses import replace
++from urllib.parse import parse_qs, urlsplit
++
++import psycopg
++import pytest
++from fastapi.testclient import TestClient
++from keycloak_forms import password_challenge, submit_otp
++from keycloak_mfa import ACR, compose_mfa, otp_code, wrong_otp_code
++from keycloak_runtime import APP_ORIGIN, identity_runtime
++from test_keycloak_identity import application as raw_application
++from test_keycloak_identity import csrf_headers, no_provider_url_logging
++from test_keycloak_rotation import captured_logout
++
++from medical_rag.oidc_login import OIDCLogin
++from medical_rag.patient_api import create_patient_app
++from medical_rag.patient_service import HealthNotice
++
++pytestmark = pytest.mark.integration
++
++
++@pytest.fixture(scope="module")
++def provider(tmp_path_factory):
++    with identity_runtime(tmp_path_factory.mktemp("actual-mfa"), realm_transform=compose_mfa) as runtime:
++        yield runtime
++
++
++@pytest.fixture
++def application(raw_application, provider):
++    _, original, tenant, accounts = raw_application
++    with psycopg.connect(**provider.admin) as db:
++        for name in ("staff", "staff_norole", "staff_unenrolled"):
++            db.execute("DELETE FROM medical_rag.identity_roles WHERE tenant_id=%s AND account_id=%s",
++                       (tenant, accounts[name]))
++            if name != "staff_norole":
++                db.execute("INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'auditor')", (tenant, accounts[name]))
++    login = OIDCLogin(replace(original.config, mfa_acr_values=frozenset({ACR})),
++                      lambda: psycopg.connect(**provider.database), tenant_id=tenant,
++                      transaction_encryption_key=b"m" * 32)
++    notice = HealthNotice("fictional-v1", "Fictional reference MFA only.", 3600)
++    with TestClient(create_patient_app(login, notice), base_url=APP_ORIGIN, headers={}) as client:
++        yield client, login, tenant, accounts
++
++
++def begin(client, browser, provider, name):
++    response = client.post("/auth/login", headers={"Origin": APP_ORIGIN}, follow_redirects=False)
++    started = response.status_code == 303
++    assert started, "Application must start the native OIDC flow"
++    return password_challenge(browser, response.headers["location"], name, provider.users[name]["password"])
++
++
++def finish(client, redirect):
++    callback_matches = bool(redirect) and urlsplit(redirect)[:3] == urlsplit(APP_ORIGIN + "/auth/callback")[:3]
++    assert callback_matches, "Provider callback must match the exact trusted origin and path"
++    return client.get(redirect, follow_redirects=False)
++
++
++def actual_mfa(client, browser, provider, name):
++    pending, redirect = begin(client, browser, provider, name)
++    actual_challenge = pending is not None and redirect is None
++    assert actual_challenge, "Accepted password must require actual native OTP before any callback"
++    no_session = not client.cookies.get("__Host-medical-session")
++    assert no_session, "Password acceptance alone must not issue an application session"
++    code = otp_code(provider.users[name])
++    pending, redirect = submit_otp(browser, pending, code)
++    accepted = pending is None and redirect is not None
++    assert accepted, "Actual provider must accept the real fictional OTP"
++    completed = finish(client, redirect).status_code == 303
++    assert completed, "Actual signed OTP identity must complete the application session"
++    return code
++
++
++def test_actual_password_otp_signed_assurance_allows_only_current_auditor(application, provider):
++    client, login, _, _ = application
++    with provider.browser() as browser:
++        actual_mfa(client, browser, provider, "staff")
++    principal = login.sessions.authenticate(client.cookies.get("__Host-medical-session"))
++    assurance_verified = principal.mfa_verified is True
++    assert assurance_verified, "Existing verifier/session authority must record signed accepted assurance"
++    audit_permission = client.get("/me").json()["data"]["permissions"]["audit"] is True
++    assert audit_permission, "Current local auditor with verified OTP must have audit permission"
++    auditor_allowed = client.get("/audit").status_code == 200
++    assert auditor_allowed, "Existing isolated auditor API must allow current verified auditor"
++    patient_denied = client.get("/me/consents/health").status_code == 403 and client.get("/conversations").status_code == 403
++    assert patient_denied, "Staff MFA must not grant self-patient consent or content access"
++
++
++@pytest.mark.parametrize("name", ["patient1", "admin"])
++def test_actual_requested_acr_does_not_upgrade_password_only_identity(application, provider, name):
++    client, login, _, _ = application
++    with provider.browser() as browser:
++        pending, redirect = begin(client, browser, provider, name)
++        lower_authentication = pending is None and redirect is not None
++        assert lower_authentication, "Non-staff classification must complete only password authentication"
++        completed = finish(client, redirect).status_code == 303
++        assert completed, "Nonessential requested ACR must permit lower-assurance identity"
++    principal = login.sessions.authenticate(client.cookies.get("__Host-medical-session"))
++    lower_assurance = principal.mfa_verified is False
++    assert lower_assurance, "Requested ACR alone must not verify MFA"
++    audit_denied = client.get("/audit").status_code == 403 and client.get("/me").json()["data"]["permissions"]["audit"] is False
++    assert audit_denied, "Patient or local low-assurance auditor must not access audit"
++    if name == "patient1":
++        patient_self = client.get("/me/consents/health").status_code == 200
++        assert patient_self, "Patient password identity must retain adult verified self functionality"
++
++
++def test_actual_mfa_without_local_role_cannot_grant_audit(application, provider):
++    client, login, _, _ = application
++    with provider.browser() as browser:
++        actual_mfa(client, browser, provider, "staff_norole")
++    verified_but_unprivileged = login.sessions.authenticate(client.cookies.get("__Host-medical-session")).mfa_verified is True and client.get("/audit").status_code == 403
++    assert verified_but_unprivileged, "Provider classification and actual MFA must not grant a local auditor role"
++
++
++def test_actual_wrong_missing_and_uncompleted_otp_cannot_issue_session(application, provider):
++    client, _, _, _ = application
++    with provider.browser() as browser:
++        pending, redirect = begin(client, browser, provider, "staff")
++        password_only_denied = pending is not None and redirect is None and client.get("/me").status_code == 401
++        assert password_only_denied, "Accepted password with incomplete OTP must have no application session"
++        for code in ("", wrong_otp_code(provider.users["staff"])):
++            pending, redirect = submit_otp(browser, pending, code)
++            actual_rejection = pending is not None and redirect is None
++            assert actual_rejection, "Actual provider must reject absent or incorrect OTP without callback"
++        guessed = client.get("/auth/callback", params={"state": "guessed", "code": "guessed"}, follow_redirects=False)
++        guessed_denied = guessed.status_code == 401 and not client.cookies.get("__Host-medical-session")
++        assert guessed_denied, "Guessed callback must not manufacture staff authority"
++
++
++def test_actual_unenrolled_staff_cannot_silently_bypass_otp(application, provider):
++    client, _, _, _ = application
++    with provider.browser() as browser:
++        pending, redirect = begin(client, browser, provider, "staff_unenrolled")
++    unenrolled_denied = pending is None and bool(redirect) and urlsplit(redirect)[:2] == urlsplit(provider.issuer)[:2] and "required-action" in urlsplit(redirect).path and client.get("/me").status_code == 401
++    assert unenrolled_denied, "Unenrolled staff must redirect to provider required action, never application callback/session"
++
++
++def test_actual_sso_reauthentication_requires_otp_again_and_stale_challenge_denied(application, provider):
++    client, _login, _, _ = application
++    with provider.browser() as browser:
++        pending, redirect = begin(client, browser, provider, "staff")
++        first_challenge = pending is not None and redirect is None
++        assert first_challenge, "Cold staff authentication must require OTP"
++        stale = pending
++        first_code = otp_code(provider.users["staff"])
++        pending, redirect = submit_otp(browser, pending, first_code)
++        completed = finish(client, redirect).status_code == 303
++        assert completed, "Initial OTP authentication must complete"
++        client.cookies.clear()
++        pending, redirect = begin(client, browser, provider, "staff")
++        new_challenge = pending is not None and redirect is None and client.get("/me").status_code == 401
++        assert new_challenge, "Provider SSO must require a new OTP challenge at level2 max-age zero"
++        pending, redirect = submit_otp(browser, pending, first_code)
++        replay_rejected = pending is not None and redirect is None and client.get("/me").status_code == 401
++        assert replay_rejected, "Actual provider must reject replayed OTP on a new SSO challenge"
++        pending, redirect = submit_otp(browser, pending, otp_code(provider.users["staff"]))
++        second_completed = finish(client, redirect).status_code == 303
++        assert second_completed, "SSO reauthentication must complete only after a fresh real OTP"
++        client.cookies.clear()
++        _old_pending, old_redirect = submit_otp(browser, stale, first_code)
++        stale_callback = bool(old_redirect) and urlsplit(old_redirect)[:3] == urlsplit(APP_ORIGIN + "/auth/callback")[:3]
++        stale_status = finish(client, old_redirect).status_code if stale_callback else None
++        stale_denied = (not stale_callback or stale_status == 401) and client.get("/me").status_code == 401
++        assert stale_denied, "Consumed provider challenge must not issue a usable new application session"
++
++
++@pytest.mark.parametrize("change", ["role", "disabled"])
++def test_actual_mfa_current_role_and_account_revocation_block_next_access(application, provider, change):
++    client, _, tenant, accounts = application
++    with provider.browser() as browser:
++        actual_mfa(client, browser, provider, "staff")
++    with psycopg.connect(**provider.admin) as db:
++        if change == "role":
++            db.execute("DELETE FROM medical_rag.identity_roles WHERE tenant_id=%s AND account_id=%s", (tenant, accounts["staff"]))
++        else:
++            db.execute("UPDATE medical_rag.identity_accounts SET active=false WHERE tenant_id=%s AND account_id=%s", (tenant, accounts["staff"]))
++    revoked = client.get("/audit").status_code in (401, 403)
++    assert revoked, "Current local revocation must block the next auditor access"
++
++
++def test_actual_mfa_provider_logout_and_audit_public_log_privacy(application, provider, caplog):
++    client, _login, tenant, _ = application
++    with provider.browser() as browser:
++        used_code = actual_mfa(client, browser, provider, "staff")
++        cookie = client.cookies.get("__Host-medical-session")
++        response = client.get("/audit")
++        request_ids = bool(response.headers.get("x-request-id"))
++        assert request_ids, "Auditor responses must retain server request IDs"
++        body = captured_logout(provider, browser)
++    delivered = client.post("/auth/backchannel-logout", content=body, headers={"Content-Type": "application/x-www-form-urlencoded"}).status_code == 200
++    assert delivered, "Actual signed provider logout must pass the existing signed route"
++    revoked = client.get("/audit").status_code == 401 and client.get("/me").status_code == 401
++    assert revoked, "Provider logout must invalidate the old actual-MFA local session"
++    with psycopg.connect(**provider.admin) as db:
++        audit = json.dumps(db.execute("SELECT * FROM medical_rag.security_audit_events WHERE tenant_id=%s", (tenant,)).fetchall(), default=str)
++    exposed = audit + caplog.text + response.text + client.get("/me").text
++    credentials_private = all(user["password"] not in exposed and ("otp_seed" not in user or user["otp_seed"].hex() not in exposed) for user in provider.users.values())
++    assert credentials_private, "Audit/public errors/logs must exclude credentials and OTP seeds"
++    seed_base32_private = all("otp_seed" not in user or base64.b32encode(user["otp_seed"]).decode().rstrip("=") not in exposed for user in provider.users.values())
++    assert seed_base32_private, "Audit/public errors/logs must exclude actual Base32-imported OTP seeds"
++    logout_token = parse_qs(body.decode())["logout_token"][0]
++    tokens_private = cookie not in exposed and logout_token not in exposed
++    assert tokens_private, "Audit/public errors/logs must exclude raw sessions and provider logout tokens"
++    otp_private = used_code not in exposed
++    assert otp_private, "Audit/public errors/logs must exclude the OTP actually submitted to provider"
+
+diff --git a/tests/test_keycloak_mfa_support.py b/tests/test_keycloak_mfa_support.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_keycloak_mfa_support.py
+@@ -0,0 +1,223 @@
++"""Pure reference-policy and bounded native OTP-driver contracts."""
++
++import inspect
++import json
++from pathlib import Path
++
++import httpx
++import keycloak_forms
++import keycloak_runtime
++import pytest
++
++POLICY = Path(__file__).resolve().parents[1] / "deploy/identity/keycloak-mfa-policy.json"
++
++
++def test_runtime_has_explicit_opt_in_policy_composition():
++    available = "realm_transform" in inspect.signature(keycloak_runtime.identity_runtime).parameters
++    assert available, "Actual MFA provisioning must opt in without changing default fixture behavior"
++
++
++def test_fixture_composer_uses_same_public_policy_and_memory_only_credentials():
++    helper = Path(__file__).with_name("keycloak_mfa.py")
++    present = helper.exists()
++    assert present, "Focused MFA composer must load the shipped policy"
++    from keycloak_mfa import compose_mfa
++
++    imported, users = {"roles": {"realm": [{"name": "admin"}]} , "users": []}, {}
++    compose_mfa(imported, users)
++    public = json.loads(POLICY.read_text(encoding="utf-8"))
++    assert imported["authenticationFlows"] == public["authenticationFlows"]
++    assert imported["attributes"] == public["attributes"]
++    assert set(users) == {"staff", "staff_norole", "staff_unenrolled"}
++    assert "otp_seed" in users["staff"] and "otp_seed" not in users["staff_unenrolled"]
++    assert all(user["realmRoles"] == ["medical-staff-mfa"] for user in imported["users"])
++    otp_models = [json.loads(credential["credentialData"]) for user in imported["users"]
++                  for credential in user["credentials"] if credential["type"] == "otp"]
++    encoding_matches = all(model.get("secretEncoding") == "BASE32" for model in otp_models)
++    assert encoding_matches, "Keycloak credential model must explicitly decode the Base32 fixture secret"
++
++
++@pytest.mark.parametrize("now,waiting", [(60.0, False), (89.0, True)])
++def test_code_generation_uses_cryptography_and_bounded_rollover(monkeypatch, now, waiting):
++    import keycloak_mfa
++    from cryptography.hazmat.primitives import hashes
++    from cryptography.hazmat.primitives.twofactor.totp import TOTP
++
++    available = hasattr(keycloak_mfa, "otp_code")
++    assert available, "Mature OTP generation with bounded rollover handling required"
++    slept = []
++    clock = iter([now, 90.05])
++    monkeypatch.setattr(keycloak_mfa.time, "time", lambda: next(clock))
++    monkeypatch.setattr(keycloak_mfa.time, "sleep", slept.append)
++    seed = b"fictional-unit-test-only"
++    code = keycloak_mfa.otp_code({"otp_seed": seed})
++    valid = code == TOTP(seed, 6, hashes.SHA1(), 30).generate(90.05 if waiting else now).decode()
++    assert valid, "Generated code must match mature TOTP utility"
++    assert bool(slept) == waiting
++    assert all(0 < duration < 3.1 for duration in slept)
++
++
++def test_code_generation_never_reuses_the_last_issued_timestep(monkeypatch):
++    import keycloak_mfa
++
++    clock = iter([65.0, 90.05])
++    slept = []
++    monkeypatch.setattr(keycloak_mfa.time, "time", lambda: next(clock))
++    monkeypatch.setattr(keycloak_mfa.time, "sleep", slept.append)
++    user = {"otp_seed": b"fictional-unit-test-only", "_last_otp_step": 2}
++    keycloak_mfa.otp_code(user)
++    fresh = user["_last_otp_step"] == 3 and len(slept) == 1 and 0 < slept[0] <= 30.05
++    assert fresh, "Keep provider single-use OTP policy; wait boundedly for a fresh timestep"
++
++
++def test_wrong_code_is_outside_default_provider_time_window(monkeypatch):
++    import keycloak_mfa
++    from cryptography.hazmat.primitives import hashes
++    from cryptography.hazmat.primitives.twofactor.totp import TOTP
++
++    available = hasattr(keycloak_mfa, "wrong_otp_code")
++    assert available, "Actual bad-OTP test must deterministically avoid valid adjacent timestep codes"
++    monkeypatch.setattr(keycloak_mfa.time, "time", lambda: 300.0)
++    user = {"otp_seed": b"fictional-unit-test-only"}
++    code = keycloak_mfa.wrong_otp_code(user)
++    candidates = {TOTP(user["otp_seed"], 6, hashes.SHA1(), 30).generate(300 + offset * 30).decode() for offset in range(-2, 3)}
++    invalid = code not in candidates and len(code) == 6 and code.isdecimal()
++    assert invalid, "Bad code must be a native six-digit input outside the provider default acceptance window"
++
++
++def test_public_policy_native_role_and_level_required_without_deployment_identity():
++    present = POLICY.exists()
++    assert present, "Reusable public MFA policy fragment is required"
++    policy = json.loads(POLICY.read_text(encoding="utf-8"))
++    assert set(policy) == {"authenticationFlows", "authenticatorConfig", "browserFlow", "attributes", "roles"}
++    assert policy["attributes"]["acr.loa.map"] == '{"urn:medical-rag:reference:otp":2}'
++    flows = {flow["alias"]: flow for flow in policy["authenticationFlows"]}
++    level2 = flows["medical-reference-staff-level2"]["authenticationExecutions"]
++    assert [item["authenticator"] for item in level2] == [
++        "conditional-user-role", "conditional-level-of-authentication", "auth-otp-form"]
++    assert all(item["requirement"] == "REQUIRED" for item in level2)
++    configs = {item["alias"]: item["config"] for item in policy["authenticatorConfig"]}
++    assert configs["medical-reference-level2"] == {"loa-condition-level": "2", "loa-max-age": "0"}
++    assert configs["medical-reference-staff"] == {"condUserRole": "medical-staff-mfa", "negate": "false"}
++    assert policy["roles"] == {"realm": [{"name": "medical-staff-mfa"}]}
++    assert not any("mapper" in key.lower() for key in policy)
++
++
++def test_password_challenge_driver_exists():
++    available = callable(getattr(keycloak_forms, "password_challenge", None))
++    assert available, "Native password driver must return a bounded pending OTP challenge"
++
++
++def test_otp_submit_driver_exists():
++    available = callable(getattr(keycloak_forms, "submit_otp", None))
++    assert available, "Native OTP driver must submit to actual provider"
++
++
++def test_pending_challenge_repr_is_private():
++    available = hasattr(keycloak_forms, "OTPChallenge")
++    assert available, "Pending challenge must have a private representation"
++    challenge = keycloak_forms.OTPChallenge("PRIVATE-CANARY", {"otp": "PRIVATE-CANARY"})
++    assert "PRIVATE-CANARY" not in repr(challenge)
++
++
++@pytest.mark.parametrize("result", ["otp", "rejected", "redirect", "invalid", "external", "large"])
++def test_driver_requires_native_password_then_bounded_same_origin_otp(monkeypatch, result):
++    assert hasattr(keycloak_forms, "password_challenge"), "Native challenge driver required"
++    calls = []
++    login = b'<form id="kc-form-login" method="post" action="/password"><input name="credentialId" value="fictional"></form>'
++    otp = b'<form id="kc-otp-login-form" method="post" action="/otp"><input name="otp"></form>'
++    if result == "external":
++        otp = otp.replace(b'/otp', b'https://external.invalid/otp')
++    response = httpx.Response(200, request=httpx.Request("GET", "https://provider.invalid/auth"))
++
++    def request(browser, method, url, **kwargs):
++        calls.append((method, url, kwargs))
++        if len(calls) == 1:
++            return response, login
++        if result == "redirect":
++            return httpx.Response(302, headers={"location": "https://app.invalid/callback"}, request=response.request), b""
++        if result == "invalid":
++            return httpx.Response(500, request=response.request), b""
++        return response, login if result == "rejected" else otp
++
++    monkeypatch.setattr(keycloak_forms, "_request", request)
++    if result in {"invalid", "external"}:
++        with pytest.raises(RuntimeError):
++            keycloak_forms.password_challenge(None, "https://provider.invalid/auth", "fictional", "private")
++        return
++    challenge, redirect = keycloak_forms.password_challenge(None, "https://provider.invalid/auth", "fictional", "private")
++    assert calls[1][0:2] == ("POST", "https://provider.invalid/password")
++    assert (challenge is not None) == (result in {"otp", "large"})
++    assert bool(redirect) == (result == "redirect")
++
++
++@pytest.mark.parametrize("status,challenge_page", [(302, False), (200, True), (400, False)])
++def test_otp_submit_accepts_redirect_only_and_preserves_rejected_challenge(monkeypatch, status, challenge_page):
++    assert hasattr(keycloak_forms, "submit_otp"), "OTP submission driver required"
++    challenge = keycloak_forms.OTPChallenge("https://provider.invalid/otp", {})
++    body = b'<form id="kc-otp-login-form" method="post" action="/otp"><input name="otp"></form>'
++    response = httpx.Response(status, headers={"location": "https://app.invalid/callback"}, request=httpx.Request("POST", challenge.action))
++    monkeypatch.setattr(keycloak_forms, "_request", lambda *args, **kwargs: (response, body))
++    if status == 400:
++        with pytest.raises(RuntimeError):
++            keycloak_forms.submit_otp(None, challenge, "123456")
++    else:
++        pending, redirect = keycloak_forms.submit_otp(None, challenge, "123456")
++        assert (pending is not None) == challenge_page
++        assert bool(redirect) == (status == 302)
++
++
++@pytest.mark.parametrize("oversized", [False, True])
++def test_native_stream_is_bounded_before_decoding(oversized):
++    # Synthetic driver-only test; actual-provider suites do not use MockTransport.
++    payload = b"x" * (131073 if oversized else 8)
++    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, content=payload))) as browser:
++        if oversized:
++            with pytest.raises(RuntimeError, match="^Provider page limit$"):
++                keycloak_forms._request(browser, "GET", "https://provider.invalid/form")
++        else:
++            response, body = keycloak_forms._request(browser, "GET", "https://provider.invalid/form")
++            assert response.status_code == 200 and body == payload
++
++
++@pytest.mark.parametrize("html", [
++    '<form id="f" method="get">',
++    '<form id="f" method="post"></form><form id="f" method="post">',
++    '<form id="f" method="post"><input name="x"><input name="x">',
++    '<form id="f" method="post"><input name="' + 'x' * 257 + '">',
++])
++def test_native_form_rejects_ambiguous_or_unbounded_controls(html):
++    with pytest.raises(RuntimeError):
++        keycloak_forms.NativeForm(html, "f")
++
++
++@pytest.mark.parametrize("action", [None, "https://external.invalid/otp", "https://user@provider.invalid/otp", "/otp#fragment"])
++def test_native_otp_action_remains_same_origin_without_userinfo_or_fragments(action):
++    response = httpx.Response(200, request=httpx.Request("GET", "https://provider.invalid/form"))
++    form = keycloak_forms.NativeForm('<form id="f" method="post">', "f")
++    form.action = action
++    with pytest.raises(RuntimeError):
++        keycloak_forms._action(response, form)
++
++
++def test_native_sso_get_can_return_otp_without_resending_password(monkeypatch):
++    calls = []
++    response = httpx.Response(200, request=httpx.Request("GET", "https://provider.invalid/form"))
++    body = b'<form id="kc-otp-login-form" method="post" action="/otp"><input name="otp"></form>'
++
++    def request(*args, **kwargs):
++        calls.append(args)
++        return response, body
++
++    monkeypatch.setattr(keycloak_forms, "_request", request)
++    pending, redirect = keycloak_forms.password_challenge(None, "https://provider.invalid/auth", "fictional", "private")
++    assert pending is not None and redirect is None and len(calls) == 1
++
++
++def test_otp_clock_rollback_fails_statically(monkeypatch):
++    import keycloak_mfa
++
++    monkeypatch.setattr(keycloak_mfa.time, "time", lambda: 60.0)
++    monkeypatch.setattr(keycloak_mfa.time, "sleep", lambda _: None)
++    with pytest.raises(RuntimeError, match="^Fixture OTP clock did not advance$"):
++        keycloak_mfa.otp_code({"otp_seed": b"fictional-unit-test-only", "_last_otp_step": 2})
+
+diff --git a/tests/test_keycloak_mfa_privacy.py b/tests/test_keycloak_mfa_privacy.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_keycloak_mfa_privacy.py
+@@ -0,0 +1,72 @@
++"""Replay actual MFA assertion AST with synthetic sensitive canaries only."""
++
++import ast
++import base64
++from pathlib import Path
++from types import SimpleNamespace
++
++import pytest
++from _pytest.assertion.rewrite import rewrite_asserts
++
++SOURCE = Path(__file__).with_name("test_keycloak_mfa.py")
++
++
++def test_new_acr_red_diagnostics_do_not_repr_credential_bearing_fixture_argument():
++    tree = ast.parse(SOURCE.with_name("test_oidc_login.py").read_text(encoding="utf-8"))
++    scenario = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
++                    and node.name == "test_login_requests_only_sorted_trusted_nonessential_acr")
++    private = "system" not in {argument.arg for argument in scenario.args.args}
++    assert private, "New ACR test must not expose the legacy credential-bearing fixture tuple in pytest argument diagnostics"
++
++
++def checks():
++    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
++    result = {}
++    for parent in ast.walk(tree):
++        for value in vars(parent).values():
++            if not isinstance(value, list):
++                continue
++            for index, node in enumerate(value):
++                if isinstance(node, ast.Assert):
++                    statements = [node]
++                    if isinstance(node.test, ast.Name) and index and isinstance(value[index - 1], ast.Assign):
++                        statements.insert(0, value[index - 1])
++                    result[getattr(node.test, "id", str(node.lineno))] = statements
++    return result
++
++
++def test_actual_mfa_checks_are_boolean_locals_and_static_messages():
++    assertions = checks().values()
++    private = all(len(items) == 2 and isinstance(items[-1].test, ast.Name)
++                  and isinstance(items[-1].msg, ast.Constant) and isinstance(items[-1].msg.value, str)
++                  for items in assertions)
++    assert private, "All actual MFA checks must use boolean locals and static messages"
++
++
++@pytest.mark.parametrize("name", ["credentials_private", "seed_base32_private", "tokens_private", "otp_private"])
++def test_rewritten_privacy_assertions_never_dump_sensitive_values(name):
++    all_checks = checks()
++    present = name in all_checks
++    assert present, "Actual MFA privacy checks must cover encoded seed, raw JWT and the used OTP"
++    password, cookie, raw_logout, code = ("PRIVATE_PASSWORD_CANARY", "PRIVATE_COOKIE_CANARY", "PRIVATE_JWT_CANARY", "654321")
++    seed = b"PRIVATE_SEED_CANARY"
++    encoded = base64.b32encode(seed).decode().rstrip("=")
++    exposed = {"credentials_private": password, "seed_base32_private": encoded,
++               "tokens_private": raw_logout, "otp_private": code}[name]
++    namespace = {"base64": base64, "provider": SimpleNamespace(users={"staff": {"password": password, "otp_seed": seed}}),
++                 "exposed": exposed, "cookie": cookie, "logout_token": raw_logout,
++                 "body": ("logout_token=" + raw_logout).encode(), "used_code": code}
++    statements = all_checks[name]
++    source = ast.unparse(ast.Module(body=statements, type_ignores=[])).encode()
++    rewritten = ast.parse(source)
++    rewrite_asserts(rewritten, source)
++    try:
++        exec(compile(rewritten, "<synthetic-mfa-check>", "exec"), namespace)  # noqa: S102
++    except AssertionError:
++        diagnostic = str(pytest.ExceptionInfo.from_current().getrepr(style="short", showlocals=False))
++    else:
++        pytest.fail("Synthetic actual MFA privacy check must fail")
++    safe = not any(value in diagnostic for value in (password, cookie, raw_logout, code, seed.hex(), encoded))
++    assert safe, "Rewritten actual MFA assertion exposed synthetic sensitive values"
++    fixed = statements[-1].msg.value in diagnostic and "assert False" in diagnostic
++    assert fixed, "Synthetic diagnostic must retain the actual static assertion message"
+
+diff --git a/deploy/identity/keycloak-mfa-policy.json b/deploy/identity/keycloak-mfa-policy.json
+new file mode 100644
+--- /dev/null
++++ b/deploy/identity/keycloak-mfa-policy.json
+@@ -0,0 +1,33 @@
++{
++  "browserFlow": "medical-reference-browser",
++  "attributes": {"acr.loa.map": "{\"urn:medical-rag:reference:otp\":2}"},
++  "roles": {"realm": [{"name": "medical-staff-mfa"}]},
++  "authenticatorConfig": [
++    {"alias": "medical-reference-level1", "config": {"loa-condition-level": "1", "loa-max-age": "36000"}},
++    {"alias": "medical-reference-level2", "config": {"loa-condition-level": "2", "loa-max-age": "0"}},
++    {"alias": "medical-reference-staff", "config": {"condUserRole": "medical-staff-mfa", "negate": "false"}}
++  ],
++  "authenticationFlows": [
++    {"alias": "medical-reference-browser", "providerId": "basic-flow", "topLevel": true, "builtIn": false,
++     "authenticationExecutions": [
++       {"authenticator": "auth-cookie", "requirement": "ALTERNATIVE", "priority": 10, "authenticatorFlow": false},
++       {"flowAlias": "medical-reference-interactive", "requirement": "ALTERNATIVE", "priority": 20, "authenticatorFlow": true}
++     ]},
++    {"alias": "medical-reference-interactive", "providerId": "basic-flow", "topLevel": false, "builtIn": false,
++     "authenticationExecutions": [
++       {"flowAlias": "medical-reference-level1", "requirement": "CONDITIONAL", "priority": 10, "authenticatorFlow": true},
++       {"flowAlias": "medical-reference-staff-level2", "requirement": "CONDITIONAL", "priority": 20, "authenticatorFlow": true}
++     ]},
++    {"alias": "medical-reference-level1", "providerId": "basic-flow", "topLevel": false, "builtIn": false,
++     "authenticationExecutions": [
++       {"authenticator": "conditional-level-of-authentication", "authenticatorConfig": "medical-reference-level1", "requirement": "REQUIRED", "priority": 10, "authenticatorFlow": false},
++       {"authenticator": "auth-username-password-form", "requirement": "REQUIRED", "priority": 20, "authenticatorFlow": false}
++     ]},
++    {"alias": "medical-reference-staff-level2", "providerId": "basic-flow", "topLevel": false, "builtIn": false,
++     "authenticationExecutions": [
++       {"authenticator": "conditional-user-role", "authenticatorConfig": "medical-reference-staff", "requirement": "REQUIRED", "priority": 10, "authenticatorFlow": false},
++       {"authenticator": "conditional-level-of-authentication", "authenticatorConfig": "medical-reference-level2", "requirement": "REQUIRED", "priority": 20, "authenticatorFlow": false},
++       {"authenticator": "auth-otp-form", "requirement": "REQUIRED", "priority": 30, "authenticatorFlow": false}
++     ]}
++  ]
++}
+
+diff --git a/deploy/identity/README.md b/deploy/identity/README.md
+new file mode 100644
+--- /dev/null
++++ b/deploy/identity/README.md
+@@ -0,0 +1,51 @@
++# Reference staff OTP authentication policy (Keycloak 26.8.1)
++
++`keycloak-mfa-policy.json` is a **fragment**, not an enabled realm or a deployment
++command. It contains no institution, client, callback, account, password, OTP
++seed, recovery code or secret. Do not import it into an existing/real realm
++without the institution's IAM/security review and a separate authorized rollout.
++The actual disposable-provider tests compose this exact file, not a parallel
++test-only policy, into a uniquely owned fictional realm.
++
++The native browser flow has a cookie/interactive structure, level1 conditional
++LoA with required username/password, and a conditional staff level2 subflow.
++Its role condition, LoA condition and OTP form are all REQUIRED. Realm role
++`medical-staff-mfa` selects staff; it is an IdP policy classification, **not** an
++application role. A configured native OTP is not itself the condition for entry:
++unenrolled staff cannot silently take a password-only shortcut. Keycloak's
++enrollment page is not an authenticated application session, and the application
++does not handle enrollment or see OTP secrets. Level2 has `loa-max-age=0` so SSO
++must challenge for OTP again on subsequent level2 authentication.
++
++`urn:medical-rag:reference:otp` maps to LoA2. The application requests its trusted
++accepted ACR values nonessentially, but independently verifies the signed token,
++issuer/audience/nonce/authentication age and accepted ACR. Merely requesting an
++ACR is never proof of MFA. Patients without staff classification can obtain
++level1 identity, never accepted level2 assurance. A locally assigned auditor
++without staff classification stays low-assurance and cannot use `/audit`.
++Conversely provider classification plus actual MFA without the current local
++auditor role cannot grant `/audit`. This does not change MFA-required local
++roles (`org_admin`, `integration_admin`, `auditor`, `platform_operator`) or
++silently change `knowledge_admin`/`support` policy. Staff MFA does not grant
++patient consent/content absent the existing verified adult self-patient scope.
++
++An institution must separately review identity proofing, role classification,
++enrollment authorization, recovery and lost-device handling, revocation,
++monitoring, key rotation, session lifetimes and approved assurance semantics.
++Retain exact callbacks, confidential code+S256, disabled implicit/direct/service
++account grants and verified provider TLS. Do not add a constant ACR mapper,
++trust upstream business-role claims, or store OTP seed/password/recovery data
++in the application. Reference TOTP is not phishing-resistant WebAuthn and this
++fragment is not a complete production IAM service or institutional certification.
++
++The tests exercise native forms over actual verified HTTPS sockets and provider
++signatures; application HTTP uses FastAPI TestClient plus real disposable
++least-privilege PostgreSQL. They are not full browser/network E2E, institutional
++enrollment/recovery evidence, or authorization to unlock legacy RAG/workers.
++
++Primary policy/model references:
++
++- [Keycloak server administration: step-up authentication](https://www.keycloak.org/docs/latest/server_admin/)
++- [26.8.1 native conditional LoA implementation](https://github.com/keycloak/keycloak/blob/26.8.1/services/src/main/java/org/keycloak/authentication/authenticators/conditional/ConditionalLoaAuthenticator.java)
++- [26.8.1 native role condition](https://github.com/keycloak/keycloak/blob/26.8.1/services/src/main/java/org/keycloak/authentication/authenticators/conditional/ConditionalRoleAuthenticatorFactory.java)
++- [26.8.1 OTP credential encoding model](https://github.com/keycloak/keycloak/blob/26.8.1/server-spi/src/main/java/org/keycloak/models/credential/OTPCredentialModel.java)
+

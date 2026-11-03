@@ -3,13 +3,28 @@
 from uuid import uuid4
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture(autouse=True)
 def isolated_chat_history(tmp_path, monkeypatch):
+    # The legacy behavior tests exercise the explicitly unsafe local demo, not
+    # the default security posture tested in test_security_lockdown.py.
+    monkeypatch.setenv("MEDICAL_RAG_ACCESS_MODE", "unsafe-local-demo")
     monkeypatch.setenv("CHAT_HISTORY_FILE", str(tmp_path / "chat-history.sqlite3"))
     monkeypatch.setenv("MEMORY_EPISODES_DIR", str(tmp_path / "episodes"))
     monkeypatch.setenv("DOCUMENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    # Starlette's synthetic default peer is not an IP address. Give legacy
+    # local-demo tests a loopback peer; tests can still specify a remote peer.
+    original_init = TestClient.__init__
+
+    def local_test_client(self, *args, **kwargs):
+        kwargs.setdefault("client", ("127.0.0.1", 50000))
+        kwargs.setdefault("base_url", "http://127.0.0.1:8001")
+        kwargs.setdefault("headers", {"Origin": "http://127.0.0.1:8001"})
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "__init__", local_test_client)
 
 
 @pytest.fixture

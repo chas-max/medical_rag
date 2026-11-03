@@ -8,7 +8,6 @@ from time import monotonic
 from .lexical import score as lexical_score
 from .types import SCORE_LEXICAL, SCORE_RERANK
 
-
 logger = logging.getLogger(__name__)
 
 EMBEDDER_MODEL = "BAAI/bge-small-zh-v1.5"
@@ -54,13 +53,13 @@ def _load_on_best_device(load):
     device = resolve_device()
     try:
         model = load(device)
-    except Exception as error:
+    except Exception:
         if device == "cpu":
             raise
-        logger.warning("模型无法在 %s 上加载，回退到 CPU: %s", device, error)
+        logger.warning("模型加载失败，尝试 CPU 回退")
         device = "cpu"
         model = load(device)
-    logger.info("模型运行设备: %s", device)
+    logger.info("模型已加载")
     return model, device
 
 
@@ -144,10 +143,9 @@ class BgeReranker:
                 raise ValueError("重排分数无效")
             self._unavailable_until = 0.0
             return scores, SCORE_RERANK
-        except Exception as error:
+        except Exception:  # noqa: BLE001 - preserve safe lexical fallback
             self._unavailable_until = monotonic() + RERANKER_RETRY_SECONDS
-            logger.warning("重排模型不可用，降级为词面覆盖率评分，%.0f 秒后重试: %s",
-                           RERANKER_RETRY_SECONDS, error)
+            logger.warning("重排模型不可用，已启用降级评分")
             return self._fallback_scores(question, texts), SCORE_LEXICAL
 
     @staticmethod

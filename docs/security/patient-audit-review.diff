@@ -1,0 +1,2727 @@
+# Task4 connected patient audit — task-scoped review package
+
+Base: preTask4 uncommitted source snapshots in outputs/patient-audit-baseline-20261102; CSS reconstructed from frozen Task3 creation diff. HEAD remains initial commit; unrelated changes excluded. No commits. New files in full; changed files with surrounding context. Reports are separate.
+
+## src/medical_rag/patient_service.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/src__medical_rag__patient_service.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/patient_service.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/src__medical_rag__patient_service.py b/src/medical_rag/patient_service.py
+index 4df21ab..95e813d 100644
+--- a/outputs/patient-audit-baseline-20261102/src__medical_rag__patient_service.py
++++ b/src/medical_rag/patient_service.py
+@@ -15,24 +15,25 @@ from uuid import UUID, uuid4
+ 
+ from psycopg import Connection
+ 
+ from .access_policy import Action, Resource, is_allowed
+ from .consent_policy import (
+     ConsentPurpose,
+     ConsentRecord,
+     PatientIdentity,
+     SubjectAge,
+     has_current_consent,
+ )
+ from .identity_sessions import AuthorizedTransaction, SessionStore
++from .security_audit import AuditAction, AuditStore
+ 
+ JsonObject = dict[str, object]
+ ContentRow = tuple[UUID, str, datetime]
+ 
+ 
+ class PatientDenied(Exception):
+     """No current verified adult self-patient authority/consent."""
+ 
+ 
+ class ResourceMissing(Exception):
+     """Missing, malformed or invisible owned resource."""
+ 
+@@ -74,24 +75,25 @@ def _page(limit: int, offset: int) -> None:
+ def _item(row: ContentRow, field: str) -> JsonObject:
+     return {"id": str(row[0]), field: row[1], "created_at": row[2].isoformat()}
+ 
+ 
+ class PatientService:
+     """No disconnected repository/snapshot principal may authorize these calls."""
+ 
+     def __init__(self, sessions: SessionStore, notice: HealthNotice) -> None:
+         if not isinstance(sessions, SessionStore) or type(notice) is not HealthNotice:
+             raise ValueError("Trusted session store and health notice required")
+         self.sessions = sessions
+         self.notice = notice
++        self.audit = AuditStore(sessions)
+ 
+     def _subject(self, authorized: AuthorizedTransaction, *, exclusive: bool = False,
+                  action: Action = Action.PATIENT_READ) -> PatientIdentity:
+         principal = authorized.principal
+         resource = Resource(principal.tenant_id, principal.patient_id)
+         if not is_allowed(principal, action, resource):
+             raise PatientDenied()
+         db = authorized.connection
+         scope = (principal.tenant_id, principal.patient_id)
+         db.execute("SELECT set_config('app.patient_scope',pg_current_xact_id()::text||'/'||%s||'/'||%s,true)", scope)
+         row = db.execute("SELECT patient_id FROM medical_rag.patient_subjects "
+                          "WHERE tenant_id=%s AND patient_id=%s " + ("FOR UPDATE" if exclusive else "FOR SHARE"),
+@@ -117,114 +119,119 @@ class PatientService:
+                          (subject.tenant_id, subject.patient_id)).fetchone()
+         now = db.execute("SELECT clock_timestamp()").fetchone()[0]
+         if row is None:
+             return False, None
+         grantor, version, granted, recorded, expires = row
+         record = ConsentRecord(subject.tenant_id, subject.patient_id, ConsentPurpose.HEALTH_INFORMATION,
+                                version, str(grantor), granted, not granted, recorded, expires, recorded)
+         current = has_current_consent(subject, record, ConsentPurpose.HEALTH_INFORMATION, action,
+                                       required_version=self.notice.version, now=now)
+         return current, expires.isoformat() if current else None
+ 
+     @contextmanager
+-    def _operation(self, token: str, *, csrf_token: str | None = None, mutation: bool = False,
++    def _operation(self, token: str, *, audit_action: AuditAction,
++                   csrf_token: str | None = None, mutation: bool = False,
+                    consent: bool = True, exclusive: bool = False
+                    ) -> Iterator[tuple[Connection, PatientIdentity, bool, str | None]]:
+-        with self.sessions.authorized_transaction(token, require_csrf=mutation, csrf_token=csrf_token) as authorized:
++        with self.audit.operation(token, audit_action, mutation=mutation, csrf_token=csrf_token) as authorized:
+             subject = self._subject(authorized, exclusive=exclusive,
+                                     action=Action.PATIENT_WRITE if mutation else Action.PATIENT_READ)
+             current, expires = self._consent(authorized.connection, subject,
+                                             Action.PATIENT_WRITE if mutation else Action.PATIENT_READ)
+             if consent and not current:
+                 raise PatientDenied()
+             yield authorized.connection, subject, current, expires
+ 
+     def me(self, token: str) -> JsonObject:
+-        with self.sessions.authorized_transaction(token) as authorized:
++        with self.audit.operation(token, AuditAction.IDENTITY_READ) as authorized:
+             principal = authorized.principal
+             eligible, current = False, False
+             try:
+                 subject = self._subject(authorized)
+             except PatientDenied:
+                 pass
+             else:
+                 eligible = True
+                 current, _ = self._consent(authorized.connection, subject)
+             return {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
+                     "roles": sorted(principal.roles), "binding": {"verified": principal.patient_id is not None},
+-                    "permissions": {"identity": True, "health_consent": eligible, "conversations": current}}
++                    "permissions": {"identity": True, "health_consent": eligible, "conversations": current,
++                                    "audit": is_allowed(principal, Action.AUDIT_READ, Resource(principal.tenant_id))}}
+ 
+     def _status(self, current: bool, expires: str | None) -> JsonObject:
+         return {"notice": {"version": self.notice.version, "text": self.notice.text,
+                            "validity_seconds": self.notice.validity_seconds},
+                 "granted": current, "expires_at": expires}
+ 
+     def consent_status(self, token: str) -> JsonObject:
+-        with self._operation(token, consent=False) as (_, _, current, expires):
++        with self._operation(token, audit_action=AuditAction.CONSENT_READ, consent=False) as (_, _, current, expires):
+             return self._status(current, expires)
+ 
+     def change_consent(self, token: str, *, csrf_token: str, granted: bool,
+                        version: str | None = None) -> JsonObject:
+         if type(granted) is not bool or (granted and version != self.notice.version):
+             raise ValueError("Invalid consent")
+-        with self._operation(token, csrf_token=csrf_token, mutation=True, consent=False, exclusive=True) as (db, subject, _, _):
++        action = AuditAction.CONSENT_GRANT if granted else AuditAction.CONSENT_WITHDRAW
++        with self._operation(token, audit_action=action, csrf_token=csrf_token,
++                             mutation=True, consent=False, exclusive=True) as (db, subject, _, _):
+             db.execute("INSERT INTO medical_rag.patient_consent_events "
+                        "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
+                        "VALUES (%s,%s,%s,%s,'health_information',%s,%s,"
+                        "clock_timestamp()+(%s*interval '1 second'))",
+                        (uuid4(), subject.tenant_id, subject.patient_id, subject.account_id,
+                         self.notice.version, granted, self.notice.validity_seconds if granted else 0))
+             current, expires = self._consent(db, subject)
+             return self._status(current, expires)
+ 
+     def create_conversation(self, token: str, *, csrf_token: str, title: str) -> JsonObject:
+         _text(title, 200)
+-        with self._operation(token, csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
++        with self._operation(token, audit_action=AuditAction.CONVERSATION_CREATE,
++                             csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
+             row = db.execute("INSERT INTO medical_rag.conversations(tenant_id,patient_id,conversation_id,title) "
+                              "VALUES (%s,%s,%s,%s) RETURNING conversation_id,title,created_at",
+                              (subject.tenant_id, subject.patient_id, uuid4(), title)).fetchone()
+             return _item(row, "title")
+ 
+     def list_conversations(self, token: str, *, limit: int = 20, offset: int = 0) -> JsonObject:
+         _page(limit, offset)
+-        with self._operation(token) as (db, subject, _, _):
++        with self._operation(token, audit_action=AuditAction.CONVERSATION_LIST) as (db, subject, _, _):
+             rows = db.execute("SELECT conversation_id,title,created_at FROM medical_rag.conversations "
+                               "WHERE tenant_id=%s AND patient_id=%s ORDER BY created_at DESC,conversation_id "
+                               "LIMIT %s OFFSET %s", (subject.tenant_id, subject.patient_id, limit, offset)).fetchall()
+             return {"items": [_item(row, "title") for row in rows], "limit": limit, "offset": offset}
+ 
+     @staticmethod
+     def _conversation(db: Connection, subject: PatientIdentity, identifier: UUID) -> ContentRow:
+         row = db.execute("SELECT conversation_id,title,created_at FROM medical_rag.conversations "
+                          "WHERE tenant_id=%s AND patient_id=%s AND conversation_id=%s",
+                          (subject.tenant_id, subject.patient_id, identifier)).fetchone()
+         if row is None:
+             raise ResourceMissing()
+         return row
+ 
+     def get_conversation(self, token: str, identifier: str) -> JsonObject:
+         conversation_id = _identifier(identifier)
+-        with self._operation(token) as (db, subject, _, _):
++        with self._operation(token, audit_action=AuditAction.CONVERSATION_READ) as (db, subject, _, _):
+             return _item(self._conversation(db, subject, conversation_id), "title")
+ 
+     def append_turn(self, token: str, identifier: str, *, csrf_token: str, content: str) -> JsonObject:
+         conversation_id = _identifier(identifier)
+         _text(content, 16000)
+-        with self._operation(token, csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
++        with self._operation(token, audit_action=AuditAction.TURN_APPEND,
++                             csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
+             self._conversation(db, subject, conversation_id)
+             row = db.execute("INSERT INTO medical_rag.conversation_turns "
+                              "(tenant_id,patient_id,conversation_id,turn_id,content) VALUES (%s,%s,%s,%s,%s) "
+                              "RETURNING turn_id,content,created_at",
+                              (subject.tenant_id, subject.patient_id, conversation_id, uuid4(), content)).fetchone()
+             return _item(row, "content")
+ 
+     def list_turns(self, token: str, identifier: str, *, limit: int = 20, offset: int = 0) -> JsonObject:
+         conversation_id = _identifier(identifier)
+         _page(limit, offset)
+-        with self._operation(token) as (db, subject, _, _):
++        with self._operation(token, audit_action=AuditAction.TURN_LIST) as (db, subject, _, _):
+             self._conversation(db, subject, conversation_id)
+             rows = db.execute("SELECT turn_id,content,created_at FROM medical_rag.conversation_turns "
+                               "WHERE tenant_id=%s AND patient_id=%s AND conversation_id=%s "
+                               "ORDER BY created_at,turn_id LIMIT %s OFFSET %s",
+                               (subject.tenant_id, subject.patient_id, conversation_id, limit, offset)).fetchall()
+             return {"items": [_item(row, "content") for row in rows], "limit": limit, "offset": offset}
+-
+
+## src/medical_rag/patient_api.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/src__medical_rag__patient_api.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/patient_api.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/src__medical_rag__patient_api.py b/src/medical_rag/patient_api.py
+index 6c0af09..68494f1 100644
+--- a/outputs/patient-audit-baseline-20261102/src__medical_rag__patient_api.py
++++ b/src/medical_rag/patient_api.py
+@@ -15,24 +15,25 @@ from pydantic import (
+     ValidationError,
+ )
+ from starlette.concurrency import run_in_threadpool
+ 
+ from .oidc_login import OIDCLogin, _cookie, create_auth_app
+ from .patient_service import (
+     HealthNotice,
+     JsonObject,
+     PatientDenied,
+     PatientService,
+     ResourceMissing,
+ )
++from .security_audit import AuditDenied
+ 
+ 
+ class _Body(BaseModel):
+     model_config = ConfigDict(extra="forbid", strict=True)
+ 
+ 
+ BodyT = TypeVar("BodyT", bound=_Body)
+ 
+ 
+ class _Grant(_Body):
+     version: StrictStr = Field(min_length=1, max_length=128)
+     accepted: StrictBool
+@@ -81,25 +82,29 @@ async def _body(request: Request, model: type[BodyT]) -> BodyT:
+                 if key in result:
+                     raise ValueError("Invalid request")
+                 result[key] = value
+             return result
+         return model.model_validate(json.loads(data, object_pairs_hook=unique))
+     except (ValueError, TypeError, RecursionError, UnicodeError):
+         raise ValueError("Invalid request") from None
+ 
+ 
+ def create_patient_app(login: OIDCLogin, notice: HealthNotice, *, patient_html: bool = False) -> FastAPI:
+     """Reuse all headless OIDC cookie, origin and no-store protections."""
+     service = PatientService(login.sessions, notice)
+-    app = create_auth_app(login, patient_html=patient_html)
++    app = create_auth_app(login, patient_html=patient_html, audit=service.audit)
++
++    @app.exception_handler(AuditDenied)
++    async def audit_denied(request: Request, error: AuditDenied) -> JSONResponse:
++        return _error(403, "AUDIT_ACCESS_DENIED", "Audit access denied")
+ 
+     @app.exception_handler(PatientDenied)
+     async def denied(request: Request, error: PatientDenied) -> JSONResponse:
+         return _error(403, "PATIENT_ACCESS_DENIED", "Patient access denied")
+ 
+     @app.exception_handler(ResourceMissing)
+     async def missing(request: Request, error: ResourceMissing) -> JSONResponse:
+         return _error(404, "RESOURCE_NOT_FOUND", "Resource not found")
+ 
+     @app.exception_handler(ValueError)
+     @app.exception_handler(ValidationError)
+     @app.exception_handler(RequestValidationError)
+@@ -109,26 +114,32 @@ def create_patient_app(login: OIDCLogin, notice: HealthNotice, *, patient_html:
+     async def credentials(request: Request, *, mutation: bool = False) -> tuple[str, str | None]:
+         token = _cookie(request, "__Host-medical-session")
+         csrf = None
+         if mutation:
+             values = request.headers.getlist("x-csrf-token")
+             if len(values) != 1:
+                 raise PatientDenied()
+             csrf = values[0]
+         # Authenticate BEFORE body/path/pagination validation. This principal
+         # is discarded; the service obtains live authority in its own locked
+         # operation transaction, never trusting a disconnected snapshot here.
+         await run_in_threadpool(login.sessions.authenticate, token, require_csrf=mutation, csrf_token=csrf)
++        service.audit.remember(token)
+         return token, csrf
+ 
++    @app.get("/audit")
++    async def audit_events(request: Request) -> JsonObject:
++        token, _ = await credentials(request)
++        return _ok(await run_in_threadpool(service.audit.list_events, token, **_pagination(request)))
++
+     @app.get("/me")
+     async def me(request: Request) -> JsonObject:
+         token, _ = await credentials(request)
+         return _ok(await run_in_threadpool(service.me, token))
+ 
+     @app.get("/me/consents/health")
+     async def consent_status(request: Request) -> JsonObject:
+         token, _ = await credentials(request)
+         return _ok(await run_in_threadpool(service.consent_status, token))
+ 
+     @app.post("/me/consents/health")
+     async def grant(request: Request) -> JsonObject:
+@@ -164,13 +175,12 @@ def create_patient_app(login: OIDCLogin, notice: HealthNotice, *, patient_html:
+     async def turns(request: Request, identifier: str) -> JsonObject:
+         token, _ = await credentials(request)
+         return _ok(await run_in_threadpool(service.list_turns, token, identifier, **_pagination(request)))
+ 
+     @app.post("/conversations/{identifier}/turns")
+     async def append(request: Request, identifier: str) -> JsonObject:
+         token, csrf = await credentials(request, mutation=True)
+         body = await _body(request, _Turn)
+         return _ok(await run_in_threadpool(service.append_turn, token, identifier,
+                                            csrf_token=csrf, content=body.content))
+ 
+     return app
+-
+
+## src/medical_rag/oidc_login.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/src__medical_rag__oidc_login.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/oidc_login.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/src__medical_rag__oidc_login.py b/src/medical_rag/oidc_login.py
+index 3b867b5..2ebdcee 100644
+--- a/outputs/patient-audit-baseline-20261102/src__medical_rag__oidc_login.py
++++ b/src/medical_rag/oidc_login.py
+@@ -37,26 +37,33 @@ from uuid import UUID
+ import httpx
+ from authlib.integrations.httpx_client import AsyncOAuth2Client
+ from cryptography.exceptions import InvalidTag
+ from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
+ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+ from fastapi import FastAPI, Request
+ from fastapi.responses import JSONResponse, RedirectResponse
+ from psycopg import Connection
+ from psycopg.pq import TransactionStatus
+ from starlette.concurrency import run_in_threadpool
+ from starlette.exceptions import HTTPException as StarletteHTTPException
+ 
++from .access_policy import Principal
+ from .identity_sessions import AuthenticationDenied, IssuedSession, SessionStore
+ from .oidc_identity import InvalidIdentity, OIDCIdentityVerifier
++from .security_audit import (
++    AuditAction,
++    AuditStore,
++    AuditUnavailable,
++    unavailable_response,
++)
+ 
+ _OPAQUE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
+ _LOGIN_COOKIE = "__Host-medical-oidc"
+ _SESSION_COOKIE = "__Host-medical-session"
+ _CSRF_COOKIE = "__Host-medical-csrf"
+ _MAX_TOKEN_RESPONSE = 65536
+ ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
+ 
+ 
+ class InvalidLogin(Exception):
+     """Missing, expired, already consumed or wrong-browser login request."""
+ 
+@@ -351,26 +358,29 @@ def _authorization_origin(endpoint: str) -> str:
+         if (not host or len(host) > 253 or any(
+                 re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
+                 for label in host.split("."))):
+             raise ValueError("Invalid trusted OIDC configuration") from None
+         authority = host.lower()
+     if parsed.port is not None:
+         if not 1 <= parsed.port <= 65535:
+             raise ValueError("Invalid trusted OIDC configuration")
+         authority += f":{parsed.port}"
+     return "https://" + authority
+ 
+ 
+-def create_auth_app(login: OIDCLogin, *, patient_html: bool = False) -> FastAPI:
+-    """Create a headless auth-only app, without legacy business endpoints."""
++def create_auth_app(login: OIDCLogin, *, patient_html: bool = False, audit: AuditStore | None = None) -> FastAPI:
++    """Reuse auth protections; standalone headless no-audit is experimental only.
++
++    The patient factory always supplies its mandatory trusted AuditStore.
++    """
+     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+     origin = login.config.app_origin
+     authority = urlsplit(origin).netloc
+     # Fixed trusted factory choice only; never derive this policy from a request.
+     csp = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
+            f"base-uri 'none'; form-action 'self' {_authorization_origin(login.config.authorization_endpoint)}; "
+            "frame-ancestors 'none'" if patient_html
+            else "default-src 'none'; frame-ancestors 'none'")
+ 
+     @app.middleware("http")
+     async def enforce_origin_and_headers(request: Request, call_next):
+         hosts = request.headers.getlist("host")
+@@ -402,67 +412,98 @@ def create_auth_app(login: OIDCLogin, *, patient_html: bool = False) -> FastAPI:
+ 
+     @app.exception_handler(Exception)
+     async def unavailable(request: Request, error: Exception):
+         return _failure(503)
+ 
+     @app.exception_handler(StarletteHTTPException)
+     async def framework_error(request: Request, error: StarletteHTTPException):
+         return _failure(error.status_code if error.status_code in {404, 405} else 400)
+ 
+     @app.post("/auth/login")
+     async def begin():
+         url, challenge = await login.start()
++        if audit is not None:
++            await run_in_threadpool(audit.record, AuditAction.LOGIN_START)
+         response = RedirectResponse(url, status_code=303)
+         _set_cookie(response, _LOGIN_COOKIE, challenge.browser_token, max_age=login.transactions.lifetime_seconds)
+         return response
+ 
+     @app.get("/auth/callback")
+     async def callback(request: Request):
+         pairs = request.query_params.multi_items()
+         allowed = {"state", "code", "iss", "session_state"}
+         if (any(key not in allowed for key, _ in pairs) or len({key for key, _ in pairs}) != len(pairs)
+                 or ("iss" in request.query_params and request.query_params["iss"] != login.config.issuer)):
+             raise InvalidLogin()
+         session = await login.finish(state=request.query_params.get("state"), browser_token=_cookie(request, _LOGIN_COOKIE),
+                                      code=request.query_params.get("code"))
+-        # Replace this browser's existing session after re-authentication; raw
+-        # values are never accepted from query/body fields or reused as new IDs.
+         try:
+-            previous, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
+-        except InvalidLogin:
+-            pass
+-        else:
++            # Finish replacing the previous session before recording a success.
++            # A storage failure here must not orphan an unexposed new session.
++            try:
++                previous, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
++            except InvalidLogin:
++                pass
++            else:
++                try:
++                    await run_in_threadpool(login.sessions.revoke, previous, csrf_token=csrf)
++                except AuthenticationDenied:
++                    pass
++            if audit is not None:
++                # Current local authority, not submitted/provider claims. The
++                # audit commits before either new browser cookie is emitted.
++                def record_login() -> None:
++                    with audit.operation(session.token, AuditAction.LOGIN_FINISH,
++                                         mutation=True, csrf_token=session.csrf_token):
++                        pass
++                await run_in_threadpool(record_login)
++        except Exception:  # revoke unexposed authority before propagating a static failure
+             try:
+-                await run_in_threadpool(login.sessions.revoke, previous, csrf_token=csrf)
+-            except AuthenticationDenied:
++                await run_in_threadpool(login.sessions.revoke, session.token, csrf_token=session.csrf_token)
++            except Exception:  # noqa: BLE001,S110 -- best effort; logging could expose raw session/SQL
+                 pass
++            if audit is not None:
++                raise AuditUnavailable() from None
++            raise
+         response = RedirectResponse("/", status_code=303)
+         _clear_cookie(response, _LOGIN_COOKIE)
+         _set_cookie(response, _SESSION_COOKIE, session.token)
+         _set_cookie(response, _CSRF_COOKIE, session.csrf_token)
+         return response
+ 
+     @app.get("/auth/session")
+     async def session_info(request: Request):
+         token, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
+-        principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=csrf)
++        if audit is None:
++            principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=csrf)
++        else:
++            def read_session() -> Principal:
++                with audit.operation(token, AuditAction.SESSION_READ, mutation=True, csrf_token=csrf) as authorized:
++                    return authorized.principal
++            principal = await run_in_threadpool(read_session)
+         return {"success": True, "data": {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
+                                           "roles": sorted(principal.roles), "csrf_token": csrf}, "error": None}
+ 
+     @app.post("/auth/logout")
+     async def logout(request: Request):
+         try:
+             headers = request.headers.getlist("x-csrf-token")
+             if len(headers) != 1:
+                 return _failure(403)
+             token = _cookie(request, _SESSION_COOKIE)
+-            await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=headers[0])
++            principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=headers[0])
+             await run_in_threadpool(login.sessions.revoke, token, csrf_token=headers[0])
+         except (InvalidLogin, AuthenticationDenied):
+             return _failure(403)
+         response = JSONResponse({"success": True, "data": None, "error": None})
++        if audit is not None:
++            try:
++                await run_in_threadpool(audit.record, AuditAction.LOGOUT, principal=principal)
++            except AuditUnavailable:
++                response = unavailable_response()
+         for name in (_SESSION_COOKIE, _CSRF_COOKIE, _LOGIN_COOKIE):
+             _clear_cookie(response, name)
+         return response
+ 
++    if audit is not None:
++        audit.install(app)
+     return app
+-
+
+## src/medical_rag/security_server.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/src__medical_rag__security_server.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/security_server.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/src__medical_rag__security_server.py b/src/medical_rag/security_server.py
+index 901b6eb..716bb7e 100644
+--- a/outputs/patient-audit-baseline-20261102/src__medical_rag__security_server.py
++++ b/src/medical_rag/security_server.py
+@@ -21,36 +21,37 @@ with warnings.catch_warnings():
+     # before installing the more-specific launcher-only filter.
+     from authlib.deprecate import AuthlibDeprecationWarning
+ 
+     warnings.filterwarnings(
+         "ignore",
+         message=r"The httpx module is deprecated; please use httpx2 instead\.",
+         category=AuthlibDeprecationWarning,
+     )
+     from .oidc_login import OIDCLogin
+ from .patient_api import create_patient_app
+ from .security_config import PatientConfiguration, StartupError, load_configuration
+ 
+-# Every required column from migrations 1-4 is resolved and SELECT-checked.
++# Every required column from migrations 1-5 is resolved and SELECT-checked.
+ _COLUMNS = {
+     "tenants": "tenant_id active session_version",
+     "identity_accounts": "tenant_id account_id issuer subject active session_version",
+     "identity_roles": "tenant_id account_id role",
+     "identity_bindings": "tenant_id account_id patient_id verified",
+     "identity_sessions": "token_hash csrf_hash tenant_id account_id mfa_verified account_version tenant_version created_at last_seen_at expires_at revoked",
+     "oidc_login_transactions": "tenant_id state_hash browser_hash tenant_version encrypted_context created_at expires_at",
+     "patient_subjects": "tenant_id patient_id age_classification identity_verified",
+     "patient_consent_events": "event_id tenant_id patient_id grantor_account_id purpose notice_version granted recorded_at expires_at event_order",
+     "conversations": "tenant_id patient_id conversation_id title created_at",
+     "conversation_turns": "tenant_id patient_id conversation_id turn_id content created_at",
++    "security_audit_events": "event_id tenant_id operator_id action resource_type outcome reason_code recorded_at event_order request_id",
+ }
+ 
+ 
+ def _connect(config: PatientConfiguration):
+     # Explicit options override DSN values; ignore ambient PG service defaults
+     # for required identity/host fields by requiring them in preflight below.
+     info = psycopg.conninfo.conninfo_to_dict(config.database_dsn)
+     if (
+         not all(info.get(key) for key in ("host", "dbname", "user", "password"))
+         or "service" in info
+     ):
+         raise StartupError()
+@@ -100,34 +101,44 @@ def preflight(config: PatientConfiguration) -> None:
+                 forbidden = (
+                     ["INSERT", "UPDATE", "DELETE"]
+                     if table
+                     in {
+                         "tenants",
+                         "identity_accounts",
+                         "identity_roles",
+                         "identity_bindings",
+                         "patient_subjects",
+                     }
+                     else ["UPDATE", "DELETE"]
+                     if table
+-                    in {"patient_consent_events", "conversations", "conversation_turns"}
++                    in {"patient_consent_events", "conversations", "conversation_turns", "security_audit_events"}
+                     else []
+                 )
++                if table == "security_audit_events":
++                    forbidden += ["TRUNCATE", "REFERENCES", "TRIGGER"]
++                    # Defaults are exclusively server-owned, not insertable by
++                    # runtime even through inherited/PUBLIC column grants.
++                    for column in ("event_id", "recorded_at", "event_order"):
++                        if db.execute(
++                            "SELECT has_column_privilege(current_user,%s,%s,'INSERT')",
++                            ("medical_rag." + table, column),
++                        ).fetchone() == (True,):
++                            raise StartupError()
+                 for privilege in forbidden:
+                     if privilege == "UPDATE" and table == "patient_subjects":
+                         bad = db.execute(
+                             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=%s::regclass AND attnum>0 AND NOT attisdropped AND attname<>'patient_id' AND has_column_privilege(current_user,attrelid,attname,'UPDATE'))",
+                             ("medical_rag." + table,),
+                         ).fetchone()[0]
+-                    elif privilege in {"INSERT", "UPDATE"}:
++                    elif privilege in {"INSERT", "UPDATE", "REFERENCES"}:
+                         bad = db.execute(
+                             "SELECT has_any_column_privilege(current_user,%s,%s)",
+                             ("medical_rag." + table, privilege),
+                         ).fetchone()[0]
+                     else:
+                         bad = db.execute(
+                             "SELECT has_table_privilege(current_user,%s,%s)",
+                             ("medical_rag." + table, privilege),
+                         ).fetchone()[0]
+                     if bad:
+                         raise StartupError()
+             required = {
+@@ -140,42 +151,46 @@ def preflight(config: PatientConfiguration) -> None:
+                     "UPDATE": "state_hash",
+                 },
+                 "patient_subjects": {"UPDATE": "patient_id"},
+                 "patient_consent_events": {
+                     "INSERT": "event_id tenant_id patient_id grantor_account_id purpose notice_version granted expires_at"
+                 },
+                 "conversations": {
+                     "INSERT": "tenant_id patient_id conversation_id title"
+                 },
+                 "conversation_turns": {
+                     "INSERT": "tenant_id patient_id conversation_id turn_id content"
+                 },
++                "security_audit_events": {
++                    "INSERT": "tenant_id operator_id action resource_type outcome reason_code request_id"
++                },
+             }
+             for table, permissions in required.items():
+                 for privilege, columns in permissions.items():
+                     for column in columns.split():
+                         if db.execute(
+                             "SELECT has_column_privilege(current_user,%s,%s,%s)",
+                             ("medical_rag." + table, column, privilege),
+                         ).fetchone() != (True,):
+                             raise StartupError()
+             if db.execute(
+                 "SELECT has_table_privilege(current_user,'medical_rag.oidc_login_transactions','DELETE')"
+             ).fetchone() != (True,):
+                 raise StartupError()
+             for table in (
+                 "patient_subjects",
+                 "patient_consent_events",
+                 "conversations",
+                 "conversation_turns",
++                "security_audit_events",
+             ):
+                 if db.execute(
+                     "SELECT relrowsecurity AND relforcerowsecurity FROM pg_catalog.pg_class WHERE oid=%s::regclass",
+                     ("medical_rag." + table,),
+                 ).fetchone() != (True,):
+                     raise StartupError()
+             if db.execute(
+                 "SELECT active FROM medical_rag.tenants WHERE tenant_id=%s",
+                 (config.tenant_id,),
+             ).fetchone() != (True,):
+                 raise StartupError()
+     except Exception:  # noqa: BLE001 -- SQL/DSN errors must never cross startup boundary
+@@ -258,13 +273,12 @@ def main(argv: list[str] | None = None) -> int:
+     except SystemExit as error:
+         if error.code == 0:
+             return 0
+         print(str(StartupError()), file=sys.stderr)
+         return 1
+     except Exception:  # noqa: BLE001 -- prevent server/path/secret tracebacks
+         print(str(StartupError()), file=sys.stderr)
+         return 1
+ 
+ 
+ if __name__ == "__main__":
+     raise SystemExit(main())
+-
+
+## database/patient_runtime_grants.sql
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/database__patient_runtime_grants.sql', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'database/patient_runtime_grants.sql', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/database__patient_runtime_grants.sql b/database/patient_runtime_grants.sql
+index fb63e2b..e3ceafd 100644
+--- a/outputs/patient-audit-baseline-20261102/database__patient_runtime_grants.sql
++++ b/database/patient_runtime_grants.sql
+@@ -1,13 +1,13 @@
+--- Owner-run psql only, after migrations 0001-0004 and external role audit:
++-- Owner-run psql only, after migrations 0001-0005 and external role audit:
+ -- psql ... -v runtime_role=patient_runtime -f database/patient_runtime_grants.sql
+ -- runtime_role must already be a dedicated NOSUPERUSER NOBYPASSRLS,
+ -- NOCREATEDB NOCREATEROLE NOREPLICATION role, with no privileged memberships,
+ -- schema CREATE, table ownership, DDL or inherited broader/PUBLIC authority.
+ -- This grant recipe does NOT revoke/audit old/inherited/PUBLIC permissions,
+ -- create roles/accounts, provision verification, or auto-apply migrations.
+ \set ON_ERROR_STOP on
+ BEGIN;
+ GRANT USAGE ON SCHEMA medical_rag TO :"runtime_role";
+ GRANT EXECUTE ON FUNCTION medical_rag.runtime_role_basic_check() TO :"runtime_role";
+ GRANT SELECT (tenant_id, active, session_version) ON medical_rag.tenants TO :"runtime_role";
+ GRANT SELECT (tenant_id, account_id, issuer, subject, active, session_version)
+@@ -30,16 +30,20 @@ GRANT SELECT (tenant_id, state_hash, browser_hash, tenant_version, encrypted_con
+ GRANT UPDATE (state_hash) ON medical_rag.oidc_login_transactions TO :"runtime_role";
+ GRANT SELECT (tenant_id, patient_id, conversation_id, title, created_at),
+     INSERT (tenant_id, patient_id, conversation_id, title)
+     ON medical_rag.conversations TO :"runtime_role";
+ GRANT SELECT (tenant_id, patient_id, conversation_id, turn_id, content, created_at),
+     INSERT (tenant_id, patient_id, conversation_id, turn_id, content)
+     ON medical_rag.conversation_turns TO :"runtime_role";
+ GRANT SELECT (event_id, tenant_id, patient_id, grantor_account_id, purpose,
+     notice_version, granted, recorded_at, expires_at, event_order),
+     INSERT (event_id, tenant_id, patient_id, grantor_account_id, purpose,
+     notice_version, granted, expires_at)
+     ON medical_rag.patient_consent_events TO :"runtime_role";
+--- Migration 0004 allocates event_order in an invoker trigger, NOT a sequence;
+--- migrations 0001-0004 contain no sequence/identity requiring extra grants.
++GRANT SELECT (event_id, tenant_id, operator_id, action, resource_type, outcome,
++    reason_code, recorded_at, event_order, request_id),
++    INSERT (tenant_id, operator_id, action, resource_type, outcome, reason_code, request_id)
++    ON medical_rag.security_audit_events TO :"runtime_role";
++-- No UPDATE/DELETE/TRUNCATE, DDL, ownership or BYPASSRLS. Server event UUID,
++-- time and identity order are not insertable columns. Identity sequence is
++-- generated by PostgreSQL and needs no extra runtime sequence privilege.
+ COMMIT;
+-
+
+## frontend/src/patient/PatientApp.tsx
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/frontend__src__patient__PatientApp.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/patient/PatientApp.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/frontend__src__patient__PatientApp.tsx b/frontend/src/patient/PatientApp.tsx
+index c20404b..096b65d 100644
+--- a/outputs/patient-audit-baseline-20261102/frontend__src__patient__PatientApp.tsx
++++ b/frontend/src/patient/PatientApp.tsx
+@@ -1,14 +1,16 @@
+ import { useCallback, useEffect, useRef, useState } from "react";
+ import { object, PatientError, request } from "./client";
++import { auditRows, type AuditRow } from "./audit";
++import { AuditTable } from "./AuditTable";
+ 
+ import {
+   identity,
+   consent,
+   row,
+   rows,
+   roles,
+   type View,
+   type Identity,
+   type Consent,
+   type Row,
+ } from "./model";
+@@ -22,24 +24,25 @@ function failureStatus(error: unknown) {
+     : error instanceof PatientError && error.status === 403
+       ? "forbidden"
+       : "unavailable";
+ }
+ export function PatientApp() {
+   const [status, setStatus] = useState("loading"),
+     [me, setMe] = useState<Identity | null>(null),
+     [view, setView] = useState<View>("identity");
+   const [notice, setNotice] = useState<Consent | null>(null),
+     [accepted, setAccepted] = useState(false),
+     [list, setList] = useState<Row[]>([]),
+     [turns, setTurns] = useState<Row[]>([]);
++  const [audit, setAudit] = useState<AuditRow[] | null>(null);
+   const [selected, setSelected] = useState<string | null>(null),
+     [title, setTitle] = useState(""),
+     [content, setContent] = useState(""),
+     [offset, setOffset] = useState(0),
+     [turnOffset, setTurnOffset] = useState(0),
+     [busy, setBusy] = useState(false);
+   const generation = useRef(0),
+     csrf = useRef<string | null>(null),
+     pending = useRef(false);
+   // Terminal actions belong to a separate lifecycle: hiding/navigating may
+   // invalidate view requests, but must never cancel logout/withdraw outcomes.
+   const terminal = useRef<Terminal | null>(null),
+@@ -48,24 +51,25 @@ export function PatientApp() {
+       document.visibilityState !== "hidden" && document.hasFocus(),
+     ),
+     mounted = useRef(true);
+   const clear = useCallback(() => {
+     generation.current++;
+     csrf.current = null;
+     pending.current = false;
+     setMe(null);
+     setNotice(null);
+     setAccepted(false);
+     setList([]);
+     setTurns([]);
++    setAudit(null);
+     setSelected(null);
+     setTitle("");
+     setContent("");
+     setOffset(0);
+     setTurnOffset(0);
+     setBusy(false);
+   }, []);
+   const failure = useCallback(
+     (error: unknown) => {
+       clear();
+       setStatus(active.current ? failureStatus(error) : "hidden");
+     },
+@@ -118,55 +122,63 @@ export function PatientApp() {
+         )
+           throw new PatientError();
+         const own = identity(await request("/me"));
+         if (!live()) return;
+         csrf.current = session.csrf_token;
+         setMe(own);
+         setView(target);
+         setStatus("ready");
+         if (
+           target !== "identity" &&
+           !(target === "consent"
+             ? own.permissions.health_consent
+-            : own.permissions.conversations)
++            : target === "audit"
++              ? own.permissions.audit
++              : own.permissions.conversations)
+         ) {
+           clear();
+           setStatus("forbidden");
+           return;
+         }
+         if (target === "consent") {
+           const data = consent(await request("/me/consents/health"));
+           if (live()) setNotice(data);
+         }
+         if (target === "conversations") {
+           const data = rows(
+             await request("/conversations?limit=20&offset=0"),
+             "title",
+           );
+           if (live()) setList(data);
+         }
++        if (target === "audit") {
++          const data = auditRows(await request("/audit?limit=20&offset=0"));
++          if (live()) setAudit(data);
++        }
+       });
+     },
+     [clear, perform],
+   );
+   useEffect(() => {
+     mounted.current = true;
+     focused.current = document.hasFocus();
+     active.current = document.visibilityState !== "hidden" && focused.current;
+     const requested = () =>
+       window.location.hash === "#consent"
+         ? "consent"
+-        : window.location.hash === "#conversations"
+-          ? "conversations"
+-          : "identity";
++        : window.location.hash === "#audit"
++          ? "audit"
++          : window.location.hash === "#conversations"
++            ? "conversations"
++            : "identity";
+     refresh(requested());
+     const hide = () => {
+       active.current = false;
+       clear();
+       setStatus("hidden");
+     };
+     const focus = () => {
+       focused.current = true;
+       if (document.visibilityState !== "hidden") {
+         active.current = true;
+         refresh();
+       }
+@@ -189,54 +201,60 @@ export function PatientApp() {
+       generation.current++;
+       window.removeEventListener("blur", blur);
+       window.removeEventListener("focus", focus);
+       window.removeEventListener("hashchange", hash);
+       document.removeEventListener("visibilitychange", visibility);
+     };
+   }, [clear, refresh]);
+   const navigate = (next: View) => {
+     if (terminal.current || pending.current || !active.current) return;
+     if (
+       !me ||
+       (next === "consent" && !me.permissions.health_consent) ||
+-      (next === "conversations" && !me.permissions.conversations)
++      (next === "conversations" && !me.permissions.conversations) ||
++      (next === "audit" && !me.permissions.audit)
+     ) {
+       failure(new PatientError(403));
+       return;
+     }
+     generation.current++;
+     setView(next);
+     setList([]);
++    setAudit(null);
+     setTurns([]);
+     setSelected(null);
+     setTitle("");
+     setContent("");
+     setNotice(null);
+     setAccepted(false);
+     setOffset(0);
+     setTurnOffset(0);
+     pending.current = false;
+     setBusy(false);
+     void perform(async (live) => {
+       if (next === "consent") {
+         const data = consent(await request("/me/consents/health"));
+         if (live()) setNotice(data);
+       }
+       if (next === "conversations") {
+         const data = rows(
+           await request("/conversations?limit=20&offset=0"),
+           "title",
+         );
+         if (live()) setList(data);
+       }
++      if (next === "audit") {
++        const data = auditRows(await request("/audit?limit=20&offset=0"));
++        if (live()) setAudit(data);
++      }
+     });
+   };
+   const mutate = (
+     operation: (token: string, live: () => boolean) => Promise<void>,
+   ) => {
+     if (pending.current || !csrf.current || terminal.current || !active.current)
+       return;
+     // Invalidates initial/pagination reads before a mutation and its canonical
+     // server reload; older reads cannot overwrite the newly saved page.
+     generation.current++;
+     pending.current = true;
+     setBusy(true);
+@@ -271,24 +289,36 @@ export function PatientApp() {
+       } catch (error) {
+         barrier.status = failureStatus(error);
+       }
+       if (!mounted.current || terminal.current !== barrier) return;
+       clear();
+       if (!active.current) setStatus("hidden");
+       else if (barrier.status === "withdrawn") refresh("consent");
+       else setStatus(barrier.status);
+     })();
+   };
+   const logout = () => terminate("logout");
+   const withdraw = () => terminate("withdraw");
++  const pageAudit = (amount: number) => {
++    if (pending.current || terminal.current || !active.current) return;
++    generation.current++;
++    const next = Math.min(10000, Math.max(0, offset + amount));
++    void perform(async (live) => {
++      const data = auditRows(await request(`/audit?limit=20&offset=${next}`));
++      if (live()) {
++        setAudit(data);
++        setOffset(next);
++      }
++    });
++  };
+   const page = (amount: number, isTurn = false) => {
+     if (pending.current || terminal.current || !active.current) return;
+     generation.current++;
+     const next = Math.min(
+       10000,
+       Math.max(0, (isTurn ? turnOffset : offset) + amount),
+     );
+     void perform(async (live) => {
+       const data = rows(
+         await request(
+           isTurn
+             ? `/conversations/${selected}/turns?limit=20&offset=${next}`
+@@ -354,24 +384,29 @@ export function PatientApp() {
+                 <button disabled={busy} onClick={() => navigate("consent")}>
+                   健康信息授权
+                 </button>
+               )}
+               {me.permissions.conversations && (
+                 <button
+                   disabled={busy}
+                   onClick={() => navigate("conversations")}
+                 >
+                   会话记录
+                 </button>
+               )}
++              {me.permissions.audit && (
++                <button disabled={busy} onClick={() => navigate("audit")}>
++                  安全审计
++                </button>
++              )}
+               <button className="patient-secondary" onClick={logout}>
+                 退出登录
+               </button>
+             </nav>
+             {view === "identity" && (
+               <section>
+                 <h2>我的身份</h2>
+                 <dl>
+                   <dt>本系统账户</dt>
+                   <dd>{me.user_id}</dd>
+                   <dt>所属机构</dt>
+                   <dd>{me.tenant_id}</dd>
+@@ -395,24 +430,32 @@ export function PatientApp() {
+                 ) && (
+                   <p>
+                     管理身份不授予患者内容访问权；管理与支持业务模块尚未开放。
+                   </p>
+                 )}
+                 {(!me.binding.verified || !me.permissions.health_consent) && (
+                   <p>
+                     需机构完成身份与绑定核验，并确认年龄及监护规则；未核验、未成年人、监护人及年龄未知路径不开放患者内容。
+                   </p>
+                 )}
+               </section>
+             )}
++            {view === "audit" && (
++              <AuditTable
++                rows={audit}
++                offset={offset}
++                busy={busy}
++                page={pageAudit}
++              />
++            )}
+             {view === "consent" && (
+               <section>
+                 <h2>健康信息使用授权</h2>
+                 <p>
+                   不包含医院病历接入或外部模型处理。撤回仅停止未来目的使用，不删除历史记录。
+                 </p>
+                 {!notice ? (
+                   <p role="status">正在读取机构告知…</p>
+                 ) : (
+                   <>
+                     <h3>机构告知 · {notice.notice.version}</h3>
+                     <p className="patient-prose">{notice.notice.text}</p>
+@@ -623,13 +666,12 @@ export function PatientApp() {
+                 )}
+               </section>
+             )}
+           </>
+         )}
+       </main>
+       <footer>
+         机构规则与真实身份核验仍须由可信机构流程完成。本环境不代表生产、临床或法律验收。
+       </footer>
+     </div>
+   );
+ }
+-
+
+## frontend/src/patient/model.ts
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/frontend__src__patient__model.ts', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/patient/model.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/frontend__src__patient__model.ts b/frontend/src/patient/model.ts
+index 50ad856..6c8c519 100644
+--- a/outputs/patient-audit-baseline-20261102/frontend__src__patient__model.ts
++++ b/frontend/src/patient/model.ts
+@@ -1,24 +1,25 @@
+ import { object, PatientError } from "./client";
+ 
+-export type View = "identity" | "consent" | "conversations";
++export type View = "identity" | "consent" | "conversations" | "audit";
+ export type Identity = {
+   user_id: string;
+   tenant_id: string;
+   roles: string[];
+   binding: { verified: boolean };
+   permissions: {
+     identity: boolean;
+     health_consent: boolean;
+     conversations: boolean;
++    audit: boolean;
+   };
+ };
+ export type Consent = {
+   notice: { version: string; text: string; validity_seconds: number };
+   granted: boolean;
+   expires_at: string | null;
+ };
+ export type Row = {
+   id: string;
+   title?: string;
+   content?: string;
+   created_at: string;
+@@ -37,25 +38,26 @@ export const roles: Record<string, string> = {
+ export function identity(value: unknown): Identity {
+   if (
+     !object(value) ||
+     typeof value.user_id !== "string" ||
+     typeof value.tenant_id !== "string" ||
+     !Array.isArray(value.roles) ||
+     !value.roles.every((x) => typeof x === "string") ||
+     !object(value.binding) ||
+     typeof value.binding.verified !== "boolean" ||
+     !object(value.permissions) ||
+     value.permissions.identity !== true ||
+     typeof value.permissions.health_consent !== "boolean" ||
+-    typeof value.permissions.conversations !== "boolean"
++    typeof value.permissions.conversations !== "boolean" ||
++    typeof value.permissions.audit !== "boolean"
+   )
+     throw new PatientError();
+   return value as Identity;
+ }
+ export function consent(value: unknown): Consent {
+   if (
+     !object(value) ||
+     !object(value.notice) ||
+     typeof value.notice.version !== "string" ||
+     typeof value.notice.text !== "string" ||
+     typeof value.notice.validity_seconds !== "number" ||
+     typeof value.granted !== "boolean" ||
+@@ -79,13 +81,12 @@ export function row(value: unknown, field: "title" | "content"): Row {
+ }
+ export function rows(value: unknown, field: "title" | "content"): Row[] {
+   if (
+     !object(value) ||
+     !Array.isArray(value.items) ||
+     value.items.length > 20 ||
+     typeof value.offset !== "number" ||
+     value.limit !== 20
+   )
+     throw new PatientError();
+   return value.items.map((x) => row(x, field));
+ }
+-
+
+## frontend/src/test/patient-app.test.tsx
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/frontend__src__test__patient-app.test.tsx', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/test/patient-app.test.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/frontend__src__test__patient-app.test.tsx b/frontend/src/test/patient-app.test.tsx
+index e2d8f80..8c91147 100644
+--- a/outputs/patient-audit-baseline-20261102/frontend__src__test__patient-app.test.tsx
++++ b/frontend/src/test/patient-app.test.tsx
+@@ -5,25 +5,30 @@ import {
+   render,
+   screen,
+   waitFor,
+ } from "@testing-library/react";
+ import { afterEach, beforeEach, expect, it, vi } from "vitest";
+ import { PatientApp } from "../patient/PatientApp";
+ 
+ const identity = {
+   user_id: "account-own",
+   tenant_id: "institution-own",
+   roles: ["patient"],
+   binding: { verified: true },
+-  permissions: { identity: true, health_consent: true, conversations: true },
++  permissions: {
++    identity: true,
++    health_consent: true,
++    conversations: true,
++    audit: false,
++  },
+ };
+ const notice = {
+   notice: {
+     version: "institution-v7",
+     text: "机构完整告知 <script>private</script>",
+     validity_seconds: 3600,
+   },
+   granted: false,
+   expires_at: null,
+ };
+ const item = {
+   id: "00000000-0000-0000-0000-000000000001",
+@@ -73,24 +78,115 @@ beforeEach(() => {
+     }),
+   );
+ });
+ afterEach(() => {
+   cleanup();
+   vi.restoreAllMocks();
+   vi.unstubAllGlobals();
+ });
+ const open = async (name: string) => {
+   await screen.findByRole("button", { name });
+   fireEvent.click(screen.getByRole("button", { name }));
+ };
++const auditItem = {
++  id: item.id,
++  time: "2026-11-02T00:00:00Z",
++  operator_id: null,
++  action: "<img src=x onerror=alert(1)>",
++  resource_type: "identity",
++  outcome: "allowed",
++  reason_code: "ok",
++  request_id: "00000000-0000-0000-0000-000000000002",
++};
++const auditorIdentity = {
++  ...identity,
++  roles: ["auditor"],
++  binding: { verified: false },
++  permissions: {
++    identity: true,
++    health_consent: false,
++    conversations: false,
++    audit: true,
++  },
++};
++it("shows permission-gated audit metadata as plain text with bounded pagination", async () => {
++  handler = (url) =>
++    url === "/auth/session"
++      ? { csrf_token: "csrf-memory" }
++      : url === "/me"
++        ? auditorIdentity
++        : { items: [auditItem], limit: 20, offset: 0 };
++  render(<PatientApp />);
++  await open("安全审计");
++  expect(
++    await screen.findByRole("table", { name: "安全审计元数据" }),
++  ).toBeInTheDocument();
++  expect(screen.getByText(auditItem.action)).toBeInTheDocument();
++  expect(document.querySelector("img")).toBeNull();
++  expect(screen.getByText("未验证操作者")).toBeInTheDocument();
++  expect(
++    screen.queryByRole("button", { name: "健康信息授权" }),
++  ).not.toBeInTheDocument();
++  expect(
++    screen.queryByRole("button", { name: "会话记录" }),
++  ).not.toBeInTheDocument();
++  expect(screen.getByRole("button", { name: "上一页审计" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("button", { name: "下一页审计" }));
++  await waitFor(() => expect(calls).toContain("/audit?limit=20&offset=20"));
++  await waitFor(() =>
++    expect(
++      screen.getByRole("button", { name: "上一页审计" }),
++    ).not.toBeDisabled(),
++  );
++});
++it.each(["patient", "support", "org_admin", "platform_operator", "auditor"])(
++  "denies direct audit hash without fetching for %s lacking effective permission",
++  async (role) => {
++    window.history.replaceState(null, "", "#audit");
++    handler = (url) =>
++      url === "/auth/session"
++        ? { csrf_token: "csrf" }
++        : { ...identity, roles: [role] };
++    render(<PatientApp />);
++    expect(await screen.findByText(/403/)).toBeInTheDocument();
++    expect(calls).toEqual(["/auth/session", "/me"]);
++    expect(screen.queryByRole("table")).not.toBeInTheDocument();
++  },
++);
++it("discards delayed audit metadata on logout and keeps audit503 logout terminal", async () => {
++  let resolveAudit!: (value: unknown) => void;
++  handler = (url) =>
++    url === "/auth/session"
++      ? { csrf_token: "csrf" }
++      : url === "/me"
++        ? auditorIdentity
++        : url === "/auth/logout"
++          ? new Response("private-audit-error", { status: 503 })
++          : new Promise((resolve) => {
++              resolveAudit = resolve;
++            });
++  render(<PatientApp />);
++  await open("安全审计");
++  await waitFor(() => expect(calls).toContain("/audit?limit=20&offset=0"));
++  fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
++  expect(await screen.findByText("服务暂不可用，请重试。")).toBeInTheDocument();
++  await act(async () =>
++    resolveAudit({ items: [auditItem], limit: 20, offset: 0 }),
++  );
++  const before = calls.length;
++  fireEvent(window, new Event("focus"));
++  fireEvent(window, new Event("hashchange"));
++  expect(calls).toHaveLength(before);
++  expect(screen.queryByText(auditItem.action)).not.toBeInTheDocument();
++});
+ it("shows only a same-origin institutional POST login after 401", async () => {
+   handler = () => new Response("secret", { status: 401 });
+   render(<PatientApp />);
+   const login = await screen.findByRole("button", { name: "机构登录" });
+   expect(login.closest("form")).toHaveAttribute("action", "/auth/login");
+   expect(login.closest("form")).toHaveAttribute("method", "post");
+   expect(calls).toEqual(["/auth/session"]);
+ });
+ it("loads identity, translates roles, keeps staff and unverified paths closed", async () => {
+   handler = (url) =>
+     url === "/auth/session"
+       ? { ...identity, csrf_token: "csrf" }
+@@ -99,45 +195,47 @@ it("loads identity, translates roles, keeps staff and unverified paths closed",
+           roles: [
+             "org_admin",
+             "support",
+             "platform_operator",
+             "guardian",
+             "unknown",
+           ],
+           binding: { verified: false },
+           permissions: {
+             identity: true,
+             health_consent: false,
+             conversations: false,
++            audit: false,
+           },
+         };
+   render(<PatientApp />);
+   expect(await screen.findByText("account-own")).toBeInTheDocument();
+   expect(screen.getByText(/管理身份不授予/)).toBeInTheDocument();
+   expect(
+     screen.queryByRole("button", { name: "会话记录" }),
+   ).not.toBeInTheDocument();
+   expect(calls).toEqual(["/auth/session", "/me"]);
+ });
+ it("explicit forbidden hash shows 403 without fetching sensitive content", async () => {
+   window.history.replaceState(null, "", "#conversations");
+   handler = (url) =>
+     url === "/auth/session"
+       ? { ...identity, csrf_token: "csrf" }
+       : {
+           ...identity,
+           permissions: {
+             identity: true,
+             health_consent: false,
+             conversations: false,
++            audit: false,
+           },
+         };
+   render(<PatientApp />);
+   expect(await screen.findByText(/403/)).toBeInTheDocument();
+   expect(calls).toEqual(["/auth/session", "/me"]);
+ });
+ it("requires unchecked acknowledgment and submits exact version+CSRF, then refreshes authority", async () => {
+   render(<PatientApp />);
+   await open("健康信息授权");
+   expect(await screen.findByText(notice.notice.text)).toBeInTheDocument();
+   expect(screen.getByRole("button", { name: "明确同意" })).toBeDisabled();
+   fireEvent.click(screen.getByRole("checkbox"));
+@@ -391,24 +489,25 @@ it("successful withdrawal reauthenticates and no longer offers conversations", a
+   handler = (url, init) => {
+     if (init.method === "DELETE") {
+       withdrawn = true;
+       return notice;
+     }
+     if (url === "/me" && withdrawn)
+       return {
+         ...identity,
+         permissions: {
+           identity: true,
+           health_consent: true,
+           conversations: false,
++          audit: false,
+         },
+       };
+     if (url.includes("consents")) return { ...notice, granted: !withdrawn };
+     return original(url, init);
+   };
+   render(<PatientApp />);
+   await open("健康信息授权");
+   await open("撤回授权");
+   await screen.findByText("当前未授权");
+   expect(
+     screen.queryByRole("button", { name: "会话记录" }),
+   ).not.toBeInTheDocument();
+@@ -458,24 +557,25 @@ it.each(["logout", "withdraw"] as const)(
+       if (
+         (kind === "logout" && url === "/auth/logout") ||
+         (kind === "withdraw" && init.method === "DELETE")
+       )
+         return new Promise((r) => (release = r));
+       if (url === "/me" && withdrawn)
+         return {
+           ...identity,
+           permissions: {
+             identity: true,
+             health_consent: true,
+             conversations: false,
++            audit: false,
+           },
+         };
+       if (url.includes("consents")) return { ...notice, granted: !withdrawn };
+       return original(url, init);
+     };
+     render(<PatientApp />);
+     await open("会话记录");
+     await screen.findByText("私密标题");
+     if (kind === "withdraw") {
+       await open("健康信息授权");
+       await open("撤回授权");
+     } else await open("退出登录");
+@@ -593,24 +693,25 @@ it.each(["logout", "withdraw"] as const)(
+       if (
+         (kind === "logout" && url === "/auth/logout") ||
+         (kind === "withdraw" && init.method === "DELETE")
+       )
+         return new Promise((r) => (release = r));
+       if (url === "/me" && withdrawn)
+         return {
+           ...identity,
+           permissions: {
+             identity: true,
+             health_consent: true,
+             conversations: false,
++            audit: false,
+           },
+         };
+       return url.includes("consents")
+         ? { ...notice, granted: !withdrawn }
+         : original(url, init);
+     };
+     render(<PatientApp />);
+     if (kind === "withdraw") {
+       await open("健康信息授权");
+       await open("撤回授权");
+     } else await open("退出登录");
+     fireEvent.blur(window);
+@@ -726,13 +827,12 @@ it("visibility alone cannot unlock an unfocused window", async () => {
+   fireEvent.focus(window);
+   await screen.findByText("account-own");
+ });
+ it("initially unfocused window waits for actual focus", async () => {
+   vi.mocked(document.hasFocus).mockReturnValue(false);
+   render(<PatientApp />);
+   await act(async () => {});
+   expect(calls).toEqual([]);
+   expect(screen.getByText(/页面已锁定/)).toBeInTheDocument();
+   fireEvent.focus(window);
+   await screen.findByText("account-own");
+ });
+-
+
+## tests/test_patient_vertical.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/tests__test_patient_vertical.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_patient_vertical.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/tests__test_patient_vertical.py b/tests/test_patient_vertical.py
+index 8a97eb9..48eabc0 100644
+--- a/outputs/patient-audit-baseline-20261102/tests__test_patient_vertical.py
++++ b/tests/test_patient_vertical.py
+@@ -32,24 +32,28 @@ from medical_rag.oidc_identity import VerifiedIdentity
+ 
+ PATIENT = "00000000-0000-0000-0000-000000000301"
+ OTHER = "00000000-0000-0000-0000-000000000302"
+ OTHER_ACCOUNT = "00000000-0000-0000-0000-000000000202"
+ OTHER_TENANT = "00000000-0000-0000-0000-000000000102"
+ 
+ 
+ @pytest.fixture(scope="module")
+ def database(oidc_database):
+     runtime, admin = oidc_database
+     with psycopg.connect(**admin) as db:
+         db.execute((ROOT / "database/migrations/0004_patient_access.sql").read_text(encoding="utf-8"))
++        db.execute((ROOT / "database/migrations/0005_security_audit.sql").read_text(encoding="utf-8"))
++        db.execute("GRANT SELECT ON medical_rag.security_audit_events TO login_test")
++        db.execute("GRANT INSERT (tenant_id,operator_id,action,resource_type,outcome,reason_code,request_id) "
++                   "ON medical_rag.security_audit_events TO login_test")
+         db.execute("REVOKE SELECT ON medical_rag.tenants,medical_rag.identity_accounts, "
+                    "medical_rag.identity_roles,medical_rag.identity_bindings FROM login_test")
+         for table, columns in {
+             "tenants": "tenant_id,active,session_version",
+             "identity_accounts": "tenant_id,account_id,issuer,subject,active,session_version",
+             "identity_roles": "tenant_id,account_id,role",
+             "identity_bindings": "tenant_id,account_id,patient_id,verified",
+         }.items():
+             db.execute(f"GRANT SELECT ({columns}) ON medical_rag.{table} TO login_test")
+         db.execute("GRANT SELECT (tenant_id,patient_id,age_classification,identity_verified) "
+                    "ON medical_rag.patient_subjects TO login_test")
+         db.execute("GRANT UPDATE (patient_id) ON medical_rag.patient_subjects TO login_test")
+@@ -108,25 +112,25 @@ def count_events(admin):
+ def test_patient_slice_has_live_service_and_protected_app():
+     assert importlib.util.find_spec("medical_rag.patient_service") is not None
+     assert importlib.util.find_spec("medical_rag.patient_api") is not None
+ 
+ 
+ @pytest.mark.integration
+ def test_full_oidc_patient_consent_conversation_and_turn_flow(system):
+     client, _, _, admin = system
+     headers = logged_in(system)
+     me = client.get("/me").json()["data"]
+     assert me["user_id"] == ACCOUNT and me["tenant_id"] == TENANT
+     assert me["binding"] == {"verified": True}
+-    assert me["permissions"] == {"identity": True, "health_consent": True, "conversations": False}
++    assert me["permissions"] == {"identity": True, "health_consent": True, "conversations": False, "audit": False}
+     assert client.get("/conversations").status_code == 403
+     notice = client.get("/me/consents/health").json()["data"]
+     assert notice["notice"]["text"].startswith("Fictional development") and notice["granted"] is False
+     assert grant(client, headers).json()["data"]["granted"] is True
+     assert client.get("/me").json()["data"]["permissions"]["conversations"] is True
+     response = client.post("/conversations", headers=headers, json={"title": "fictional title"})
+     assert response.status_code == 200
+     conversation = response.json()["data"]
+     assert conversation["title"] == "fictional title"
+     path = "/conversations/" + conversation["id"]
+     assert client.get(path).json()["data"] == conversation
+     assert client.get("/conversations?limit=1&offset=0").json()["data"]["items"] == [conversation]
+@@ -285,25 +289,25 @@ def test_patient_verification_and_all_nonadult_classes_deny(system, field, value
+     assert client.get("/conversations").status_code == 403
+     assert client.get("/me").json()["data"]["permissions"]["conversations"] is False
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("role", ["org_admin", "support", "platform_operator", "guardian"])
+ def test_staff_and_guardians_have_no_implicit_patient_permissions(system, role):
+     client, _, _, admin = system
+     mutate(admin, "DELETE FROM medical_rag.identity_roles WHERE account_id=%s", (ACCOUNT,))
+     mutate(admin, "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,%s)", (TENANT, ACCOUNT, role))
+     headers = logged_in(system)
+     assert client.get("/me").json()["data"]["permissions"] == {
+-        "identity": True, "health_consent": False, "conversations": False}
++        "identity": True, "health_consent": False, "conversations": False, "audit": False}
+     assert client.get("/me/consents/health").status_code == 403
+     assert client.post("/me/consents/health", headers=headers,
+                        json={"version": "fictional-v1", "accepted": True}).status_code == 403
+ 
+ 
+ @pytest.mark.integration
+ @pytest.mark.parametrize("change", ["account", "tenant", "role", "binding", "expiry", "logout"])
+ def test_live_authority_changes_deny_next_operation(system, change):
+     client, _, _, admin = system
+     headers = logged_in(system)
+     grant(client, headers)
+     changes = {
+@@ -505,13 +509,12 @@ def test_consent_server_order_timestamp_and_append_only(system):
+     headers = logged_in(system)
+     grant(client, headers)
+     with psycopg.connect(**admin) as db:
+         assert db.execute("SELECT array_agg(event_order ORDER BY event_order) FROM medical_rag.patient_consent_events").fetchone() == ([1, 2],)
+ 
+ 
+ @pytest.mark.parametrize("args", [("", "text", 1), ("v", "", 1), ("v", "text", 0),
+     ("v", "text", 31536001), ("v", "text", True), ("v" * 129, "text", 1), ("v", "x" * 64001, 1)])
+ def test_notice_configuration_requires_actual_bounded_trusted_text(args):
+     from medical_rag.patient_service import HealthNotice
+     with pytest.raises(ValueError):
+         HealthNotice(*args)
+-
+
+## tests/test_security_server.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/tests__test_security_server.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_security_server.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/tests__test_security_server.py b/tests/test_security_server.py
+index 3cf6791..8c67de5 100644
+--- a/outputs/patient-audit-baseline-20261102/tests__test_security_server.py
++++ b/tests/test_security_server.py
+@@ -203,25 +203,30 @@ def test_app_mounts_only_dedicated_build_with_self_only_csp(config_file, monkeyp
+         assert client.get("/assets/patient.js").status_code == 200
+         assert client.get("/assets/").status_code == 404
+         for path in [
+             "/ui",
+             "/chat",
+             "/api/chat",
+             "/settings",
+             "/docs",
+             "/openapi.json",
+             "/patient.toml",
+             "/assets/../patient.toml",
+         ]:
+-            assert client.get(path).status_code == 404
++            # This isolated asset-loader test deliberately has no live DB.
++            # Mandatory failed-attempt auditing therefore fails closed, rather
++            # than silently disabling audit to return an ordinary route404.
++            assert client.get(path).status_code == 503
++        registered = {getattr(route, "path", None) for route in app.routes}
++        assert not registered & {"/ui", "/chat", "/api/chat", "/settings", "/docs", "/openapi.json"}
+         csp = response.headers["content-security-policy"]
+         assert (
+             "script-src 'self'" in csp
+             and "unsafe-" not in csp
+             and "form-action 'self'" in csp
+         )
+         assert response.headers["cache-control"] == "no-store"
+         assert client.get("/", headers={"Host": "evil.example"}).status_code == 403
+         assert (
+             client.get("/", headers={"Origin": "https://evil.example"}).status_code
+             == 403
+         )
+@@ -710,13 +715,12 @@ def test_real_direct_tls_process_serves_only_dedicated_build(
+                 time.sleep(0.1)
+         else:
+             pytest.fail("direct TLS test listener did not become ready")
+         assert (
+             response.startswith(b"HTTP/1.1 200") and b"/assets/patient.js" in response
+         )
+         assert b"server: uvicorn" not in response.lower()
+         assert b"cache-control: no-store" in response.lower()
+     finally:
+         process.terminate()
+         stdout, stderr = process.communicate(timeout=10)
+     assert stdout == b"" and stderr == b""
+-
+
+## tests/test_oidc_login.py
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/tests__test_oidc_login.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'tests/test_oidc_login.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/tests__test_oidc_login.py b/tests/test_oidc_login.py
+index 4f91f72..923243e 100644
+--- a/outputs/patient-audit-baseline-20261102/tests__test_oidc_login.py
++++ b/tests/test_oidc_login.py
+@@ -86,27 +86,34 @@ def database():
+             connection.execute("GRANT SELECT,INSERT,UPDATE ON medical_rag.identity_sessions TO login_test")
+             connection.execute("GRANT SELECT,INSERT,UPDATE,DELETE ON medical_rag.oidc_login_transactions TO login_test")
+         yield dict(admin, user="login_test", autocommit=False), admin
+     finally:
+         subprocess.run(["docker", "stop", "--time", "1", container], capture_output=True, check=False)
+ 
+ 
+ @pytest.fixture
+ def system(database, signing_key):
+     import psycopg
+     runtime, admin = database
+     with psycopg.connect(**admin) as connection:
++        # Audited patient fixtures add append-only history. Only this disposable
++        # database's owner may disable the truncate guard for per-test reset.
++        audited = connection.execute("SELECT to_regclass('medical_rag.security_audit_events')").fetchone()[0]
++        if audited:
++            connection.execute("ALTER TABLE medical_rag.security_audit_events DISABLE TRIGGER security_audit_no_truncate")
+         connection.execute("TRUNCATE medical_rag.oidc_login_transactions, medical_rag.identity_sessions, "
+                            "medical_rag.identity_roles, medical_rag.identity_bindings, "
+                            "medical_rag.identity_accounts, medical_rag.tenants CASCADE")
++        if audited:
++            connection.execute("ALTER TABLE medical_rag.security_audit_events ENABLE TRIGGER security_audit_no_truncate")
+         connection.execute("INSERT INTO medical_rag.tenants(tenant_id) VALUES (%s)", (TENANT,))
+         connection.execute("INSERT INTO medical_rag.identity_accounts(tenant_id,account_id,issuer,subject) "
+                            "VALUES (%s,%s,%s,'subject-1')", (TENANT, ACCOUNT, ISSUER))
+         connection.execute("INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'patient')", (TENANT, ACCOUNT))
+     provider = {"nonce": None, "calls": [], "mode": "valid"}
+ 
+     def response(request):
+         provider["calls"].append(request)
+         if provider["mode"] == "raise":
+             raise RuntimeError("provider-private-secret-NEVER-LOG")
+         if provider["mode"] == "reactivate":
+             with psycopg.connect(**admin) as connection:
+@@ -498,13 +505,12 @@ def test_untrusted_or_ambiguous_configuration_rejected(signing_key, field, value
+     with pytest.raises(ValueError):
+         configuration(signing_key, **{field: value})
+ 
+ 
+ @pytest.mark.integration
+ def test_origin_and_host_cannot_change_trusted_login_configuration(system):
+     client, _, provider, _ = system
+     assert client.post("/auth/login", headers={"Origin": "https://evil.example"}).status_code == 403
+     assert client.post("/auth/login", headers={"Origin": APP_ORIGIN, "Host": "evil.example"}).status_code == 403
+     assert client.post("/auth/login").status_code == 403
+     assert client.get("/conversations").status_code == 404
+     assert provider["calls"] == []
+-
+
+## frontend/src/patient/patient.css
+warning: in the working copy of 'outputs/patient-audit-baseline-20261102/frontend__src__patient__patient.css', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'frontend/src/patient/patient.css', LF will be replaced by CRLF the next time Git touches it
+diff --git a/outputs/patient-audit-baseline-20261102/frontend__src__patient__patient.css b/frontend/src/patient/patient.css
+index 95d235a..6febbfb 100644
+--- a/outputs/patient-audit-baseline-20261102/frontend__src__patient__patient.css
++++ b/frontend/src/patient/patient.css
+@@ -130,24 +130,40 @@ li {
+   margin: 0.6rem 0;
+ }
+ .patient-paging {
+   display: flex;
+   align-items: center;
+   gap: 0.75rem;
+   flex-wrap: wrap;
+   margin: 1rem 0;
+ }
+ [role="alert"] {
+   color: #963a22;
+ }
++.patient-audit {
++  overflow-x: auto;
++}
++.patient-audit table {
++  border-collapse: collapse;
++  width: 100%;
++  font-size: 0.85rem;
++}
++.patient-audit th,
++.patient-audit td {
++  padding: 0.65rem;
++  border: 1px solid #cfdddf;
++  text-align: left;
++  overflow-wrap: anywhere;
++  min-width: 8rem;
++}
+ @media (max-width: 600px) {
+   main,
+   header {
+     padding: 1.2rem;
+   }
+   section {
+     padding: 1rem;
+   }
+   nav button {
+     flex: 1 1 40%;
+   }
+ }
+
+## database/migrations/0005_security_audit.sql
+warning: in the working copy of 'database/migrations/0005_security_audit.sql', LF will be replaced by CRLF the next time Git touches it
+diff --git a/database/migrations/0005_security_audit.sql b/database/migrations/0005_security_audit.sql
+new file mode 100644
+index 0000000..786f551
+--- /dev/null
++++ b/database/migrations/0005_security_audit.sql
+@@ -0,0 +1,50 @@
++-- Owner-run migration, not a role creator or a tamper-proof external ledger.
++-- The trusted application supplies the fixed institution and verified operator.
++-- Application roles cannot mutate events; a schema owner can change protections.
++BEGIN;
++
++CREATE TABLE medical_rag.security_audit_events (
++    event_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
++    tenant_id uuid NOT NULL REFERENCES medical_rag.tenants(tenant_id),
++    -- Deliberately no account FK: account deletion must not erase history.
++    operator_id uuid,
++    action text NOT NULL CHECK (action IN (
++        'login.start','login.finish','session.read','logout','identity.read',
++        'consent.read','consent.grant','consent.withdraw','conversation.create',
++        'conversation.list','conversation.read','turn.append','turn.list','audit.read','request')),
++    resource_type text NOT NULL CHECK (resource_type IN (
++        'authentication','identity','health_consent','conversation','turn','audit','application')),
++    outcome text NOT NULL CHECK (outcome IN ('allowed','denied','error')),
++    reason_code text NOT NULL CHECK (reason_code IN (
++        'ok','authentication_denied','access_denied','resource_not_found',
++        'invalid_request','request_denied','operation_unavailable')),
++    recorded_at timestamptz NOT NULL DEFAULT clock_timestamp(),
++    event_order bigint GENERATED ALWAYS AS IDENTITY UNIQUE,
++    request_id uuid NOT NULL
++);
++CREATE INDEX security_audit_institution_order
++    ON medical_rag.security_audit_events(tenant_id,event_order DESC);
++
++CREATE FUNCTION medical_rag.reject_audit_mutation() RETURNS trigger
++LANGUAGE plpgsql SECURITY INVOKER SET search_path=pg_catalog AS $$
++BEGIN
++    RAISE EXCEPTION 'Audit events are append only';
++END;
++$$;
++CREATE TRIGGER security_audit_append_only BEFORE UPDATE OR DELETE
++    ON medical_rag.security_audit_events FOR EACH ROW
++    EXECUTE FUNCTION medical_rag.reject_audit_mutation();
++CREATE TRIGGER security_audit_no_truncate BEFORE TRUNCATE
++    ON medical_rag.security_audit_events FOR EACH STATEMENT
++    EXECUTE FUNCTION medical_rag.reject_audit_mutation();
++
++ALTER TABLE medical_rag.security_audit_events ENABLE ROW LEVEL SECURITY;
++ALTER TABLE medical_rag.security_audit_events FORCE ROW LEVEL SECURITY;
++CREATE POLICY security_audit_institution_scope ON medical_rag.security_audit_events
++    USING (current_setting('app.audit_scope',true) =
++        pg_current_xact_id_if_assigned()::text || '/' || tenant_id::text)
++    WITH CHECK (current_setting('app.audit_scope',true) =
++        pg_current_xact_id_if_assigned()::text || '/' || tenant_id::text);
++REVOKE ALL ON medical_rag.security_audit_events FROM PUBLIC;
++REVOKE ALL ON SEQUENCE medical_rag.security_audit_events_event_order_seq FROM PUBLIC;
++COMMIT;
+
+## src/medical_rag/security_audit.py
+warning: in the working copy of 'src/medical_rag/security_audit.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/medical_rag/security_audit.py b/src/medical_rag/security_audit.py
+new file mode 100644
+index 0000000..0c02180
+--- /dev/null
++++ b/src/medical_rag/security_audit.py
+@@ -0,0 +1,260 @@
++"""Mandatory minimal audit for the isolated patient app, not legacy/headless auth.
++
++Success uses the operation's live primary transaction; attempted denials use a
++separate bounded transaction after rollback. Never pass exceptions, request
++payloads, paths, external identities or resource identifiers into the recorder.
++RLS is defense in depth under a trusted application, not arbitrary-SQL defense
++or protection against a database/schema owner changing these protections.
++"""
++
++from collections.abc import Awaitable, Callable, Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
++from dataclasses import dataclass, field
++from enum import StrEnum
++from uuid import UUID, uuid4
++
++from fastapi import FastAPI, Request
++from fastapi.responses import JSONResponse, Response
++from psycopg import Connection
++from starlette.concurrency import run_in_threadpool
++
++from .access_policy import Action, Principal, Resource, is_allowed
++from .identity_sessions import AuthenticationDenied, AuthorizedTransaction, SessionStore
++
++
++class AuditUnavailable(Exception):
++    """Static public failure; never include storage error text."""
++
++
++class AuditDenied(Exception):
++    """Current principal lacks institution audit permission and verified MFA."""
++
++
++class AuditAction(StrEnum):
++    LOGIN_START = "login.start"
++    LOGIN_FINISH = "login.finish"
++    SESSION_READ = "session.read"
++    LOGOUT = "logout"
++    IDENTITY_READ = "identity.read"
++    CONSENT_READ = "consent.read"
++    CONSENT_GRANT = "consent.grant"
++    CONSENT_WITHDRAW = "consent.withdraw"
++    CONVERSATION_CREATE = "conversation.create"
++    CONVERSATION_LIST = "conversation.list"
++    CONVERSATION_READ = "conversation.read"
++    TURN_APPEND = "turn.append"
++    TURN_LIST = "turn.list"
++    AUDIT_READ = "audit.read"
++    REQUEST = "request"
++
++
++class AuditResource(StrEnum):
++    AUTHENTICATION = "authentication"
++    IDENTITY = "identity"
++    HEALTH_CONSENT = "health_consent"
++    CONVERSATION = "conversation"
++    TURN = "turn"
++    AUDIT = "audit"
++    APPLICATION = "application"
++
++
++_RESOURCES = {
++    **dict.fromkeys((AuditAction.LOGIN_START, AuditAction.LOGIN_FINISH, AuditAction.SESSION_READ,
++                     AuditAction.LOGOUT), AuditResource.AUTHENTICATION),
++    AuditAction.IDENTITY_READ: AuditResource.IDENTITY,
++    **dict.fromkeys((AuditAction.CONSENT_READ, AuditAction.CONSENT_GRANT,
++                     AuditAction.CONSENT_WITHDRAW), AuditResource.HEALTH_CONSENT),
++    **dict.fromkeys((AuditAction.CONVERSATION_CREATE, AuditAction.CONVERSATION_LIST,
++                     AuditAction.CONVERSATION_READ), AuditResource.CONVERSATION),
++    AuditAction.TURN_APPEND: AuditResource.TURN, AuditAction.TURN_LIST: AuditResource.TURN,
++    AuditAction.AUDIT_READ: AuditResource.AUDIT, AuditAction.REQUEST: AuditResource.APPLICATION,
++}
++
++
++@dataclass(slots=True)
++class _RequestAudit:
++    action: AuditAction
++    request_id: UUID = field(default_factory=uuid4)
++    token: str | None = field(default=None, repr=False)
++    committed: bool = False
++    failed: bool = False
++
++
++_request: ContextVar[_RequestAudit | None] = ContextVar("patient_audit_request", default=None)
++
++
++def _action(request: Request) -> AuditAction | None:
++    """Classify to fixed enums only; paths and IDs never enter audit storage."""
++    path, method = request.url.path, request.method
++    if path == "/" or path.startswith("/assets/"):
++        return None
++    fixed = {
++        ("POST", "/auth/login"): AuditAction.LOGIN_START,
++        ("GET", "/auth/callback"): AuditAction.LOGIN_FINISH,
++        ("GET", "/auth/session"): AuditAction.SESSION_READ,
++        ("POST", "/auth/logout"): AuditAction.LOGOUT,
++        ("GET", "/me"): AuditAction.IDENTITY_READ,
++        ("GET", "/me/consents/health"): AuditAction.CONSENT_READ,
++        ("POST", "/me/consents/health"): AuditAction.CONSENT_GRANT,
++        ("DELETE", "/me/consents/health"): AuditAction.CONSENT_WITHDRAW,
++        ("GET", "/conversations"): AuditAction.CONVERSATION_LIST,
++        ("POST", "/conversations"): AuditAction.CONVERSATION_CREATE,
++        ("GET", "/audit"): AuditAction.AUDIT_READ,
++    }
++    if (method, path) in fixed:
++        return fixed[method, path]
++    parts = path.split("/")
++    if len(parts) == 3 and parts[1] == "conversations" and method == "GET":
++        return AuditAction.CONVERSATION_READ
++    if len(parts) == 4 and parts[1] == "conversations" and parts[3] == "turns":
++        if method == "GET":
++            return AuditAction.TURN_LIST
++        if method == "POST":
++            return AuditAction.TURN_APPEND
++    return AuditAction.REQUEST
++
++
++def unavailable_response() -> JSONResponse:
++    return JSONResponse({"success": False, "data": None,
++                         "error": {"code": "AUDIT_UNAVAILABLE", "message": "Security audit unavailable"}},
++                        status_code=503)
++
++
++def _closed_response(response: Response) -> JSONResponse:
++    replacement = unavailable_response()
++    # An already revoked logout must keep cookie deletions; never propagate
++    # new login/session cookies or a redirect from an unrecorded success.
++    for value in response.headers.getlist("set-cookie"):
++        if "Max-Age=0" in value:
++            replacement.headers.append("set-cookie", value)
++    for key in ("cache-control", "pragma", "referrer-policy", "x-content-type-options",
++                "x-frame-options", "content-security-policy", "cross-origin-resource-policy"):
++        if key in response.headers:
++            replacement.headers[key] = response.headers[key]
++    return replacement
++
++
++class AuditStore:
++    """Trusted server institution, current SessionStore authority, no opt-out."""
++
++    def __init__(self, sessions: SessionStore) -> None:
++        self.sessions = sessions
++        # Same trusted fixed configuration as session authority, never request IDs.
++        self._tenant = sessions._tenant_id
++
++    @staticmethod
++    def remember(token: str) -> None:
++        """Called only AFTER successful live authentication (including CSRF)."""
++        if context := _request.get():
++            context.token = token
++
++    def _scope(self, db: Connection) -> None:
++        db.execute("SELECT set_config('app.audit_scope',pg_current_xact_id()::text||'/'||%s,true)",
++                   (str(self._tenant),))
++
++    def _insert(self, db: Connection, action: AuditAction, *, principal: Principal | None = None,
++                outcome: str = "allowed", reason: str = "ok") -> None:
++        if not isinstance(action, AuditAction) or (principal and principal.tenant_id != str(self._tenant)):
++            raise AuditUnavailable()
++        context = _request.get()
++        try:
++            self._scope(db)
++            db.execute("INSERT INTO medical_rag.security_audit_events "
++                       "(tenant_id,operator_id,action,resource_type,outcome,reason_code,request_id) "
++                       "VALUES (%s,%s,%s,%s,%s,%s,%s)",
++                       (self._tenant, principal.user_id if principal else None, action, _RESOURCES[action],
++                        outcome, reason, context.request_id if context else uuid4()))
++        except Exception:  # noqa: BLE001 -- don't preserve or log sensitive SQL errors
++            if context:
++                context.failed = True
++            raise AuditUnavailable() from None
++
++    @staticmethod
++    def _committed() -> None:
++        if context := _request.get():
++            context.committed = True
++
++    @contextmanager
++    def operation(self, token: str, action: AuditAction, *, mutation: bool = False,
++                  csrf_token: str | None = None) -> Iterator[AuthorizedTransaction]:
++        """Insert before exiting the SAME transaction, mark only after commit."""
++        with self.sessions.authorized_transaction(token, require_csrf=mutation, csrf_token=csrf_token) as authorized:
++            self.remember(token)
++            yield authorized
++            self._insert(authorized.connection, action, principal=authorized.principal)
++        self._committed()
++
++    def record(self, action: AuditAction, *, principal: Principal | None = None) -> None:
++        """Auth lifecycle event after a verified result, before any cookie output."""
++        try:
++            with self.sessions._transaction() as db:
++                self._insert(db, action, principal=principal)
++        except Exception:  # noqa: BLE001 -- static boundary, including transaction/commit failure
++            if context := _request.get():
++                context.failed = True
++            raise AuditUnavailable() from None
++        self._committed()
++
++    def record_failure(self, status: int) -> None:
++        """Called after failed operation rollback. Recheck any earlier actor live."""
++        context = _request.get()
++        if context is None or context.failed:
++            raise AuditUnavailable()
++        reason = {400: "invalid_request", 401: "authentication_denied", 403: "access_denied",
++                  404: "resource_not_found"}.get(status, "request_denied" if status < 500 else "operation_unavailable")
++        outcome = "denied" if status < 500 else "error"
++        try:
++            if context.token:
++                try:
++                    with self.sessions.authorized_transaction(context.token) as authorized:
++                        self._insert(authorized.connection, context.action, principal=authorized.principal,
++                                     outcome=outcome, reason=reason)
++                    self._committed()
++                    return
++                except AuthenticationDenied:
++                    pass
++            with self.sessions._transaction() as db:
++                self._insert(db, context.action, outcome=outcome, reason=reason)
++        except Exception:  # noqa: BLE001 -- no raw exception values beyond this boundary
++            context.failed = True
++            raise AuditUnavailable() from None
++        self._committed()
++
++    def list_events(self, token: str, *, limit: int = 20, offset: int = 0) -> dict[str, object]:
++        if type(limit) is not int or not 1 <= limit <= 100 or type(offset) is not int or not 0 <= offset <= 10000:
++            raise ValueError("Invalid pagination")
++        with self.operation(token, AuditAction.AUDIT_READ) as authorized:
++            principal = authorized.principal
++            if not is_allowed(principal, Action.AUDIT_READ, Resource(principal.tenant_id)):
++                raise AuditDenied()
++            db = authorized.connection
++            self._scope(db)
++            rows = db.execute("SELECT event_id,recorded_at,operator_id,action,resource_type,outcome,reason_code,request_id "
++                              "FROM medical_rag.security_audit_events WHERE tenant_id=%s "
++                              "ORDER BY event_order DESC LIMIT %s OFFSET %s", (self._tenant, limit, offset)).fetchall()
++            keys = ("id", "time", "operator_id", "action", "resource_type", "outcome", "reason_code", "request_id")
++            return {"items": [dict(zip(keys, (str(row[0]), row[1].isoformat(), str(row[2]) if row[2] else None,
++                                             *row[3:7], str(row[7])), strict=True)) for row in rows],
++                    "limit": limit, "offset": offset}
++
++    def install(self, app: FastAPI) -> None:
++        """Outer guard sees origin/framework denials before response emission."""
++        @app.middleware("http")
++        async def mandatory_audit(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
++            action = _action(request)
++            context = _RequestAudit(action or AuditAction.REQUEST)
++            marker = _request.set(context)
++            try:
++                response = await call_next(request)
++                if action is not None and not context.committed:
++                    if response.status_code < 400:
++                        response = _closed_response(response)
++                    try:
++                        await run_in_threadpool(self.record_failure, response.status_code)
++                    except AuditUnavailable:
++                        response = _closed_response(response)
++                response.headers["X-Request-ID"] = str(context.request_id)
++                return response
++            finally:
++                _request.reset(marker)
+
+## tests/test_security_audit.py
+warning: in the working copy of 'tests/test_security_audit.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tests/test_security_audit.py b/tests/test_security_audit.py
+new file mode 100644
+index 0000000..2ae599c
+--- /dev/null
++++ b/tests/test_security_audit.py
+@@ -0,0 +1,515 @@
++"""Connected audit with fictional identity and actual least-privilege PG."""
++# ruff: noqa: F401,F811 -- imported pytest fixtures
++
++import importlib.util
++import json
++from types import SimpleNamespace
++from uuid import UUID, uuid4
++
++import psycopg
++import pytest
++from test_patient_vertical import (
++    ACCOUNT,
++    APP_ORIGIN,
++    ISSUER,
++    OTHER,
++    OTHER_ACCOUNT,
++    OTHER_TENANT,
++    PATIENT,
++    ROOT,
++    TENANT,
++    auth_system,
++    database,
++    grant,
++    logged_in,
++    mutate,
++    oidc_database,
++    signing_key,
++    start,
++    system,
++)
++
++from medical_rag.identity_sessions import AuthenticationDenied
++from medical_rag.oidc_identity import VerifiedIdentity
++
++
++def events(admin):
++    with psycopg.connect(**admin) as db:
++        cursor = db.execute("SELECT * FROM medical_rag.security_audit_events ORDER BY event_order")
++        names = [column.name for column in cursor.description]
++        return [dict(zip(names, row, strict=True)) for row in cursor.fetchall()]
++
++
++def audit_insert(admin, *, allowed):
++    verb, direction = ("GRANT", "TO") if allowed else ("REVOKE", "FROM")
++    mutate(admin, f"{verb} INSERT (tenant_id,operator_id,action,resource_type,outcome,reason_code,request_id) "
++           f"ON medical_rag.security_audit_events {direction} login_test")
++
++
++def auditor(system, *, mfa=True, role="auditor", account=ACCOUNT):
++    client, login, _, admin = system
++    mutate(admin, "DELETE FROM medical_rag.identity_roles WHERE account_id=%s", (account,))
++    mutate(admin, "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,%s)", (TENANT, account, role))
++    issued = login.sessions.issue(VerifiedIdentity(ISSUER, "subject-1" if account == ACCOUNT else "subject-2", mfa))
++    client.cookies.clear()
++    client.cookies.set("__Host-medical-session", issued.token)
++    client.cookies.set("__Host-medical-csrf", issued.csrf_token)
++    return issued
++
++
++def test_audit_is_a_connected_module():
++    assert importlib.util.find_spec("medical_rag.security_audit") is not None
++
++
++@pytest.mark.integration
++def test_full_http_flow_has_one_minimal_event_per_request_and_private_canaries(system, caplog):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    responses = [client.get("/me"), client.get("/me/consents/health"), grant(client, headers)]
++    created = client.post("/conversations", headers=headers | {"X-Request-ID": "untrusted-header-CANARY"},
++                          json={"title": "title-private-CANARY"})
++    responses.append(created)
++    identifier = created.json()["data"]["id"]
++    responses.extend([
++        client.post(f"/conversations/{identifier}/turns", headers=headers,
++                    json={"content": "health-content-private-CANARY"}),
++        client.get(f"/conversations/{identifier}"),
++        client.get(f"/conversations/{identifier}/turns"),
++        client.get("/conversations"),
++        client.delete("/me/consents/health", headers=headers),
++        client.post("/auth/logout", headers=headers),
++    ])
++    assert all("X-Request-ID" in response.headers for response in responses)
++    rows = events(admin)
++    assert len(rows) == len(responses) + 3  # begin/callback/session during logged_in
++    for response in responses:
++        assert response.status_code == 200
++        request_id = UUID(response.headers["X-Request-ID"])
++        matching = [row for row in rows if row["request_id"] == request_id]
++        assert len(matching) == 1
++        assert matching[0]["operator_id"] == UUID(ACCOUNT)
++        assert matching[0]["outcome"] == "allowed"
++    assert {r["action"] for r in rows} >= {
++        "login.start", "login.finish", "session.read", "identity.read", "consent.read",
++        "consent.grant", "consent.withdraw", "conversation.create", "conversation.read",
++        "conversation.list", "turn.append", "turn.list", "logout",
++    }
++    assert set(rows[0]) == {"event_id", "tenant_id", "operator_id", "action", "resource_type",
++                            "outcome", "reason_code", "recorded_at", "event_order", "request_id"}
++    serialized = json.dumps(rows, default=str) + caplog.text
++    for secret in [identifier, PATIENT, "title-private-CANARY", "health-content-private-CANARY",
++                   "untrusted-header-CANARY", "fake-access-NEVER-RETURN", "fake-refresh-NEVER-RETURN",
++                   "fictional-client-secret-with-32-characters", headers["X-CSRF-Token"]]:
++        assert secret not in serialized
++    assert rows[0]["operator_id"] is None
++
++
++@pytest.mark.integration
++def test_auditor_live_policy_mfa_scope_and_metadata(system):
++    client, _, _, admin = system
++    logged_in(system)
++    client.get("/me")
++    auditor(system)
++    assert client.get("/me").json()["data"]["permissions"] == {
++        "identity": True, "health_consent": False, "conversations": False, "audit": True,
++    }
++    response = client.get("/audit?limit=20&offset=0")
++    assert response.status_code == 200
++    data = response.json()["data"]
++    assert data["limit"] == 20 and data["offset"] == 0
++    assert len(data["items"]) > 0
++    assert set(data["items"][0]) == {"id", "time", "operator_id", "action", "resource_type",
++                                      "outcome", "reason_code", "request_id"}
++    row = events(admin)[-1]
++    assert row["action"] == "audit.read" and str(row["request_id"]) == response.headers["X-Request-ID"]
++    assert client.get("/me/consents/health").status_code == 403
++    assert client.get("/conversations").status_code == 403
++    mutate(admin, "DELETE FROM medical_rag.identity_roles WHERE account_id=%s", (ACCOUNT,))
++    assert client.get("/audit").status_code == 401  # role mutation invalidates the old session epoch
++    auditor(system, mfa=False)
++    assert client.get("/audit").status_code == 403
++    assert client.get("/me").json()["data"]["permissions"]["audit"] is False
++    auditor(system)
++    mutate(admin, "UPDATE medical_rag.identity_accounts SET active=false WHERE account_id=%s", (ACCOUNT,))
++    assert client.get("/audit").status_code == 401
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("role", ["patient", "support", "org_admin", "platform_operator"])
++def test_roles_do_not_gain_audit(system, role):
++    client, _, _, _ = system
++    auditor(system, role=role)
++    assert client.get("/me").json()["data"]["permissions"]["audit"] is False
++    assert client.get("/audit").status_code == 403
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("query", ["limit=0", "limit=101", "offset=-1", "offset=10001", "limit=x",
++                                    "tenant_id=CANARY", "account_id=CANARY", "limit=1&limit=2"])
++def test_audit_rejects_filters_and_invalid_pagination(system, query):
++    client, _, _, admin = system
++    auditor(system)
++    response = client.get("/audit?" + query)
++    assert response.status_code == 400
++    row = events(admin)[-1]
++    assert row["outcome"] == "denied" and row["reason_code"] == "invalid_request"
++    assert "CANARY" not in json.dumps(events(admin), default=str)
++
++
++@pytest.mark.integration
++def test_denials_uniform_missing_ids_actor_and_untrusted_input(system, caplog):
++    client, _, _, admin = system
++    response = client.get("/me", headers={"X-Request-ID": "caller-CANARY"})
++    assert response.status_code == 401
++    assert events(admin)[-1]["operator_id"] is None
++    headers = logged_in(system)
++    grant(client, headers)
++    guessed = str(uuid4())
++    first = client.get("/conversations/" + guessed)
++    second = client.get("/conversations/not-a-uuid-CANARY")
++    assert first.status_code == second.status_code == 404 and first.json() == second.json()
++    invalid = client.post("/conversations", headers=headers, json={"title": "body-CANARY", "patient_id": PATIENT})
++    assert invalid.status_code == 400
++    origin = client.post("/conversations", headers=headers | {"Origin": "https://bad-CANARY.example"},
++                         json={"title": "other-body-CANARY"})
++    assert origin.status_code == 403
++    wrong_csrf = client.post("/conversations", headers=headers | {"X-CSRF-Token": "csrf-CANARY"},
++                            json={"title": "csrf-body-CANARY"})
++    assert wrong_csrf.status_code == 401
++    assert events(admin)[-1]["operator_id"] is None
++    serialized = json.dumps(events(admin), default=str) + caplog.text
++    for raw in [guessed, PATIENT, "caller-CANARY", "not-a-uuid-CANARY", "body-CANARY", "bad-CANARY", "csrf-CANARY"]:
++        assert raw not in serialized
++
++
++@pytest.mark.integration
++def test_audit_insert_loss_rolls_back_write_blocks_reads_login_and_clears_revoked_logout(system):
++    client, login, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    created = client.post("/conversations", headers=headers, json={"title": "private-rollback-CANARY"})
++    identifier = created.json()["data"]["id"]
++    session = client.cookies.get("__Host-medical-session")
++    audit_insert(admin, allowed=False)
++    try:
++        for response in [client.post("/conversations", headers=headers, json={"title": "must-roll-back"}),
++                         client.get("/conversations/" + identifier),
++                         client.post("/me/consents/health", headers=headers,
++                                     json={"version": "fictional-v1", "accepted": True})]:
++            assert response.status_code == 503 and response.json()["data"] is None
++            assert "private-rollback-CANARY" not in response.text
++        with psycopg.connect(**admin) as db:
++            assert db.execute("SELECT count(*) FROM medical_rag.conversations").fetchone() == (1,)
++            assert db.execute("SELECT count(*) FROM medical_rag.patient_consent_events").fetchone() == (1,)
++        response = client.post("/auth/logout", headers=headers)
++        assert response.status_code == 503
++        assert "__Host-medical-session" not in client.cookies
++        assert any("Max-Age=0" in value for value in response.headers.get_list("set-cookie"))
++        with pytest.raises(AuthenticationDenied):
++            login.sessions.authenticate(session)
++        response = client.post("/auth/login", headers={"Origin": APP_ORIGIN}, follow_redirects=False)
++        assert response.status_code == 503 and "set-cookie" not in response.headers
++    finally:
++        audit_insert(admin, allowed=True)
++
++
++@pytest.mark.integration
++def test_callback_audit_failure_emits_no_session_cookie_and_revokes_unexposed_session(system):
++    client, _, _, admin = system
++    _, query = start(system)
++    audit_insert(admin, allowed=False)
++    try:
++        response = client.get("/auth/callback", params={"state": query["state"][0], "code": "fictional-code"},
++                              follow_redirects=False)
++        assert response.status_code == 503
++        assert "__Host-medical-session" not in client.cookies
++        with psycopg.connect(**admin) as db:
++            assert db.execute("SELECT count(*) FROM medical_rag.identity_sessions WHERE NOT revoked").fetchone() == (0,)
++    finally:
++        audit_insert(admin, allowed=True)
++
++
++@pytest.mark.integration
++def test_audit_rls_other_institution_pool_scope_and_no_mutation(system, database):
++    client, _, _, admin = system
++    runtime, _ = database
++    logged_in(system)
++    auditor(system)
++    # Owner provisioning of fictional second institution metadata, not a user filter.
++    with psycopg.connect(**admin) as db:
++        db.execute("INSERT INTO medical_rag.security_audit_events "
++                   "(tenant_id,operator_id,action,resource_type,outcome,reason_code,request_id) "
++                   "VALUES (%s,NULL,'identity.read','identity','allowed','ok',%s)", (OTHER_TENANT, uuid4()))
++        other_id = db.execute("SELECT event_id FROM medical_rag.security_audit_events WHERE tenant_id=%s",
++                              (OTHER_TENANT,)).fetchone()[0]
++    assert str(other_id) not in client.get("/audit").text
++    with psycopg.connect(**runtime) as db:
++        with db.transaction():
++            assert db.execute("SELECT count(*) FROM medical_rag.security_audit_events").fetchone() == (0,)
++            db.execute("SELECT set_config('app.audit_scope',pg_current_xact_id()::text||'/'||%s,false)", (TENANT,))
++            count = db.execute("SELECT count(*) FROM medical_rag.security_audit_events").fetchone()[0]
++            assert count > 0
++            assert db.execute("SELECT count(*) FROM medical_rag.security_audit_events WHERE tenant_id=%s",
++                              (OTHER_TENANT,)).fetchone() == (0,)
++        # A session-level stale pooled value cannot authorize a later xact.
++        with db.transaction():
++            db.execute("SELECT pg_current_xact_id()")
++            assert db.execute("SELECT count(*) FROM medical_rag.security_audit_events").fetchone() == (0,)
++        for statement in ["UPDATE medical_rag.security_audit_events SET outcome='error'",
++                          "DELETE FROM medical_rag.security_audit_events", "TRUNCATE medical_rag.security_audit_events"]:
++            with pytest.raises(psycopg.errors.InsufficientPrivilege), db.transaction():
++                db.execute(statement)
++        with pytest.raises(psycopg.errors.InsufficientPrivilege), db.transaction():
++            db.execute("INSERT INTO medical_rag.security_audit_events "
++                       "(tenant_id,action,resource_type,outcome,reason_code,request_id) "
++                       "VALUES (%s,'identity.read','identity','allowed','ok',%s)", (TENANT, uuid4()))
++    # Even owner DML is rejected by the append-only trigger (DDL owner remains trusted).
++    for statement in ["UPDATE medical_rag.security_audit_events SET outcome='error'",
++                      "DELETE FROM medical_rag.security_audit_events", "TRUNCATE medical_rag.security_audit_events"]:
++        with pytest.raises(psycopg.errors.RaiseException), psycopg.connect(**admin) as db:
++            db.execute(statement)
++
++
++@pytest.mark.integration
++def test_audit_read_insert_loss_and_storage_error_are_static_and_closed(system, caplog):
++    client, _, _, admin = system
++    auditor(system)
++    audit_insert(admin, allowed=False)
++    try:
++        response = client.get("/audit")
++        assert response.status_code == 503 and response.json()["data"] is None
++    finally:
++        audit_insert(admin, allowed=True)
++    with psycopg.connect(**admin) as db:
++        db.execute("CREATE FUNCTION medical_rag.audit_storage_failure() RETURNS trigger LANGUAGE plpgsql AS $$ "
++                   "BEGIN RAISE EXCEPTION 'private-storage-error-CANARY'; END; $$")
++        db.execute("CREATE TRIGGER audit_storage_failure BEFORE INSERT ON medical_rag.security_audit_events "
++                   "FOR EACH ROW EXECUTE FUNCTION medical_rag.audit_storage_failure()")
++    try:
++        response = client.get("/audit")
++        assert response.status_code == 503 and response.json()["data"] is None
++        assert "private-storage-error-CANARY" not in response.text + caplog.text
++    finally:
++        mutate(admin, "DROP TRIGGER audit_storage_failure ON medical_rag.security_audit_events")
++        mutate(admin, "DROP FUNCTION medical_rag.audit_storage_failure()")
++
++
++@pytest.mark.integration
++def test_preflight_requires_audit_schema_and_minimal_rights(system, database):
++    from medical_rag.security_config import StartupError
++    from medical_rag.security_server import preflight
++    runtime, admin = database
++    config = SimpleNamespace(database_dsn=psycopg.conninfo.make_conninfo(
++        **{key: value for key, value in runtime.items() if key != "autocommit"}), tenant_id=TENANT)
++    preflight(config)
++    mutate(admin, "ALTER TABLE medical_rag.security_audit_events RENAME TO hidden_audit")
++    try:
++        with pytest.raises(StartupError):
++            preflight(config)
++    finally:
++        mutate(admin, "ALTER TABLE medical_rag.hidden_audit RENAME TO security_audit_events")
++    for privilege in ["UPDATE(outcome)", "DELETE", "TRUNCATE"]:
++        mutate(admin, f"GRANT {privilege} ON medical_rag.security_audit_events TO login_test")
++        try:
++            with pytest.raises(StartupError):
++                preflight(config)
++        finally:
++            mutate(admin, f"REVOKE {privilege} ON medical_rag.security_audit_events FROM login_test")
++    audit_insert(admin, allowed=False)
++    try:
++        with pytest.raises(StartupError):
++            preflight(config)
++    finally:
++        audit_insert(admin, allowed=True)
++
++
++@pytest.mark.integration
++def test_auth_failures_and_host_origin_guard_are_recorded_before_response(system):
++    client, _, provider, admin = system
++    for headers in [{"Origin": "https://untrusted-CANARY.example"},
++                    {"Origin": APP_ORIGIN, "Host": "host-CANARY.example"}]:
++        response = client.post("/auth/login", headers=headers, follow_redirects=False)
++        assert response.status_code == 403
++        row = events(admin)[-1]
++        assert row["action"] == "login.start" and row["outcome"] == "denied" and row["operator_id"] is None
++        assert str(row["request_id"]) == response.headers["X-Request-ID"]
++    _, query = start(system)
++    provider["mode"] = "raise"
++    response = client.get("/auth/callback", params={"state": query["state"][0], "code": "code-private-CANARY"},
++                          follow_redirects=False)
++    assert response.status_code == 401
++    assert events(admin)[-1]["action"] == "login.finish"
++    assert events(admin)[-1]["operator_id"] is None
++    response = client.get("/auth/session")
++    assert response.status_code == 401 and events(admin)[-1]["action"] == "session.read"
++    response = client.post("/auth/logout", headers={"Origin": APP_ORIGIN})
++    assert response.status_code == 403 and events(admin)[-1]["action"] == "logout"
++    assert "CANARY" not in json.dumps(events(admin), default=str)
++
++
++@pytest.mark.integration
++def test_patient_storage_error_rolls_back_then_records_only_static_error(system, caplog):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    with psycopg.connect(**admin) as db:
++        db.execute("CREATE FUNCTION medical_rag.patient_storage_failure() RETURNS trigger LANGUAGE plpgsql AS $$ "
++                   "BEGIN RAISE EXCEPTION 'private-patient-storage-error-CANARY'; END; $$")
++        db.execute("CREATE TRIGGER patient_storage_failure BEFORE INSERT ON medical_rag.conversations "
++                   "FOR EACH ROW EXECUTE FUNCTION medical_rag.patient_storage_failure()")
++    try:
++        response = client.post("/conversations", headers=headers, json={"title": "title-storage-CANARY"})
++        assert response.status_code == 503 and response.json()["data"] is None
++        row = events(admin)[-1]
++        assert row["action"] == "conversation.create" and row["outcome"] == "error"
++        assert row["reason_code"] == "operation_unavailable" and row["operator_id"] == UUID(ACCOUNT)
++        assert "CANARY" not in response.text + caplog.text + json.dumps(events(admin), default=str)
++        with psycopg.connect(**admin) as db:
++            assert db.execute("SELECT count(*) FROM medical_rag.conversations").fetchone() == (0,)
++    finally:
++        mutate(admin, "DROP TRIGGER patient_storage_failure ON medical_rag.conversations")
++        mutate(admin, "DROP FUNCTION medical_rag.patient_storage_failure()")
++
++
++@pytest.mark.integration
++def test_second_patient_invisible_and_missing_ids_have_identical_minimal_denial(system):
++    client, _, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    created = client.post("/conversations", headers=headers, json={"title": "other-patient-CANARY"})
++    other_id = created.json()["data"]["id"]
++    auditor(system, role="patient", account=OTHER_ACCOUNT)
++    csrf = client.get("/auth/session").json()["data"]["csrf_token"]
++    grant(client, {"Origin": APP_ORIGIN, "X-CSRF-Token": csrf})
++    first = client.get("/conversations/" + other_id)
++    second = client.get("/conversations/" + str(uuid4()))
++    assert first.status_code == second.status_code == 404 and first.json() == second.json()
++    last = events(admin)[-2:]
++    assert all(row["operator_id"] == UUID(OTHER_ACCOUNT) and row["reason_code"] == "resource_not_found" for row in last)
++    assert other_id not in json.dumps(events(admin), default=str)
++
++
++@pytest.mark.integration
++def test_unrecorded_success_cannot_bypass_mandatory_guard(system):
++    """An accidentally unconnected endpoint may not release any sensitive body."""
++    client, _, _, admin = system
++
++    @client.app.get("/unconnected")
++    def unconnected():
++        return {"success": True, "data": "private-unconnected-CANARY", "error": None}
++
++    response = client.get("/unconnected")
++    assert response.status_code == 503 and response.json()["data"] is None
++    assert "private-unconnected-CANARY" not in response.text
++    assert events(admin)[-1]["outcome"] == "error"
++
++
++@pytest.mark.integration
++def test_reauthentication_failure_revokes_unexposed_new_session_and_audits_error(system, monkeypatch, caplog):
++    client, login, _, admin = system
++    logged_in(system)
++    previous = client.cookies.get("__Host-medical-session")
++    _, query = start(system)
++    original = login.sessions.revoke
++
++    def fail_old(token, *, csrf_token):
++        if token == previous:
++            raise RuntimeError("private-reauthentication-storage-CANARY")
++        original(token, csrf_token=csrf_token)
++
++    monkeypatch.setattr(login.sessions, "revoke", fail_old)
++    response = client.get("/auth/callback", params={"state": query["state"][0], "code": "fictional-code"},
++                          follow_redirects=False)
++    assert response.status_code == 503
++    assert client.cookies.get("__Host-medical-session") == previous
++    with psycopg.connect(**admin) as db:
++        assert db.execute("SELECT count(*) FROM medical_rag.identity_sessions WHERE NOT revoked").fetchone() == (1,)
++    row = events(admin)[-1]
++    assert row["action"] == "login.finish" and row["outcome"] == "error"
++    assert "private-reauthentication-storage-CANARY" not in response.text + caplog.text
++
++
++@pytest.mark.integration
++def test_wrong_audit_role_denies_before_select_and_read_storage_loss_is_closed(system):
++    client, _, _, admin = system
++    auditor(system, role="support")
++    mutate(admin, "REVOKE SELECT ON medical_rag.security_audit_events FROM login_test")
++    try:
++        assert client.get("/audit").status_code == 403
++        auditor(system)
++        response = client.get("/audit")
++        assert response.status_code == 503 and response.json()["data"] is None
++        assert events(admin)[-1]["outcome"] == "error"
++    finally:
++        mutate(admin, "GRANT SELECT ON medical_rag.security_audit_events TO login_test")
++
++
++@pytest.mark.integration
++def test_removed_account_does_not_erase_audit_history(system):
++    client, _, _, admin = system
++    auditor(system)
++    assert client.get("/me").status_code == 200
++    before = events(admin)
++    # This fictional account has no consent history. Remove its existing
++    # authority/session FK dependants first; do not alter production schema.
++    for table in ("identity_roles", "identity_bindings", "identity_sessions"):
++        mutate(admin, f"DELETE FROM medical_rag.{table} WHERE tenant_id=%s AND account_id=%s", (TENANT, ACCOUNT))
++    mutate(admin, "DELETE FROM medical_rag.identity_accounts WHERE tenant_id=%s AND account_id=%s", (TENANT, ACCOUNT))
++    assert events(admin) == before and before[-1]["operator_id"] == UUID(ACCOUNT)
++
++
++@pytest.mark.integration
++def test_threadpool_request_ids_are_distinct_and_correlate_even_for_invisible_ids(system):
++    from concurrent.futures import ThreadPoolExecutor
++
++    client, _, _, admin = system
++    headers = logged_in(system)
++    grant(client, headers)
++    with ThreadPoolExecutor(max_workers=4) as pool:
++        responses = list(pool.map(lambda _: client.get("/conversations/" + str(uuid4()),
++                                 headers={"X-Request-ID": "forged-shared-CANARY"}), range(8)))
++    assert all(response.status_code == 404 for response in responses)
++    ids = {UUID(response.headers["X-Request-ID"]) for response in responses}
++    assert len(ids) == 8
++    rows = [row for row in events(admin) if row["request_id"] in ids]
++    assert len(rows) == 8
++    assert all(row["action"] == "conversation.read" and row["operator_id"] == UUID(ACCOUNT) for row in rows)
++
++
++@pytest.mark.integration
++def test_auditor_revoked_session_denies_and_separately_authorized_adult_can_use_own_patient_scope(system):
++    client, login, _, admin = system
++    issued = auditor(system)
++    mutate(admin, "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,'patient')", (TENANT, ACCOUNT))
++    # Current role mutation invalidates prior session; a new independently
++    # verified local login has both permissions, still no consent by role alone.
++    assert client.get("/audit").status_code == 401
++    client.cookies.clear()
++    issued = login.sessions.issue(VerifiedIdentity(ISSUER, "subject-1", True))
++    client.cookies.set("__Host-medical-session", issued.token)
++    client.cookies.set("__Host-medical-csrf", issued.csrf_token)
++    permissions = client.get("/me").json()["data"]["permissions"]
++    assert permissions == {"identity": True, "health_consent": True, "conversations": False, "audit": True}
++    grant(client, {"Origin": APP_ORIGIN, "X-CSRF-Token": issued.csrf_token})
++    assert client.get("/me").json()["data"]["permissions"]["conversations"] is True
++    assert client.get("/audit").status_code == 200
++    login.sessions.revoke(issued.token, csrf_token=issued.csrf_token)
++    assert client.get("/audit").status_code == 401
++    assert events(admin)[-1]["operator_id"] is None
++
++
++@pytest.mark.integration
++@pytest.mark.parametrize("privilege", ["INSERT(event_id)", "INSERT(recorded_at)", "INSERT(event_order)",
++                                        "REFERENCES", "TRIGGER"])
++def test_preflight_rejects_audit_server_metadata_or_extra_table_grants(system, database, privilege):
++    from medical_rag.security_config import StartupError
++    from medical_rag.security_server import preflight
++    runtime, admin = database
++    config = SimpleNamespace(database_dsn=psycopg.conninfo.make_conninfo(
++        **{key: value for key, value in runtime.items() if key != "autocommit"}), tenant_id=TENANT)
++    mutate(admin, f"GRANT {privilege} ON medical_rag.security_audit_events TO login_test")
++    try:
++        with pytest.raises(StartupError):
++            preflight(config)
++    finally:
++        mutate(admin, f"REVOKE {privilege} ON medical_rag.security_audit_events FROM login_test")
+
+## frontend/src/patient/audit.ts
+warning: in the working copy of 'frontend/src/patient/audit.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/audit.ts b/frontend/src/patient/audit.ts
+new file mode 100644
+index 0000000..0df21da
+--- /dev/null
++++ b/frontend/src/patient/audit.ts
+@@ -0,0 +1,56 @@
++import { object, PatientError } from "./client";
++
++export type AuditRow = {
++  id: string;
++  time: string;
++  operator_id: string | null;
++  action: string;
++  resource_type: string;
++  outcome: string;
++  reason_code: string;
++  request_id: string;
++};
++const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
++export function auditRows(value: unknown): AuditRow[] {
++  if (
++    !object(value) ||
++    !Array.isArray(value.items) ||
++    value.items.length > 20 ||
++    value.limit !== 20 ||
++    !Number.isInteger(value.offset) ||
++    (value.offset as number) < 0 ||
++    (value.offset as number) > 10000
++  )
++    throw new PatientError();
++  return value.items.map((row: unknown) => {
++    if (
++      !object(row) ||
++      typeof row.id !== "string" ||
++      !uuid.test(row.id) ||
++      typeof row.time !== "string" ||
++      row.time.length > 64 ||
++      !(
++        row.operator_id === null ||
++        (typeof row.operator_id === "string" && uuid.test(row.operator_id))
++      ) ||
++      typeof row.request_id !== "string" ||
++      !uuid.test(row.request_id) ||
++      !["action", "resource_type", "outcome", "reason_code"].every(
++        (key) =>
++          typeof row[key] === "string" && (row[key] as string).length <= 128,
++      )
++    )
++      throw new PatientError();
++    // Copy only the fixed metadata fields; never spread an arbitrary server body.
++    return {
++      id: row.id,
++      time: row.time,
++      operator_id: row.operator_id,
++      action: row.action,
++      resource_type: row.resource_type,
++      outcome: row.outcome,
++      reason_code: row.reason_code,
++      request_id: row.request_id,
++    } as AuditRow;
++  });
++}
+
+## frontend/src/patient/AuditTable.tsx
+warning: in the working copy of 'frontend/src/patient/AuditTable.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/AuditTable.tsx b/frontend/src/patient/AuditTable.tsx
+new file mode 100644
+index 0000000..1aadc61
+--- /dev/null
++++ b/frontend/src/patient/AuditTable.tsx
+@@ -0,0 +1,77 @@
++import type { AuditRow } from "./audit";
++
++export function AuditTable({
++  rows,
++  offset,
++  busy,
++  page,
++}: {
++  rows: AuditRow[] | null;
++  offset: number;
++  busy: boolean;
++  page: (amount: number) => void;
++}) {
++  return (
++    <section>
++      <h2>安全审计</h2>
++      <p>
++        仅显示本机构操作元数据，不包含患者标识、会话标识或医疗内容。此开发环境不代表合规验收。
++      </p>
++      {rows === null ? (
++        <p role="status">正在读取审计元数据…</p>
++      ) : (
++        <>
++          <div className="patient-audit">
++            <table aria-label="安全审计元数据">
++              <thead>
++                <tr>
++                  {[
++                    "事件标识",
++                    "服务器时间",
++                    "操作者",
++                    "操作",
++                    "资源类型",
++                    "结果",
++                    "原因码",
++                    "请求标识",
++                  ].map((label) => (
++                    <th scope="col" key={label}>
++                      {label}
++                    </th>
++                  ))}
++                </tr>
++              </thead>
++              <tbody>
++                {rows.map((row) => (
++                  <tr key={row.id}>
++                    <td>{row.id}</td>
++                    <td>{row.time}</td>
++                    <td>{row.operator_id ?? "未验证操作者"}</td>
++                    <td>{row.action}</td>
++                    <td>{row.resource_type}</td>
++                    <td>{row.outcome}</td>
++                    <td>{row.reason_code}</td>
++                    <td>{row.request_id}</td>
++                  </tr>
++                ))}
++              </tbody>
++            </table>
++            {rows.length === 0 && <p>没有更多审计事件。</p>}
++          </div>
++          <div className="patient-paging">
++            <button disabled={busy || offset === 0} onClick={() => page(-20)}>
++              上一页审计
++            </button>
++            <span>第 {offset / 20 + 1} 页</span>
++            <button
++              disabled={busy || rows.length === 0 || offset >= 10000}
++              onClick={() => page(20)}
++            >
++              下一页审计
++            </button>
++          </div>
++        </>
++      )}
++    </section>
++  );
++}
+
+## frontend/src/test/patient-audit.test.tsx
+warning: in the working copy of 'frontend/src/test/patient-audit.test.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/test/patient-audit.test.tsx b/frontend/src/test/patient-audit.test.tsx
+new file mode 100644
+index 0000000..5abf427
+--- /dev/null
++++ b/frontend/src/test/patient-audit.test.tsx
+@@ -0,0 +1,63 @@
++import { cleanup, render, screen } from "@testing-library/react";
++import { afterEach, expect, it, vi } from "vitest";
++import { AuditTable } from "../patient/AuditTable";
++import { auditRows } from "../patient/audit";
++
++afterEach(cleanup);
++const row = {
++  id: "00000000-0000-0000-0000-000000000001",
++  time: "2026-11-02T00:00:00Z",
++  operator_id: "00000000-0000-0000-0000-000000000002",
++  action: "identity.read",
++  resource_type: "identity",
++  outcome: "allowed",
++  reason_code: "ok",
++  request_id: "00000000-0000-0000-0000-000000000003",
++};
++const page = { items: [row], limit: 20, offset: 0 };
++it("copies only fixed metadata fields, with null operator allowed", () => {
++  expect(
++    auditRows({
++      ...page,
++      items: [{ ...row, private_body: "not-displayable" }],
++    }),
++  ).toEqual([row]);
++  expect(
++    auditRows({ ...page, items: [{ ...row, operator_id: null }] })[0]
++      .operator_id,
++  ).toBeNull();
++});
++it.each([
++  null,
++  {},
++  { ...page, limit: 100 },
++  { ...page, offset: -1 },
++  { ...page, offset: 10001 },
++  { ...page, offset: 0.5 },
++  { ...page, items: Array(21).fill(row) },
++  ...[
++    "id",
++    "time",
++    "operator_id",
++    "request_id",
++    "action",
++    "resource_type",
++    "outcome",
++    "reason_code",
++  ].map((key) => ({ ...page, items: [{ ...row, [key]: 123 }] })),
++  { ...page, items: [{ ...row, action: "x".repeat(129) }] },
++])("rejects malformed audit metadata with static errors", (value) => {
++  expect(() => auditRows(value)).toThrow("服务暂不可用，请重试。");
++});
++it("caps the audit UI at the API offset boundary and shows empty/loading states", () => {
++  const { rerender } = render(
++    <AuditTable rows={[row]} offset={10000} busy={false} page={vi.fn()} />,
++  );
++  expect(screen.getByRole("button", { name: "下一页审计" })).toBeDisabled();
++  expect(screen.getByText(row.operator_id)).toBeInTheDocument();
++  rerender(<AuditTable rows={[]} offset={0} busy={false} page={vi.fn()} />);
++  expect(screen.getByText("没有更多审计事件。")).toBeInTheDocument();
++  expect(screen.getByRole("button", { name: "下一页审计" })).toBeDisabled();
++  rerender(<AuditTable rows={null} offset={0} busy={false} page={vi.fn()} />);
++  expect(screen.getByRole("status")).toHaveTextContent("正在读取审计元数据");
++});

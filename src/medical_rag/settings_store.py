@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -52,8 +52,8 @@ class SettingsStore:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
-        except (OSError, json.JSONDecodeError) as error:
-            logger.warning("设置文件无法读取，按未配置处理: %s", error)
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning("设置文件无法读取，按未配置处理")
             return {}
         return data if isinstance(data, dict) else {}
 
@@ -133,11 +133,11 @@ class ModelSettings:
                 continue
             try:
                 profile = ModelProfile(**{key: raw.get(key, "") for key in ModelProfile.model_fields})
-            except ValidationError as error:
-                logger.warning("跳过无法解析的模型配置: %s", error)
+            except ValidationError:
+                logger.warning("跳过无法解析的模型配置")
                 continue
             if not all([profile.model_name, profile.base_url, profile.api_key]):
-                logger.warning("跳过字段不完整的模型配置: %s", profile.id)
+                logger.warning("跳过字段不完整的模型配置")
                 continue
             profiles.append(profile)
         self.profiles = profiles
@@ -163,7 +163,7 @@ class ModelSettings:
         # does not pile up rows the operator has to guess apart.
         existing = next((item for item in self.profiles if item.model_name == values["model_name"]
                          and item.base_url == values["base_url"]), None)
-        verified_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        verified_at = datetime.now(UTC).isoformat(timespec="seconds")
         if existing is None:
             created = ModelProfile(id=self._new_id(values["model_name"]),
                                    verified_at=verified_at, **values)

@@ -15,6 +15,11 @@ from .types import ApiError
 logger = logging.getLogger(__name__)
 
 
+def _require_demo_access(settings: Settings) -> None:
+    if settings.access_mode != "unsafe-local-demo":
+        raise RuntimeError("Worker disabled: security isolation is not ready")
+
+
 def fresh_memory_transport():
     """Reload env defaults before applying profiles, including after deletion."""
     from .generation import OpenAITransport
@@ -34,6 +39,7 @@ def parser() -> argparse.ArgumentParser:
 async def run_role(role: str, settings: Settings | None = None) -> None:
     """Reconnect on transport failure; cancellation drains any active sync writer."""
     settings = settings or Settings()
+    _require_demo_access(settings)
     store = DocumentJobStore(settings)
     memory = MemoryStore(settings.chat_history_file, settings.memory_episodes_dir)
     with memory._connect():
@@ -113,6 +119,7 @@ def main() -> None:
     role = parser().parse_args().role
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     settings = Settings()
+    _require_demo_access(settings)
     try:
         if role == "ingest":
             # asyncio.run waits for its threadpool on cancellation; OS lock stays held.
