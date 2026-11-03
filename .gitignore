@@ -1,4 +1,5 @@
 .worktrees/
+.idea/
 __pycache__/
 .pytest_cache/
 pytest-tmp-*/
@@ -17,5 +18,6 @@ outputs/
 server-ui-test.*.log
 data/*.pdf
 data/chat-history.sqlite3*
+data/*.ingest.lock
 data/memory/
 data/document-uploads/
