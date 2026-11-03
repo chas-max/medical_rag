@@ -1,8 +1,8 @@
 # 项目目录结构
 
-本文件描述 `codex/medical-security` 工作树的完整结构（当前安全改造分支）。
-`D:\medical-rag-resume` 是未合并的安全改造前基线，缺少 `database/`、`deploy/`、
-`docs/` 以及患者身份/网关模块和独立患者前端；需要完整功能时以本工作树为准。
+本文件描述当前完整项目结构。安全改造已合并到 `master`
+（`D:\medical-rag-resume`）；`codex/medical-security` 工作树保留为历史分支，
+其本地 `outputs/` 目录保存任务验收证据。代码与文档以主目录为准。
 
 测试运行产生的 `pytest-tmp-*` / `.pytest-tmp-*`、`.pytest_cache`、
 `.ruff_cache`、`__pycache__`、`.coverage`、前端 coverage 与测试报告均属
