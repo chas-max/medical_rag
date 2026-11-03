@@ -1,9 +1,12 @@
 """FastAPI entry point and consistent public response envelope."""
 
 import json
+import logging
 import threading
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Annotated
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
@@ -17,6 +20,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import RequestResponseEndpoint
+from starlette.responses import Response
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .chat_api import chat_router
 from .chat_history import ChatHistoryStore, HistoryImport
@@ -25,8 +31,46 @@ from .config import Settings
 from .jobs import DocumentJobStore
 from .memory import MemoryStore
 from .memory_api import memory_router
+from .public_errors import public_error, public_http_error
 from .settings_store import ModelSettings, SettingsStore
 from .types import ApiError
+
+logger = logging.getLogger(__name__)
+
+
+class _RejectWebSockets:
+    """No WebSocket path is authorized until the full security model exists."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 1008})
+            return
+        await self.app(scope, receive, send)
+
+
+def _loopback_authority(value: str) -> bool:
+    """Accept only literal loopback hosts, not DNS names that can rebind."""
+    try:
+        url = urlsplit(f"//{value}")
+        if url.username or url.password or url.path or url.query or url.fragment:
+            return False
+        _ = url.port  # Validate an optional port.
+        host = url.hostname or ""
+        return host == "localhost" or ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _loopback_origin(value: str) -> bool:
+    try:
+        url = urlsplit(value)
+        return (url.scheme in {"http", "https"} and not url.path and not url.query
+                and not url.fragment and _loopback_authority(url.netloc))
+    except ValueError:
+        return False
 
 
 class SearchRequest(BaseModel):
@@ -98,6 +142,34 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
         return active_service
 
     app = FastAPI(title="公开医疗资料检索问答", version="0.1.0")
+    app.add_middleware(_RejectWebSockets)
+    if settings.access_mode == "unsafe-local-demo":
+        logger.warning("Unsafe local demo mode enabled: no authentication or patient isolation; never expose this service")
+
+    @app.middleware("http")
+    async def security_lockdown(request: Request, call_next: RequestResponseEndpoint) -> Response:
+        if settings.access_mode == "locked":
+            if request.method == "GET" and request.url.path == "/health":
+                return JSONResponse(_success({"status": "security_not_ready"}),
+                                    headers={"Cache-Control": "no-store"})
+            return _failure("SECURITY_NOT_READY", "安全能力尚未就绪，接口已关闭", 503)
+        try:
+            local_peer = bool(request.client and ip_address(request.client.host).is_loopback)
+        except ValueError:
+            local_peer = False
+        forwarded = any(
+            name in {"forwarded", "x-real-ip"} or name.startswith("x-forwarded-")
+            for name in request.headers
+        )
+        hosts = request.headers.getlist("host")
+        origins = request.headers.getlist("origin")
+        bad_host = len(hosts) != 1 or not _loopback_authority(hosts[0])
+        bad_origin = (len(origins) > 1 or (origins and not _loopback_origin(origins[0]))
+                      or (not origins and request.method not in {"GET", "HEAD", "OPTIONS"}))
+        if not local_peer or forwarded or bad_host or bad_origin:
+            return _failure("LOCAL_DEMO_ONLY", "本机演示模式禁止远程或代理访问", 403)
+        return await call_next(request)
+
     app.state.memory = memory
     app.state.memory_worker = None
     app.state.document_jobs = document_jobs
@@ -120,7 +192,8 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
 
     @app.exception_handler(ApiError)
     async def handle_api_error(request: Request, error: ApiError):
-        return _failure(error.code, error.message, error.status)
+        safe_error = public_error(error.code)
+        return _failure(safe_error.code, safe_error.message, safe_error.status)
 
     @app.exception_handler(RequestValidationError)
     async def handle_validation_error(request: Request, error: RequestValidationError):
@@ -128,7 +201,8 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
 
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_error(request: Request, error: StarletteHTTPException):
-        return _failure("HTTP_ERROR", str(error.detail), error.status_code)
+        safe_error = public_http_error(error.status_code)
+        return _failure(safe_error.code, safe_error.message, safe_error.status)
 
     @app.exception_handler(Exception)
     async def handle_unexpected_error(request: Request, error: Exception):

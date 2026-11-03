@@ -1,0 +1,2987 @@
+# Task3 runnable patient portal review package
+
+Uncommitted task-scoped exact baselines; unrelated dirty worktree excluded. Task1 API baseline reconstructed verbatim from its pre-Task3 new-file diff. New files shown in full.
+
+## .gitignore
+diff --git a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/.gitignore b/.gitignore
+index f54456b..700fc9e 100644
+--- a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/.gitignore
++++ b/.gitignore
+@@ -4,19 +4,20 @@ __pycache__/
+ pytest-tmp-*/
+ .pytest-tmp-*/
+ frontend/page-test-report*.json
+ .coverage
+ .venv/
+ .env
+ settings.json
+ *.egg-info/
+ frontend/node_modules/
+ frontend/dist/
++frontend/dist-patient/
+ frontend/coverage/
+ frontend/dist.sandbox-bak/
+ outputs/
+ .workbuddy/
+ server-ui-test.*.log
+ data/*.pdf
+ data/chat-history.sqlite3*
+ data/memory/
+ data/document-uploads/
+
+
+## frontend/package.json
+warning: in the working copy of 'frontend/package.json', LF will be replaced by CRLF the next time Git touches it
+diff --git a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/frontend__package.json b/frontend/package.json
+index cecbc15..a840471 100644
+--- a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/frontend__package.json
++++ b/frontend/package.json
+@@ -1,18 +1,19 @@
+ {
+   "name": "medical-rag-workflow-ui",
+   "private": true,
+   "version": "0.1.0",
+   "type": "module",
+   "scripts": {
+     "dev": "vite",
+     "build": "tsc --noEmit && vite build",
++    "build:patient": "tsc --noEmit && vite build --config vite.patient.config.ts",
+     "test": "vitest run",
+     "test:coverage": "vitest run --coverage",
+     "lint": "tsc --noEmit && eslint .",
+     "format": "prettier --write src vite.config.ts eslint.config.mjs"
+   },
+   "dependencies": {
+     "@xyflow/react": "^12.0.0",
+     "react": "^19.0.0",
+     "react-dom": "^19.0.0",
+     "react-router-dom": "^7.0.0"
+
+
+## frontend/tsconfig.json
+warning: in the working copy of 'frontend/tsconfig.json', LF will be replaced by CRLF the next time Git touches it
+diff --git a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/frontend__tsconfig.json b/frontend/tsconfig.json
+index ea3b710..f1756f5 100644
+--- a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/frontend__tsconfig.json
++++ b/frontend/tsconfig.json
+@@ -3,12 +3,12 @@
+     "target": "ES2022",
+     "lib": ["ES2022", "DOM", "DOM.Iterable"],
+     "module": "ESNext",
+     "moduleResolution": "Bundler",
+     "jsx": "react-jsx",
+     "strict": true,
+     "skipLibCheck": true,
+     "noEmit": true,
+     "types": ["vite/client", "vitest/globals", "@testing-library/jest-dom"]
+   },
+-  "include": ["src", "vite.config.ts"]
++  "include": ["src", "vite.config.ts", "vite.patient.config.ts"]
+ }
+
+
+## frontend/eslint.config.mjs
+warning: in the working copy of 'frontend/eslint.config.mjs', LF will be replaced by CRLF the next time Git touches it
+diff --git a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/frontend__eslint.config.mjs b/frontend/eslint.config.mjs
+index 22a7e30..4e38fa7 100644
+--- a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/frontend__eslint.config.mjs
++++ b/frontend/eslint.config.mjs
+@@ -1,13 +1,13 @@
+ import js from "@eslint/js";
+ import tseslint from "typescript-eslint";
+ import globals from "globals";
+ 
+ export default tseslint.config(
+-  { ignores: ["dist/**", "coverage/**"] },
++  { ignores: ["dist/**", "dist-patient/**", "coverage/**"] },
+   js.configs.recommended,
+   ...tseslint.configs.recommended,
+   {
+-    files: ["src/**/*.{ts,tsx}", "vite.config.ts"],
++    files: ["src/**/*.{ts,tsx}", "vite.config.ts", "vite.patient.config.ts"],
+     languageOptions: { globals: { ...globals.browser, ...globals.node } },
+   },
+ );
+
+
+## src/medical_rag/oidc_login.py
+warning: in the working copy of 'D:/TEMP-O~1/medical-patient-portal-baseline-20261102/src__medical_rag__oidc_login.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/oidc_login.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/src__medical_rag__oidc_login.py b/src/medical_rag/oidc_login.py
+index aaf1926..5b0a959 100644
+--- a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/src__medical_rag__oidc_login.py
++++ b/src/medical_rag/oidc_login.py
+@@ -16,20 +16,21 @@ an additional institution-approved login/event policy; they are not solved by
+ local session invalidation or by this headless application.
+ 
+ The AES-GCM key must come from institutional secret management, not the DB or
+ clients. Expired login rows require a bounded operational cleanup policy. Do
+ not enable request/response body or callback query logging at any proxy/server;
+ in particular Uvicorn must run with access_log=False/--no-access-log. This app
+ does not configure or override external server/proxy loggers.
+ """
+ 
+ import asyncio
++import ipaddress
+ import json
+ import re
+ from collections.abc import Callable
+ from contextlib import AbstractContextManager, contextmanager
+ from dataclasses import dataclass, field
+ from hashlib import sha256
+ from secrets import token_bytes, token_urlsafe
+ from urllib.parse import urlsplit
+ from uuid import UUID
+ 
+@@ -330,44 +331,69 @@ def _failure(status: int) -> JSONResponse:
+ 
+ 
+ def _set_cookie(response, name: str, value: str, *, max_age: int | None = None) -> None:
+     response.set_cookie(name, value, max_age=max_age, secure=True, httponly=True, samesite="lax", path="/")
+ 
+ 
+ def _clear_cookie(response, name: str) -> None:
+     response.delete_cookie(name, secure=True, httponly=True, samesite="lax", path="/")
+ 
+ 
+-def create_auth_app(login: OIDCLogin) -> FastAPI:
++def _authorization_origin(endpoint: str) -> str:
++    """Serialize one fixed HTTPS CSP source, rejecting source-list injection."""
++    parsed = _https_url(endpoint)
++    host = parsed.hostname
++    try:
++        address = ipaddress.ip_address(host)
++        authority = f"[{address}]" if address.version == 6 else str(address)
++    except ValueError:
++        if (not host or len(host) > 253 or any(
++                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
++                for label in host.split("."))):
++            raise ValueError("Invalid trusted OIDC configuration") from None
++        authority = host.lower()
++    if parsed.port is not None:
++        if not 1 <= parsed.port <= 65535:
++            raise ValueError("Invalid trusted OIDC configuration")
++        authority += f":{parsed.port}"
++    return "https://" + authority
++
++
++def create_auth_app(login: OIDCLogin, *, patient_html: bool = False) -> FastAPI:
+     """Create a headless auth-only app, without legacy business endpoints."""
+     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+     origin = login.config.app_origin
+     authority = urlsplit(origin).netloc
++    # Fixed trusted factory choice only; never derive this policy from a request.
++    csp = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
++           f"base-uri 'none'; form-action 'self' {_authorization_origin(login.config.authorization_endpoint)}; "
++           "frame-ancestors 'none'" if patient_html
++           else "default-src 'none'; frame-ancestors 'none'")
+ 
+     @app.middleware("http")
+     async def enforce_origin_and_headers(request: Request, call_next):
+         hosts = request.headers.getlist("host")
+         origins = request.headers.getlist("origin")
+         if (request.url.scheme != "https" or len(hosts) != 1 or hosts[0].lower() != authority.lower()
+                 or (request.method not in {"GET", "HEAD", "OPTIONS"} and origins != [origin])
+                 or (origins and origins != [origin] and request.url.path != "/auth/callback")):
+             response = _failure(403)
+         else:
+             try:
+                 response = await call_next(request)
+             except Exception:  # noqa: BLE001 - prevent sensitive ASGI tracebacks
+                 # Catch before ServerErrorMiddleware can re-raise a storage or
+                 # provider exception to an ASGI server's traceback logger.
+                 response = _failure(503)
+         response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
+                                  "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
+-                                 "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
++                                 "Content-Security-Policy": csp,
+                                  "Cross-Origin-Resource-Policy": "same-origin"})
+         return response
+ 
+     @app.exception_handler(InvalidLogin)
+     @app.exception_handler(AuthenticationDenied)
+     async def deny(request: Request, error: Exception):
+         response = _failure(401)
+         if request.url.path == "/auth/callback":
+             _clear_cookie(response, _LOGIN_COOKIE)
+         return response
+
+
+## src/medical_rag/patient_api.py
+warning: in the working copy of 'D:/TEMP-O~1/medical-patient-portal-baseline-20261102/src__medical_rag__patient_api.py', LF will be replaced by CRLF the next time Git touches it
+warning: in the working copy of 'src/medical_rag/patient_api.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/src__medical_rag__patient_api.py b/src/medical_rag/patient_api.py
+index 34064c7..f39de47 100644
+--- a/D:/TEMP-O~1/medical-patient-portal-baseline-20261102/src__medical_rag__patient_api.py
++++ b/src/medical_rag/patient_api.py
+@@ -80,24 +80,24 @@ async def _body(request: Request, model: type[BodyT]) -> BodyT:
+             for key, value in pairs:
+                 if key in result:
+                     raise ValueError("Invalid request")
+                 result[key] = value
+             return result
+         return model.model_validate(json.loads(data, object_pairs_hook=unique))
+     except (ValueError, TypeError, RecursionError, UnicodeError):
+         raise ValueError("Invalid request") from None
+ 
+ 
+-def create_patient_app(login: OIDCLogin, notice: HealthNotice) -> FastAPI:
++def create_patient_app(login: OIDCLogin, notice: HealthNotice, *, patient_html: bool = False) -> FastAPI:
+     """Reuse all headless OIDC cookie, origin and no-store protections."""
+     service = PatientService(login.sessions, notice)
+-    app = create_auth_app(login)
++    app = create_auth_app(login, patient_html=patient_html)
+ 
+     @app.exception_handler(PatientDenied)
+     async def denied(request: Request, error: PatientDenied) -> JSONResponse:
+         return _error(403, "PATIENT_ACCESS_DENIED", "Patient access denied")
+ 
+     @app.exception_handler(ResourceMissing)
+     async def missing(request: Request, error: ResourceMissing) -> JSONResponse:
+         return _error(404, "RESOURCE_NOT_FOUND", "Resource not found")
+ 
+     @app.exception_handler(ValueError)
+@@ -166,11 +166,10 @@ def create_patient_app(login: OIDCLogin, notice: HealthNotice) -> FastAPI:
+         return _ok(await run_in_threadpool(service.list_turns, token, identifier, **_pagination(request)))
+ 
+     @app.post("/conversations/{identifier}/turns")
+     async def append(request: Request, identifier: str) -> JsonObject:
+         token, csrf = await credentials(request, mutation=True)
+         body = await _body(request, _Turn)
+         return _ok(await run_in_threadpool(service.append_turn, token, identifier,
+                                            csrf_token=csrf, content=body.content))
+ 
+     return app
+-
+
+
+## frontend/patient.html
+warning: in the working copy of 'frontend/patient.html', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/patient.html b/frontend/patient.html
+new file mode 100644
+index 0000000..7265a55
+--- /dev/null
++++ b/frontend/patient.html
+@@ -0,0 +1,12 @@
++<!doctype html>
++<html lang="zh-CN">
++  <head>
++    <meta charset="UTF-8" />
++    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
++    <title>机构患者门户 · 虚构数据开发</title>
++  </head>
++  <body>
++    <div id="root"></div>
++    <script type="module" src="/src/patient/main.tsx"></script>
++  </body>
++</html>
+
+
+## frontend/vite.patient.config.ts
+warning: in the working copy of 'frontend/vite.patient.config.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/vite.patient.config.ts b/frontend/vite.patient.config.ts
+new file mode 100644
+index 0000000..78e59b9
+--- /dev/null
++++ b/frontend/vite.patient.config.ts
+@@ -0,0 +1,8 @@
++import { defineConfig } from "vite";
++import react from "@vitejs/plugin-react";
++
++export default defineConfig({
++  plugins: [react()],
++  base: "/",
++  build: { outDir: "dist-patient", rollupOptions: { input: "patient.html" } },
++});
+
+
+## frontend/src/patient/main.tsx
+warning: in the working copy of 'frontend/src/patient/main.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/main.tsx b/frontend/src/patient/main.tsx
+new file mode 100644
+index 0000000..819eec2
+--- /dev/null
++++ b/frontend/src/patient/main.tsx
+@@ -0,0 +1,10 @@
++import { StrictMode } from "react";
++import { createRoot } from "react-dom/client";
++import { PatientApp } from "./PatientApp";
++import "./patient.css";
++
++createRoot(document.getElementById("root")!).render(
++  <StrictMode>
++    <PatientApp />
++  </StrictMode>,
++);
+
+
+## frontend/src/patient/PatientApp.tsx
+warning: in the working copy of 'frontend/src/patient/PatientApp.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/PatientApp.tsx b/frontend/src/patient/PatientApp.tsx
+new file mode 100644
+index 0000000..eef46dd
+--- /dev/null
++++ b/frontend/src/patient/PatientApp.tsx
+@@ -0,0 +1,574 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { object, PatientError, request } from "./client";
++
++import {
++  identity,
++  consent,
++  row,
++  rows,
++  roles,
++  type View,
++  type Identity,
++  type Consent,
++  type Row,
++} from "./model";
++export function PatientApp() {
++  const [status, setStatus] = useState("loading"),
++    [me, setMe] = useState<Identity | null>(null),
++    [view, setView] = useState<View>("identity");
++  const [notice, setNotice] = useState<Consent | null>(null),
++    [accepted, setAccepted] = useState(false),
++    [list, setList] = useState<Row[]>([]),
++    [turns, setTurns] = useState<Row[]>([]);
++  const [selected, setSelected] = useState<string | null>(null),
++    [title, setTitle] = useState(""),
++    [content, setContent] = useState(""),
++    [offset, setOffset] = useState(0),
++    [turnOffset, setTurnOffset] = useState(0),
++    [busy, setBusy] = useState(false);
++  const generation = useRef(0),
++    csrf = useRef<string | null>(null),
++    pending = useRef(false);
++  const clear = useCallback(() => {
++    generation.current++;
++    csrf.current = null;
++    pending.current = false;
++    setMe(null);
++    setNotice(null);
++    setAccepted(false);
++    setList([]);
++    setTurns([]);
++    setSelected(null);
++    setTitle("");
++    setContent("");
++    setOffset(0);
++    setTurnOffset(0);
++    setBusy(false);
++  }, []);
++  const failure = useCallback(
++    (error: unknown) => {
++      clear();
++      setStatus(
++        error instanceof PatientError && error.status === 401
++          ? "login"
++          : error instanceof PatientError && error.status === 403
++            ? "forbidden"
++            : "unavailable",
++      );
++    },
++    [clear],
++  );
++  const perform = useCallback(
++    async (operation: (live: () => boolean) => Promise<void>) => {
++      const current = generation.current;
++      const live = () => generation.current === current;
++      try {
++        await operation(live);
++      } catch (error) {
++        if (live()) failure(error);
++      }
++    },
++    [failure],
++  );
++  const refresh = useCallback(
++    (target: View = "identity") => {
++      clear();
++      setStatus("loading");
++      void perform(async (live) => {
++        const session = await request("/auth/session");
++        if (!live()) return;
++        if (
++          !object(session) ||
++          typeof session.csrf_token !== "string" ||
++          !session.csrf_token
++        )
++          throw new PatientError();
++        const own = identity(await request("/me"));
++        if (!live()) return;
++        csrf.current = session.csrf_token;
++        setMe(own);
++        setView(target);
++        setStatus("ready");
++        if (
++          target !== "identity" &&
++          !(target === "consent"
++            ? own.permissions.health_consent
++            : own.permissions.conversations)
++        ) {
++          clear();
++          setStatus("forbidden");
++          return;
++        }
++        if (target === "consent") {
++          const data = consent(await request("/me/consents/health"));
++          if (live()) setNotice(data);
++        }
++        if (target === "conversations") {
++          const data = rows(
++            await request("/conversations?limit=20&offset=0"),
++            "title",
++          );
++          if (live()) setList(data);
++        }
++      });
++    },
++    [clear, perform],
++  );
++  useEffect(() => {
++    const requested = () =>
++      window.location.hash === "#consent"
++        ? "consent"
++        : window.location.hash === "#conversations"
++          ? "conversations"
++          : "identity";
++    refresh(requested());
++    const hide = () => {
++      clear();
++      setStatus("hidden");
++    };
++    const focus = () => {
++      if (document.visibilityState !== "hidden") refresh();
++    };
++    const visibility = () => {
++      if (document.visibilityState === "hidden") hide();
++      else focus();
++    };
++    const hash = () => refresh(requested());
++    window.addEventListener("blur", hide);
++    window.addEventListener("focus", focus);
++    window.addEventListener("hashchange", hash);
++    document.addEventListener("visibilitychange", visibility);
++    return () => {
++      generation.current++;
++      window.removeEventListener("blur", hide);
++      window.removeEventListener("focus", focus);
++      window.removeEventListener("hashchange", hash);
++      document.removeEventListener("visibilitychange", visibility);
++    };
++  }, [clear, refresh]);
++  const navigate = (next: View) => {
++    if (
++      !me ||
++      (next === "consent" && !me.permissions.health_consent) ||
++      (next === "conversations" && !me.permissions.conversations)
++    ) {
++      failure(new PatientError(403));
++      return;
++    }
++    generation.current++;
++    setView(next);
++    setList([]);
++    setTurns([]);
++    setSelected(null);
++    setTitle("");
++    setContent("");
++    setNotice(null);
++    setAccepted(false);
++    setOffset(0);
++    setTurnOffset(0);
++    pending.current = false;
++    setBusy(false);
++    void perform(async (live) => {
++      if (next === "consent") {
++        const data = consent(await request("/me/consents/health"));
++        if (live()) setNotice(data);
++      }
++      if (next === "conversations") {
++        const data = rows(
++          await request("/conversations?limit=20&offset=0"),
++          "title",
++        );
++        if (live()) setList(data);
++      }
++    });
++  };
++  const mutate = (
++    operation: (token: string, live: () => boolean) => Promise<void>,
++  ) => {
++    if (pending.current || !csrf.current) return;
++    pending.current = true;
++    setBusy(true);
++    const token = csrf.current;
++    void perform(async (live) => {
++      try {
++        await operation(token, live);
++      } finally {
++        if (live()) {
++          pending.current = false;
++          setBusy(false);
++        }
++      }
++    });
++  };
++  const logout = () => {
++    const token = csrf.current;
++    clear();
++    setStatus("loading");
++    void perform(async (live) => {
++      await request("/auth/logout", "POST", undefined, token ?? undefined);
++      if (live()) setStatus("login");
++    });
++  };
++  const withdraw = () => {
++    const token = csrf.current;
++    clear();
++    setView("consent");
++    setStatus("loading");
++    void perform(async (live) => {
++      await request(
++        "/me/consents/health",
++        "DELETE",
++        undefined,
++        token ?? undefined,
++      );
++      if (live()) refresh("consent");
++    });
++  };
++  const page = (amount: number, isTurn = false) => {
++    const next = Math.min(
++      10000,
++      Math.max(0, (isTurn ? turnOffset : offset) + amount),
++    );
++    void perform(async (live) => {
++      const data = rows(
++        await request(
++          isTurn
++            ? `/conversations/${selected}/turns?limit=20&offset=${next}`
++            : `/conversations?limit=20&offset=${next}`,
++        ),
++        isTurn ? "content" : "title",
++      );
++      if (live()) {
++        if (isTurn) {
++          setTurns(data);
++          setTurnOffset(next);
++        } else {
++          setList(data);
++          setOffset(next);
++        }
++      }
++    });
++  };
++  return (
++    <div className="patient-shell">
++      <header>
++        <div className="patient-mark">机构服务 · 患者门户</div>
++        <h1>身份与会话记录</h1>
++        <p>虚构数据开发环境 · 不提供诊断或模型生成</p>
++      </header>
++      <main>
++        <p className="patient-note">
++          离开或隐藏页面会清空本页敏感内容；返回时重新验证身份与权限。闲置期间不提供即时推送撤权。
++        </p>
++        {status === "loading" && <p role="status">正在安全验证…</p>}
++        {status === "hidden" && (
++          <p role="status">页面已锁定，返回后重新验证。</p>
++        )}
++        {status === "login" && (
++          <section>
++            <h2>机构身份验证</h2>
++            <form action="/auth/login" method="post">
++              <button type="submit">机构登录</button>
++            </form>
++          </section>
++        )}
++        {status === "unavailable" && (
++          <section>
++            <p role="alert">服务暂不可用，请重试。</p>
++            <button onClick={() => refresh()}>重试</button>
++          </section>
++        )}
++        {status === "forbidden" && (
++          <section>
++            <p role="alert">403 · 当前权限不允许访问此内容。</p>
++            <button onClick={() => refresh()}>重新验证身份</button>
++          </section>
++        )}
++        {status === "ready" && me && (
++          <>
++            <nav aria-label="服务导航">
++              <button disabled={busy} onClick={() => navigate("identity")}>
++                我的身份
++              </button>
++              {me.permissions.health_consent && (
++                <button disabled={busy} onClick={() => navigate("consent")}>
++                  健康信息授权
++                </button>
++              )}
++              {me.permissions.conversations && (
++                <button
++                  disabled={busy}
++                  onClick={() => navigate("conversations")}
++                >
++                  会话记录
++                </button>
++              )}
++              <button className="patient-secondary" onClick={logout}>
++                退出登录
++              </button>
++            </nav>
++            {view === "identity" && (
++              <section>
++                <h2>我的身份</h2>
++                <dl>
++                  <dt>本系统账户</dt>
++                  <dd>{me.user_id}</dd>
++                  <dt>所属机构</dt>
++                  <dd>{me.tenant_id}</dd>
++                  <dt>系统角色</dt>
++                  <dd>
++                    {me.roles
++                      .map((role) => roles[role] ?? "未开放角色")
++                      .join("、")}
++                  </dd>
++                </dl>
++                <p>系统角色声明不等于医院身份核验。</p>
++                {me.roles.some((role) =>
++                  [
++                    "org_admin",
++                    "support",
++                    "platform_operator",
++                    "knowledge_admin",
++                    "integration_admin",
++                    "auditor",
++                  ].includes(role),
++                ) && (
++                  <p>
++                    管理身份不授予患者内容访问权；管理与支持业务模块尚未开放。
++                  </p>
++                )}
++                {(!me.binding.verified || !me.permissions.health_consent) && (
++                  <p>
++                    需机构完成身份与绑定核验，并确认年龄及监护规则；未核验、未成年人、监护人及年龄未知路径不开放患者内容。
++                  </p>
++                )}
++              </section>
++            )}
++            {view === "consent" && (
++              <section>
++                <h2>健康信息使用授权</h2>
++                <p>
++                  不包含医院病历接入或外部模型处理。撤回仅停止未来目的使用，不删除历史记录。
++                </p>
++                {!notice ? (
++                  <p role="status">正在读取机构告知…</p>
++                ) : (
++                  <>
++                    <h3>机构告知 · {notice.notice.version}</h3>
++                    <p className="patient-prose">{notice.notice.text}</p>
++                    <p role="status">
++                      {notice.granted ? "当前已授权" : "当前未授权"}
++                      {notice.expires_at
++                        ? ` · 有效至 ${notice.expires_at}`
++                        : ""}
++                    </p>
++                    {notice.granted ? (
++                      <button disabled={busy} onClick={withdraw}>
++                        撤回授权
++                      </button>
++                    ) : (
++                      <>
++                        <label className="patient-check">
++                          <input
++                            type="checkbox"
++                            checked={accepted}
++                            onChange={(event) =>
++                              setAccepted(event.target.checked)
++                            }
++                          />
++                          我已完整阅读上述机构告知并明确同意本目的使用
++                        </label>
++                        <button
++                          disabled={!accepted || busy}
++                          onClick={() =>
++                            mutate(async (token, live) => {
++                              const updated = consent(
++                                await request(
++                                  "/me/consents/health",
++                                  "POST",
++                                  {
++                                    version: notice.notice.version,
++                                    accepted: true,
++                                  },
++                                  token,
++                                ),
++                              );
++                              if (!live()) return;
++                              const own = identity(await request("/me"));
++                              if (live()) {
++                                setNotice(updated);
++                                setAccepted(false);
++                                setMe(own);
++                              }
++                            })
++                          }
++                        >
++                          明确同意
++                        </button>
++                      </>
++                    )}
++                  </>
++                )}
++              </section>
++            )}
++            {view === "conversations" && (
++              <section>
++                <h2>会话记录</h2>
++                <p>仅保存您输入的文字记录，不生成医疗建议或助手回复。</p>
++                <form
++                  onSubmit={(event) => {
++                    event.preventDefault();
++                    mutate(async (token, live) => {
++                      row(
++                        await request(
++                          "/conversations",
++                          "POST",
++                          { title },
++                          token,
++                        ),
++                        "title",
++                      );
++                      if (!live()) return;
++                      const page = rows(
++                        await request("/conversations?limit=20&offset=0"),
++                        "title",
++                      );
++                      if (live()) {
++                        setTitle("");
++                        setList(page);
++                        setOffset(0);
++                      }
++                    });
++                  }}
++                >
++                  <label>
++                    会话标题
++                    <input
++                      maxLength={200}
++                      value={title}
++                      onChange={(event) => setTitle(event.target.value)}
++                    />
++                  </label>
++                  <button disabled={busy || !title.trim()}>创建会话</button>
++                </form>
++                <ul>
++                  {list.map((item) => (
++                    <li key={item.id}>
++                      <button
++                        disabled={busy}
++                        onClick={() => {
++                          generation.current++;
++                          setSelected(item.id);
++                          setTurns([]);
++                          setContent("");
++                          setTurnOffset(0);
++                          void perform(async (live) => {
++                            const data = rows(
++                              await request(
++                                `/conversations/${item.id}/turns?limit=20&offset=0`,
++                              ),
++                              "content",
++                            );
++                            if (live()) setTurns(data);
++                          });
++                        }}
++                      >
++                        {item.title}
++                      </button>
++                    </li>
++                  ))}
++                </ul>
++                <div className="patient-paging">
++                  <button
++                    disabled={busy || offset === 0}
++                    onClick={() => page(-20)}
++                  >
++                    上一页会话
++                  </button>
++                  <span>第 {offset / 20 + 1} 页</span>
++                  <button
++                    disabled={busy || list.length === 0 || offset >= 10000}
++                    onClick={() => page(20)}
++                  >
++                    下一页会话
++                  </button>
++                </div>
++                {selected && (
++                  <section>
++                    <h3>文字记录</h3>
++                    <ol>
++                      {turns.map((item) => (
++                        <li className="patient-prose" key={item.id}>
++                          {item.content}
++                        </li>
++                      ))}
++                    </ol>
++                    <div className="patient-paging">
++                      <button
++                        disabled={busy || turnOffset === 0}
++                        onClick={() => page(-20, true)}
++                      >
++                        上一页记录
++                      </button>
++                      <button
++                        disabled={
++                          busy || turns.length === 0 || turnOffset >= 10000
++                        }
++                        onClick={() => page(20, true)}
++                      >
++                        下一页记录
++                      </button>
++                    </div>
++                    <form
++                      onSubmit={(event) => {
++                        event.preventDefault();
++                        mutate(async (token, live) => {
++                          row(
++                            await request(
++                              `/conversations/${selected}/turns`,
++                              "POST",
++                              { content },
++                              token,
++                            ),
++                            "content",
++                          );
++                          if (!live()) return;
++                          const page = rows(
++                            await request(
++                              `/conversations/${selected}/turns?limit=20&offset=0`,
++                            ),
++                            "content",
++                          );
++                          if (live()) {
++                            setContent("");
++                            setTurns(page);
++                            setTurnOffset(0);
++                          }
++                        });
++                      }}
++                    >
++                      <label>
++                        记录内容
++                        <textarea
++                          maxLength={16000}
++                          value={content}
++                          onChange={(event) => setContent(event.target.value)}
++                        />
++                      </label>
++                      <button disabled={busy || !content.trim()}>
++                        保存记录
++                      </button>
++                    </form>
++                  </section>
++                )}
++              </section>
++            )}
++          </>
++        )}
++      </main>
++      <footer>
++        机构规则与真实身份核验仍须由可信机构流程完成。本环境不代表生产、临床或法律验收。
++      </footer>
++    </div>
++  );
++}
+
+
+## frontend/src/patient/client.ts
+warning: in the working copy of 'frontend/src/patient/client.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/client.ts b/frontend/src/patient/client.ts
+new file mode 100644
+index 0000000..747cb48
+--- /dev/null
++++ b/frontend/src/patient/client.ts
+@@ -0,0 +1,44 @@
++export class PatientError extends Error {
++  constructor(public readonly status = 503) {
++    super("服务暂不可用，请重试。");
++  }
++}
++export function object(value: unknown): value is Record<string, unknown> {
++  return value !== null && typeof value === "object" && !Array.isArray(value);
++}
++export async function request(
++  path: string,
++  method = "GET",
++  body?: unknown,
++  csrf?: string,
++): Promise<unknown> {
++  try {
++    const headers: Record<string, string> = {};
++    if (body !== undefined) headers["Content-Type"] = "application/json";
++    if (csrf !== undefined) headers["X-CSRF-Token"] = csrf;
++    const response = await fetch(path, {
++      method,
++      credentials: "same-origin",
++      cache: "no-store",
++      headers,
++      ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
++    });
++    if (!response.ok) throw new PatientError(response.status);
++    if (
++      response.headers.get("content-type")?.split(";")[0].trim() !==
++      "application/json"
++    )
++      throw new PatientError();
++    const result: unknown = await response.json();
++    if (
++      !object(result) ||
++      result.success !== true ||
++      !("data" in result) ||
++      result.error !== null
++    )
++      throw new PatientError();
++    return result.data;
++  } catch (error) {
++    throw error instanceof PatientError ? error : new PatientError();
++  }
++}
+
+
+## frontend/src/patient/model.ts
+warning: in the working copy of 'frontend/src/patient/model.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/model.ts b/frontend/src/patient/model.ts
+new file mode 100644
+index 0000000..13ad4f8
+--- /dev/null
++++ b/frontend/src/patient/model.ts
+@@ -0,0 +1,90 @@
++import { object, PatientError } from "./client";
++
++export type View = "identity" | "consent" | "conversations";
++export type Identity = {
++  user_id: string;
++  tenant_id: string;
++  roles: string[];
++  binding: { verified: boolean };
++  permissions: {
++    identity: boolean;
++    health_consent: boolean;
++    conversations: boolean;
++  };
++};
++export type Consent = {
++  notice: { version: string; text: string; validity_seconds: number };
++  granted: boolean;
++  expires_at: string | null;
++};
++export type Row = {
++  id: string;
++  title?: string;
++  content?: string;
++  created_at: string;
++};
++export const roles: Record<string, string> = {
++  patient: "患者",
++  org_admin: "机构管理员",
++  support: "支持人员",
++  platform_operator: "平台运维",
++  knowledge_admin: "知识管理员",
++  integration_admin: "集成管理员",
++  auditor: "审计员",
++  guardian: "监护人",
++};
++
++export function identity(value: unknown): Identity {
++  if (
++    !object(value) ||
++    typeof value.user_id !== "string" ||
++    typeof value.tenant_id !== "string" ||
++    !Array.isArray(value.roles) ||
++    !value.roles.every((x) => typeof x === "string") ||
++    !object(value.binding) ||
++    typeof value.binding.verified !== "boolean" ||
++    !object(value.permissions) ||
++    value.permissions.identity !== true ||
++    typeof value.permissions.health_consent !== "boolean" ||
++    typeof value.permissions.conversations !== "boolean"
++  )
++    throw new PatientError();
++  return value as Identity;
++}
++export function consent(value: unknown): Consent {
++  if (
++    !object(value) ||
++    !object(value.notice) ||
++    typeof value.notice.version !== "string" ||
++    typeof value.notice.text !== "string" ||
++    typeof value.notice.validity_seconds !== "number" ||
++    typeof value.granted !== "boolean" ||
++    !(value.expires_at === null || typeof value.expires_at === "string")
++  )
++    throw new PatientError();
++  return value as Consent;
++}
++export function row(value: unknown, field: "title" | "content"): Row {
++  if (
++    !object(value) ||
++    typeof value.id !== "string" ||
++    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
++      value.id,
++    ) ||
++    typeof value[field] !== "string" ||
++    typeof value.created_at !== "string"
++  )
++    throw new PatientError();
++  return value as Row;
++}
++export function rows(value: unknown, field: "title" | "content"): Row[] {
++  if (
++    !object(value) ||
++    !Array.isArray(value.items) ||
++    value.items.length > 20 ||
++    typeof value.offset !== "number" ||
++    value.limit !== 20
++  )
++    throw new PatientError();
++  return value.items.map((x) => row(x, field));
++}
+
+
+## frontend/src/patient/patient.css
+warning: in the working copy of 'frontend/src/patient/patient.css', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/patient/patient.css b/frontend/src/patient/patient.css
+new file mode 100644
+index 0000000..95d235a
+--- /dev/null
++++ b/frontend/src/patient/patient.css
+@@ -0,0 +1,153 @@
++:root {
++  font-family: "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
++  color: #163743;
++  background: #edf4f5;
++  line-height: 1.65;
++  font-synthesis: none;
++}
++* {
++  box-sizing: border-box;
++}
++body {
++  margin: 0;
++}
++.patient-shell {
++  max-width: 1080px;
++  margin: auto;
++}
++header {
++  background: #113e50;
++  color: white;
++  padding: 2.5rem 2rem;
++  border-bottom: 6px solid #28a69a;
++}
++h1 {
++  font-size: clamp(1.7rem, 4vw, 2.4rem);
++  margin: 0.5rem 0;
++}
++h2,
++h3 {
++  line-height: 1.4;
++}
++.patient-mark {
++  letter-spacing: 0.12em;
++  color: #a9e6df;
++}
++main {
++  padding: 1.5rem 2rem;
++}
++section {
++  background: #fff;
++  border: 1px solid #cfdddf;
++  padding: 1.5rem;
++  margin: 1rem 0;
++  border-radius: 0.5rem;
++}
++nav {
++  display: flex;
++  flex-wrap: wrap;
++  gap: 0.7rem;
++  margin: 1.2rem 0;
++}
++button {
++  font: inherit;
++  background: #086f6a;
++  color: #fff;
++  padding: 0.65rem 1.05rem;
++  border: 1px solid #086f6a;
++  border-radius: 0.3rem;
++  cursor: pointer;
++}
++button:disabled {
++  opacity: 0.5;
++  cursor: not-allowed;
++}
++button:hover:not(:disabled) {
++  background: #075852;
++}
++button:focus-visible,
++input:focus-visible,
++textarea:focus-visible {
++  outline: 3px solid #ba6b06;
++  outline-offset: 3px;
++}
++.patient-secondary {
++  background: #fff;
++  color: #164b60;
++}
++label {
++  display: grid;
++  gap: 0.4rem;
++  margin: 1rem 0;
++  font-weight: 600;
++}
++input,
++textarea {
++  font: inherit;
++  padding: 0.7rem;
++  border: 1px solid #9bafb4;
++  border-radius: 0.25rem;
++  width: 100%;
++}
++textarea {
++  min-height: 8rem;
++  resize: vertical;
++}
++.patient-check {
++  display: flex;
++  align-items: flex-start;
++  gap: 0.7rem;
++}
++.patient-check input {
++  width: 1.2rem;
++  height: 1.2rem;
++  flex-shrink: 0;
++  margin-top: 0.25rem;
++}
++.patient-prose {
++  white-space: pre-wrap;
++  overflow-wrap: anywhere;
++}
++.patient-note,
++footer {
++  font-size: 0.9rem;
++  color: #42606a;
++}
++footer {
++  padding: 1rem 2rem 2rem;
++}
++dt {
++  font-weight: 700;
++}
++dd {
++  margin: 0 0 1rem;
++  overflow-wrap: anywhere;
++}
++ul {
++  padding-left: 1.3rem;
++}
++li {
++  margin: 0.6rem 0;
++}
++.patient-paging {
++  display: flex;
++  align-items: center;
++  gap: 0.75rem;
++  flex-wrap: wrap;
++  margin: 1rem 0;
++}
++[role="alert"] {
++  color: #963a22;
++}
++@media (max-width: 600px) {
++  main,
++  header {
++    padding: 1.2rem;
++  }
++  section {
++    padding: 1rem;
++  }
++  nav button {
++    flex: 1 1 40%;
++  }
++}
+
+
+## frontend/src/test/patient-app.test.tsx
+warning: in the working copy of 'frontend/src/test/patient-app.test.tsx', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/test/patient-app.test.tsx b/frontend/src/test/patient-app.test.tsx
+new file mode 100644
+index 0000000..ed7b5ea
+--- /dev/null
++++ b/frontend/src/test/patient-app.test.tsx
+@@ -0,0 +1,443 @@
++import {
++  act,
++  cleanup,
++  fireEvent,
++  render,
++  screen,
++  waitFor,
++} from "@testing-library/react";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { PatientApp } from "../patient/PatientApp";
++
++const identity = {
++  user_id: "account-own",
++  tenant_id: "institution-own",
++  roles: ["patient"],
++  binding: { verified: true },
++  permissions: { identity: true, health_consent: true, conversations: true },
++};
++const notice = {
++  notice: {
++    version: "institution-v7",
++    text: "机构完整告知 <script>private</script>",
++    validity_seconds: 3600,
++  },
++  granted: false,
++  expires_at: null,
++};
++const item = {
++  id: "00000000-0000-0000-0000-000000000001",
++  title: "私密标题",
++  created_at: "2026-01-01",
++};
++let handler: (url: string, init: RequestInit) => unknown;
++let calls: string[];
++const ok = (data: unknown) =>
++  new Response(JSON.stringify({ success: true, data, error: null }), {
++    headers: { "Content-Type": "application/json" },
++  });
++beforeEach(() => {
++  calls = [];
++  window.history.replaceState(null, "", window.location.pathname);
++  handler = (url) =>
++    url === "/auth/session"
++      ? { ...identity, csrf_token: "csrf-memory" }
++      : url === "/me"
++        ? identity
++        : url.includes("consents")
++          ? notice
++          : url.includes("turns")
++            ? {
++                items: [
++                  {
++                    id: item.id,
++                    content: "私密记录",
++                    created_at: item.created_at,
++                  },
++                ],
++                limit: 20,
++                offset: 0,
++              }
++            : { items: [item], limit: 20, offset: 0 };
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async (url: string, init: RequestInit) => {
++      calls.push(url);
++      const result = await handler(url, init);
++      return result instanceof Response ? result : ok(result);
++    }),
++  );
++});
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++});
++const open = async (name: string) => {
++  await screen.findByRole("button", { name });
++  fireEvent.click(screen.getByRole("button", { name }));
++};
++it("shows only a same-origin institutional POST login after 401", async () => {
++  handler = () => new Response("secret", { status: 401 });
++  render(<PatientApp />);
++  const login = await screen.findByRole("button", { name: "机构登录" });
++  expect(login.closest("form")).toHaveAttribute("action", "/auth/login");
++  expect(login.closest("form")).toHaveAttribute("method", "post");
++  expect(calls).toEqual(["/auth/session"]);
++});
++it("loads identity, translates roles, keeps staff and unverified paths closed", async () => {
++  handler = (url) =>
++    url === "/auth/session"
++      ? { ...identity, csrf_token: "csrf" }
++      : {
++          ...identity,
++          roles: [
++            "org_admin",
++            "support",
++            "platform_operator",
++            "guardian",
++            "unknown",
++          ],
++          binding: { verified: false },
++          permissions: {
++            identity: true,
++            health_consent: false,
++            conversations: false,
++          },
++        };
++  render(<PatientApp />);
++  expect(await screen.findByText("account-own")).toBeInTheDocument();
++  expect(screen.getByText(/管理身份不授予/)).toBeInTheDocument();
++  expect(
++    screen.queryByRole("button", { name: "会话记录" }),
++  ).not.toBeInTheDocument();
++  expect(calls).toEqual(["/auth/session", "/me"]);
++});
++it("explicit forbidden hash shows 403 without fetching sensitive content", async () => {
++  window.history.replaceState(null, "", "#conversations");
++  handler = (url) =>
++    url === "/auth/session"
++      ? { ...identity, csrf_token: "csrf" }
++      : {
++          ...identity,
++          permissions: {
++            identity: true,
++            health_consent: false,
++            conversations: false,
++          },
++        };
++  render(<PatientApp />);
++  expect(await screen.findByText(/403/)).toBeInTheDocument();
++  expect(calls).toEqual(["/auth/session", "/me"]);
++});
++it("requires unchecked acknowledgment and submits exact version+CSRF, then refreshes authority", async () => {
++  render(<PatientApp />);
++  await open("健康信息授权");
++  expect(await screen.findByText(notice.notice.text)).toBeInTheDocument();
++  expect(screen.getByRole("button", { name: "明确同意" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("checkbox"));
++  fireEvent.click(screen.getByRole("button", { name: "明确同意" }));
++  await waitFor(() => expect(calls.filter((x) => x === "/me")).toHaveLength(2));
++  expect(fetch).toHaveBeenCalledWith(
++    "/me/consents/health",
++    expect.objectContaining({
++      method: "POST",
++      body: JSON.stringify({ version: "institution-v7", accepted: true }),
++      headers: {
++        "Content-Type": "application/json",
++        "X-CSRF-Token": "csrf-memory",
++      },
++    }),
++  );
++  expect(document.querySelector("script")).toBeNull();
++});
++it("lists/selects/paginates, creates and appends only plain records; duplicates disabled", async () => {
++  const original = handler;
++  let appended = false;
++  handler = (url, init) =>
++    init.method === "POST"
++      ? url.includes("turns")
++        ? ((appended = true),
++          {
++            id: "00000000-0000-0000-0000-000000000002",
++            content: "新记录",
++            created_at: item.created_at,
++          })
++        : { ...item, id: "00000000-0000-0000-0000-000000000003" }
++      : url.includes("turns") && appended
++        ? {
++            items: [
++              { id: item.id, content: "新记录", created_at: item.created_at },
++            ],
++            limit: 20,
++            offset: 0,
++          }
++        : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  expect(await screen.findByText("私密记录")).toBeInTheDocument();
++  fireEvent.change(screen.getByLabelText("记录内容"), {
++    target: { value: "新记录" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
++  await screen.findByText("新记录");
++  fireEvent.change(screen.getByLabelText("会话标题"), {
++    target: { value: "新标题" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "创建会话" }));
++  await waitFor(() =>
++    expect(fetch).toHaveBeenCalledWith(
++      "/conversations",
++      expect.objectContaining({ body: JSON.stringify({ title: "新标题" }) }),
++    ),
++  );
++  fireEvent.click(screen.getByRole("button", { name: "下一页会话" }));
++  await waitFor(() =>
++    expect(calls).toContain("/conversations?limit=20&offset=20"),
++  );
++  fireEvent.click(screen.getByRole("button", { name: "上一页会话" }));
++  expect(window.location.href).not.toContain(item.id);
++});
++it("logout clears sensitive state synchronously and rejects delayed old replies", async () => {
++  let resolve!: (value: unknown) => void;
++  const original = handler;
++  handler = (url, init) =>
++    url.includes("turns")
++      ? new Promise((r) => {
++          resolve = r;
++        })
++      : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  await open("退出登录");
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  await act(async () =>
++    resolve({
++      items: [
++        { id: item.id, content: "迟到敏感记录", created_at: item.created_at },
++      ],
++      limit: 20,
++      offset: 0,
++    }),
++  );
++  expect(screen.queryByText("迟到敏感记录")).not.toBeInTheDocument();
++  await screen.findByRole("button", { name: "机构登录" });
++});
++it.each([401, 403, 503])(
++  "clears on content authority failure %s with static errors",
++  async (status) => {
++    const original = handler;
++    handler = (url, init) =>
++      url.includes("turns")
++        ? new Response("backend-secret", { status })
++        : original(url, init);
++    render(<PatientApp />);
++    await open("会话记录");
++    await open("私密标题");
++    await waitFor(() =>
++      expect(screen.queryByText("私密标题")).not.toBeInTheDocument(),
++    );
++    expect(document.body.textContent).not.toContain("backend-secret");
++  },
++);
++it("withdraw clears before awaiting failed network and does not restore content", async () => {
++  let resolve!: (value: unknown) => void;
++  const original = handler;
++  handler = (url, init) =>
++    init.method === "DELETE"
++      ? new Promise((r) => {
++          resolve = r;
++        })
++      : url.includes("consents")
++        ? { ...notice, granted: true }
++        : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  await screen.findByText("私密记录");
++  await open("健康信息授权");
++  await open("撤回授权");
++  expect(screen.queryByText("私密记录")).not.toBeInTheDocument();
++  await act(async () => resolve(new Response("secret", { status: 503 })));
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++});
++it("blur clears drafts/content; focus reauthenticates before content", async () => {
++  render(<PatientApp />);
++  await open("会话记录");
++  await screen.findByText("私密标题");
++  fireEvent.change(screen.getByLabelText("会话标题"), {
++    target: { value: "私密草稿" },
++  });
++  fireEvent.blur(window);
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  fireEvent.focus(window);
++  await waitFor(() =>
++    expect(calls.filter((x) => x === "/auth/session")).toHaveLength(2),
++  );
++  await screen.findByText("account-own");
++  expect(screen.queryByDisplayValue("私密草稿")).not.toBeInTheDocument();
++});
++it("network unavailable offers safe retry and never persists patient data", async () => {
++  const storage = vi.spyOn(Storage.prototype, "setItem");
++  handler = () => Promise.reject(Error("secret"));
++  render(<PatientApp />);
++  await screen.findByText("服务暂不可用，请重试。");
++  expect(storage).not.toHaveBeenCalled();
++  expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
++});
++it("locks selection during mutation and reloads real server pages after create/append", async () => {
++  let release!: (data: unknown) => void;
++  const original = handler;
++  let created = false,
++    appended = false;
++  handler = (url, init) => {
++    if (init.method === "POST")
++      return new Promise((resolve) => {
++        release = resolve;
++      });
++    if (url.startsWith("/conversations?") && created)
++      return {
++        items: [{ ...item, title: "服务器第一页" }],
++        limit: 20,
++        offset: 0,
++      };
++    if (url.includes("turns") && appended)
++      return {
++        items: [
++          { id: item.id, content: "服务器记录页", created_at: item.created_at },
++        ],
++        limit: 20,
++        offset: 0,
++      };
++    return original(url, init);
++  };
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  await screen.findByText("私密记录");
++  fireEvent.click(screen.getByRole("button", { name: "下一页记录" }));
++  await waitFor(() =>
++    expect(calls).toContain(
++      `/conversations/${item.id}/turns?limit=20&offset=20`,
++    ),
++  );
++  fireEvent.change(screen.getByLabelText("记录内容"), {
++    target: { value: "new" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
++  expect(screen.getByRole("button", { name: "私密标题" })).toBeDisabled();
++  expect(screen.getByRole("button", { name: "会话记录" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
++  expect(calls.filter((x) => x.endsWith("/turns"))).toHaveLength(1);
++  appended = true;
++  await act(async () =>
++    release({ id: item.id, content: "new", created_at: item.created_at }),
++  );
++  await screen.findByText("服务器记录页");
++  expect(screen.getByRole("button", { name: "上一页记录" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("button", { name: "下一页会话" }));
++  await waitFor(() =>
++    expect(calls).toContain("/conversations?limit=20&offset=20"),
++  );
++  fireEvent.change(screen.getByLabelText("会话标题"), {
++    target: { value: "new" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "创建会话" }));
++  created = true;
++  await act(async () => release({ ...item, title: "new" }));
++  await screen.findByRole("button", { name: "服务器第一页" });
++  expect(screen.getByRole("button", { name: "上一页会话" })).toBeDisabled();
++  expect(screen.queryByText("new")).not.toBeInTheDocument();
++});
++it.each(["session", "identity", "notice", "page", "row"])(
++  "rejects malformed %s data without echo",
++  async (kind) => {
++    const original = handler;
++    handler = (url, init) =>
++      kind === "session" && url === "/auth/session"
++        ? {}
++        : kind === "identity" && url === "/me"
++          ? {}
++          : kind === "notice" && url.includes("consents")
++            ? {}
++            : kind === "page" && url.startsWith("/conversations?")
++              ? {}
++              : kind === "row" && url.startsWith("/conversations?")
++                ? {
++                    items: [
++                      { id: "secret", title: "secret", created_at: "secret" },
++                    ],
++                    limit: 20,
++                    offset: 0,
++                  }
++                : original(url, init);
++    render(<PatientApp />);
++    if (kind === "notice") await open("健康信息授权");
++    if (kind === "page" || kind === "row") await open("会话记录");
++    await screen.findByText("服务暂不可用，请重试。");
++    expect(document.body.textContent).not.toContain("secret");
++  },
++);
++it("successful withdrawal reauthenticates and no longer offers conversations", async () => {
++  const original = handler;
++  let withdrawn = false;
++  handler = (url, init) => {
++    if (init.method === "DELETE") {
++      withdrawn = true;
++      return notice;
++    }
++    if (url === "/me" && withdrawn)
++      return {
++        ...identity,
++        permissions: {
++          identity: true,
++          health_consent: true,
++          conversations: false,
++        },
++      };
++    if (url.includes("consents")) return { ...notice, granted: !withdrawn };
++    return original(url, init);
++  };
++  render(<PatientApp />);
++  await open("健康信息授权");
++  await open("撤回授权");
++  await screen.findByText("当前未授权");
++  expect(
++    screen.queryByRole("button", { name: "会话记录" }),
++  ).not.toBeInTheDocument();
++  await open("我的身份");
++  expect(await screen.findByText("account-own")).toBeInTheDocument();
++});
++it("visibility hiding rejects late old page responses and rechecks on return", async () => {
++  const original = handler;
++  let release!: (data: unknown) => void;
++  handler = (url, init) =>
++    url.startsWith("/conversations?")
++      ? new Promise((r) => (release = r))
++      : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  Object.defineProperty(document, "visibilityState", {
++    configurable: true,
++    value: "hidden",
++  });
++  fireEvent(document, new Event("visibilitychange"));
++  await act(async () => release({ items: [item], limit: 20, offset: 0 }));
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  Object.defineProperty(document, "visibilityState", {
++    configurable: true,
++    value: "visible",
++  });
++  fireEvent(document, new Event("visibilitychange"));
++  await screen.findByText("account-own");
++});
++it("safe retry rechecks after unavailable response", async () => {
++  const original = handler;
++  handler = () => new Response("secret", { status: 503 });
++  render(<PatientApp />);
++  await screen.findByText("服务暂不可用，请重试。");
++  handler = original;
++  await open("重试");
++  await screen.findByText("account-own");
++});
+
+
+## frontend/src/test/patient-client.test.ts
+warning: in the working copy of 'frontend/src/test/patient-client.test.ts', LF will be replaced by CRLF the next time Git touches it
+diff --git a/frontend/src/test/patient-client.test.ts b/frontend/src/test/patient-client.test.ts
+new file mode 100644
+index 0000000..75b1279
+--- /dev/null
++++ b/frontend/src/test/patient-client.test.ts
+@@ -0,0 +1,59 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { PatientError, request } from "../patient/client";
++
++afterEach(() => vi.unstubAllGlobals());
++describe("patient same-origin transport", () => {
++  it("uses cookie credentials/no-store and exact CSRF JSON without ownership", async () => {
++    const fetch = vi
++      .fn()
++      .mockResolvedValue(
++        new Response(
++          JSON.stringify({ success: true, data: null, error: null }),
++          { headers: { "Content-Type": "application/json" } },
++        ),
++      );
++    vi.stubGlobal("fetch", fetch);
++    expect(await request("/auth/logout", "POST", undefined, "csrf")).toBeNull();
++    expect(fetch).toHaveBeenCalledWith(
++      "/auth/logout",
++      expect.objectContaining({
++        credentials: "same-origin",
++        cache: "no-store",
++        method: "POST",
++        headers: { "X-CSRF-Token": "csrf" },
++      }),
++    );
++  });
++  it.each([
++    "secret",
++    { success: true, data: {}, error: "secret" },
++    { success: "yes", data: null, error: null },
++    { success: false, data: "secret", error: { message: "secret" } },
++  ])("rejects malformed envelopes without echo", async (data) => {
++    vi.stubGlobal(
++      "fetch",
++      vi
++        .fn()
++        .mockResolvedValue(
++          new Response(JSON.stringify(data), {
++            headers: { "Content-Type": "application/json" },
++          }),
++        ),
++    );
++    await expect(request("/me")).rejects.toThrow("服务暂不可用，请重试。");
++  });
++  it("sanitizes HTTP errors, non JSON, parse and network failures", async () => {
++    for (const response of [
++      new Response("secret", { status: 403 }),
++      new Response("secret"),
++      new Response("secret", {
++        headers: { "Content-Type": "application/json" },
++      }),
++    ]) {
++      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(response));
++      await expect(request("/me")).rejects.toBeInstanceOf(PatientError);
++    }
++    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(Error("secret")));
++    await expect(request("/me")).rejects.toThrow("服务暂不可用，请重试。");
++  });
++});
+
+
+## src/medical_rag/security_config.py
+warning: in the working copy of 'src/medical_rag/security_config.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/medical_rag/security_config.py b/src/medical_rag/security_config.py
+new file mode 100644
+index 0000000..c6fb24c
+--- /dev/null
++++ b/src/medical_rag/security_config.py
+@@ -0,0 +1,138 @@
++"""Bounded trusted configuration; never imports legacy Settings or dotenv."""
++
++import ipaddress
++import ssl
++import tomllib
++from dataclasses import dataclass, field
++from pathlib import Path
++from uuid import UUID
++
++from cryptography.hazmat.primitives.serialization import load_pem_public_key
++
++from .oidc_login import LoginConfiguration
++from .patient_service import HealthNotice
++
++
++class StartupError(Exception):
++    """Only this static message may cross the startup boundary."""
++
++    def __str__(self) -> str:
++        return "患者服务启动失败，请联系机构运维。"
++
++
++@dataclass(frozen=True, slots=True)
++class PatientConfiguration:
++    tenant_id: str
++    database_dsn: str = field(repr=False)
++    transaction_key: bytes = field(repr=False)
++    frontend_dist: Path
++    listen_host: str
++    listen_port: int
++    tls_cert_file: Path = field(repr=False)
++    tls_key_file: Path = field(repr=False)
++    login: LoginConfiguration = field(repr=False)
++    notice: HealthNotice = field(repr=False)
++
++
++def _read(path: Path, limit: int) -> bytes:
++    with path.open("rb") as stream:
++        data = stream.read(limit + 1)
++    if not data or len(data) > limit:
++        raise StartupError()
++    return data
++
++
++def _keys(value: object, expected: str) -> dict:
++    if type(value) is not dict or set(value) != set(expected.split()):
++        raise StartupError()
++    return value
++
++
++def _string(value: object) -> str:
++    if (
++        type(value) is not str
++        or not value.strip()
++        or len(value) > 65536
++        or "\x00" in value
++    ):
++        raise StartupError()
++    return value
++
++
++def load_configuration(path: Path) -> PatientConfiguration:
++    """Resolve all file paths relative to this operator-owned TOML file."""
++    try:
++        path = Path(path).resolve(strict=True)
++        data = _keys(
++            tomllib.loads(_read(path, 65536).decode("utf-8")),
++            "tenant_id database_dsn_file transaction_key_file frontend_dist listen_host listen_port "
++            "tls_cert_file tls_key_file oidc health_notice",
++        )
++        oidc = _keys(
++            data["oidc"],
++            "issuer authorization_endpoint token_endpoint callback_uri client_id "
++            "client_secret_file public_key_file mfa_acr_values",
++        )
++        notice = _keys(data["health_notice"], "version text_file validity_seconds")
++
++        def file(value: object) -> Path:
++            return (path.parent / _string(value)).resolve(strict=True)
++
++        def text(value: object, limit: int) -> str:
++            return _string(_read(file(value), limit).decode("utf-8").strip())
++
++        tenant = str(UUID(_string(data["tenant_id"])))
++        host = str(ipaddress.ip_address(_string(data["listen_host"])))
++        if ipaddress.ip_address(host).is_unspecified:
++            raise StartupError()
++        port = data["listen_port"]
++        if type(port) is not int or not 1 <= port <= 65535:
++            raise StartupError()
++        acr = oidc["mfa_acr_values"]
++        if (
++            type(acr) is not list
++            or not 1 <= len(acr) <= 32
++            or len(set(map(_string, acr))) != len(acr)
++        ):
++            raise StartupError()
++        login = LoginConfiguration(
++            **{
++                key: _string(oidc[key])
++                for key in (
++                    "issuer",
++                    "authorization_endpoint",
++                    "token_endpoint",
++                    "callback_uri",
++                    "client_id",
++                )
++            },
++            client_secret=text(oidc["client_secret_file"], 16384),
++            public_key=load_pem_public_key(_read(file(oidc["public_key_file"]), 65536)),
++            mfa_acr_values=frozenset(acr),
++        )
++        encryption = _read(file(data["transaction_key_file"]), 32)
++        if len(encryption) != 32:
++            raise StartupError()
++        cert, key = file(data["tls_cert_file"]), file(data["tls_key_file"])
++        # Validate eagerly, before Uvicorn can print credential-path errors.
++        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++        context.minimum_version = ssl.TLSVersion.TLSv1_2
++        context.load_cert_chain(cert, key, password=lambda: b"")
++        return PatientConfiguration(
++            tenant,
++            text(data["database_dsn_file"], 16384),
++            encryption,
++            file(data["frontend_dist"]),
++            host,
++            port,
++            cert,
++            key,
++            login,
++            HealthNotice(
++                _string(notice["version"]),
++                text(notice["text_file"], 65536),
++                notice["validity_seconds"],
++            ),
++        )
++    except Exception:  # noqa: BLE001 -- secret-bearing parser/crypto errors stay private
++        raise StartupError() from None
+
+
+## src/medical_rag/security_server.py
+warning: in the working copy of 'src/medical_rag/security_server.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/src/medical_rag/security_server.py b/src/medical_rag/security_server.py
+new file mode 100644
+index 0000000..696be9c
+--- /dev/null
++++ b/src/medical_rag/security_server.py
+@@ -0,0 +1,269 @@
++"""Dedicated same-origin patient portal, direct TLS only; no legacy routes."""
++
++import argparse
++import ipaddress
++import logging
++import sys
++import warnings
++from pathlib import Path
++
++import psycopg
++import uvicorn
++from fastapi import FastAPI
++from fastapi.responses import FileResponse
++from starlette.staticfiles import StaticFiles
++
++# Authlib currently emits a known httpx migration notice at import, including
++# a local package path. Suppress only that notice at the standalone launcher
++# boundary, not runtime warnings, exceptions or arbitrary dependency messages.
++with warnings.catch_warnings():
++    # Authlib adds an always-filter when importing this category; load it
++    # before installing the more-specific launcher-only filter.
++    from authlib.deprecate import AuthlibDeprecationWarning
++
++    warnings.filterwarnings(
++        "ignore",
++        message=r"The httpx module is deprecated; please use httpx2 instead\.",
++        category=AuthlibDeprecationWarning,
++    )
++    from .oidc_login import OIDCLogin
++from .patient_api import create_patient_app
++from .security_config import PatientConfiguration, StartupError, load_configuration
++
++# Every required column from migrations 1-4 is resolved and SELECT-checked.
++_COLUMNS = {
++    "tenants": "tenant_id active session_version",
++    "identity_accounts": "tenant_id account_id issuer subject active session_version",
++    "identity_roles": "tenant_id account_id role",
++    "identity_bindings": "tenant_id account_id patient_id verified",
++    "identity_sessions": "token_hash csrf_hash tenant_id account_id mfa_verified account_version tenant_version created_at last_seen_at expires_at revoked",
++    "oidc_login_transactions": "tenant_id state_hash browser_hash tenant_version encrypted_context created_at expires_at",
++    "patient_subjects": "tenant_id patient_id age_classification identity_verified",
++    "patient_consent_events": "event_id tenant_id patient_id grantor_account_id purpose notice_version granted recorded_at expires_at event_order",
++    "conversations": "tenant_id patient_id conversation_id title created_at",
++    "conversation_turns": "tenant_id patient_id conversation_id turn_id content created_at",
++}
++
++
++def _connect(config: PatientConfiguration):
++    # Explicit options override DSN values; ignore ambient PG service defaults
++    # for required identity/host fields by requiring them in preflight below.
++    info = psycopg.conninfo.conninfo_to_dict(config.database_dsn)
++    if (
++        not all(info.get(key) for key in ("host", "dbname", "user", "password"))
++        or "service" in info
++    ):
++        raise StartupError()
++    host = info["host"]
++    if "," in host or "hostaddr" in info or host.startswith(("/", "\\")):
++        raise StartupError()
++    try:
++        address = ipaddress.ip_address(host)
++        loopback = address.is_loopback
++        # In particular PGHOSTADDR must not redirect a plaintext loopback
++        # development connection to a remote endpoint.
++        info["hostaddr"] = str(address)
++    except ValueError:
++        loopback = False
++    if not loopback and info.get("sslmode") != "verify-full":
++        raise StartupError()
++    # Explicit endpoint/auth/options prevent libpq PGHOST/PGUSER/PGPASSWORD/
++    # PGPORT/PGOPTIONS from silently selecting a different authority.
++    info.setdefault("port", "5432")
++    info.setdefault("sslmode", "disable" if loopback else "verify-full")
++    info["gssencmode"] = "disable"
++    info.update(
++        connect_timeout="3",
++        options="-c search_path=pg_catalog -c lock_timeout=3000 -c statement_timeout=5000",
++    )
++    return psycopg.connect(**info, autocommit=False)
++
++
++def preflight(config: PatientConfiguration) -> None:
++    """Partial live privilege/schema/primary check, NOT a full security audit."""
++    try:
++        with _connect(config) as db:
++            if db.execute(
++                "SELECT medical_rag.runtime_role_basic_check() AND NOT pg_catalog.pg_is_in_recovery()"
++            ).fetchone() != (True,):
++                raise StartupError()
++            for table, columns in _COLUMNS.items():
++                query = psycopg.sql.SQL("SELECT {} FROM medical_rag.{} LIMIT 0").format(
++                    psycopg.sql.SQL(",").join(
++                        map(psycopg.sql.Identifier, columns.split())
++                    ),
++                    psycopg.sql.Identifier(table),
++                )
++                db.execute(query)
++                # Catch grants via membership/PUBLIC, including column grants
++                # which has_table_privilege alone does not detect.
++                forbidden = (
++                    ["INSERT", "UPDATE", "DELETE"]
++                    if table
++                    in {
++                        "tenants",
++                        "identity_accounts",
++                        "identity_roles",
++                        "identity_bindings",
++                        "patient_subjects",
++                    }
++                    else ["UPDATE", "DELETE"]
++                    if table
++                    in {"patient_consent_events", "conversations", "conversation_turns"}
++                    else []
++                )
++                for privilege in forbidden:
++                    if privilege == "UPDATE" and table == "patient_subjects":
++                        bad = db.execute(
++                            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=%s::regclass AND attnum>0 AND NOT attisdropped AND attname<>'patient_id' AND has_column_privilege(current_user,attrelid,attname,'UPDATE'))",
++                            ("medical_rag." + table,),
++                        ).fetchone()[0]
++                    elif privilege in {"INSERT", "UPDATE"}:
++                        bad = db.execute(
++                            "SELECT has_any_column_privilege(current_user,%s,%s)",
++                            ("medical_rag." + table, privilege),
++                        ).fetchone()[0]
++                    else:
++                        bad = db.execute(
++                            "SELECT has_table_privilege(current_user,%s,%s)",
++                            ("medical_rag." + table, privilege),
++                        ).fetchone()[0]
++                    if bad:
++                        raise StartupError()
++            required = {
++                "identity_sessions": {
++                    "INSERT": "token_hash csrf_hash tenant_id account_id mfa_verified account_version tenant_version expires_at",
++                    "UPDATE": "last_seen_at revoked",
++                },
++                "oidc_login_transactions": {
++                    "INSERT": "tenant_id state_hash browser_hash tenant_version encrypted_context expires_at",
++                    "UPDATE": "state_hash",
++                },
++                "patient_subjects": {"UPDATE": "patient_id"},
++                "patient_consent_events": {
++                    "INSERT": "event_id tenant_id patient_id grantor_account_id purpose notice_version granted expires_at"
++                },
++                "conversations": {
++                    "INSERT": "tenant_id patient_id conversation_id title"
++                },
++                "conversation_turns": {
++                    "INSERT": "tenant_id patient_id conversation_id turn_id content"
++                },
++            }
++            for table, permissions in required.items():
++                for privilege, columns in permissions.items():
++                    for column in columns.split():
++                        if db.execute(
++                            "SELECT has_column_privilege(current_user,%s,%s,%s)",
++                            ("medical_rag." + table, column, privilege),
++                        ).fetchone() != (True,):
++                            raise StartupError()
++            if db.execute(
++                "SELECT has_table_privilege(current_user,'medical_rag.oidc_login_transactions','DELETE')"
++            ).fetchone() != (True,):
++                raise StartupError()
++            for table in (
++                "patient_subjects",
++                "patient_consent_events",
++                "conversations",
++                "conversation_turns",
++            ):
++                if db.execute(
++                    "SELECT relrowsecurity AND relforcerowsecurity FROM pg_catalog.pg_class WHERE oid=%s::regclass",
++                    ("medical_rag." + table,),
++                ).fetchone() != (True,):
++                    raise StartupError()
++            if db.execute(
++                "SELECT active FROM medical_rag.tenants WHERE tenant_id=%s",
++                (config.tenant_id,),
++            ).fetchone() != (True,):
++                raise StartupError()
++    except Exception:  # noqa: BLE001 -- SQL/DSN errors must never cross startup boundary
++        raise StartupError() from None
++
++
++def _application(config: PatientConfiguration) -> FastAPI:
++    try:
++        html = config.frontend_dist / "patient.html"
++        assets = config.frontend_dist / "assets"
++        if not html.is_file() or not assets.is_dir() or not any(assets.iterdir()):
++            raise StartupError()
++        preflight(config)
++        login = OIDCLogin(
++            config.login,
++            lambda: _connect(config),
++            tenant_id=config.tenant_id,
++            transaction_encryption_key=config.transaction_key,
++        )
++        app = create_patient_app(login, config.notice, patient_html=True)
++
++        @app.get("/", include_in_schema=False)
++        async def index():
++            return FileResponse(html, media_type="text/html")
++
++        app.mount(
++            "/assets",
++            StaticFiles(directory=assets, html=False, follow_symlink=False),
++            name="patient-assets",
++        )
++        return app
++    except Exception:  # noqa: BLE001 -- only static startup errors may be public
++        raise StartupError() from None
++
++
++def load_patient_application(config_path: Path) -> FastAPI:
++    """Load only trusted file configuration, preflight, and dedicated build."""
++    return _application(load_configuration(config_path))
++
++
++class _Parser(argparse.ArgumentParser):
++    def error(self, message):
++        raise StartupError()
++
++
++def main(argv: list[str] | None = None) -> int:
++    """Run direct TLS without request logging or proxy-header trust."""
++    try:
++        parser = _Parser(description="机构患者门户（直接 TLS）")
++        parser.add_argument("--config", required=True, type=Path)
++        args = parser.parse_args(argv)
++        config = load_configuration(args.config)
++        app = _application(config)
++        if not ipaddress.ip_address(config.listen_host).is_loopback:
++            print(
++                "警告：患者服务绑定非回环地址；机构须另行完成网络边界审查。",
++                file=sys.stderr,
++            )
++        # Avoid upstream libraries printing startup paths or ASGI traces. The
++        # application converts request failures to static responses as well.
++        for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
++            logger = logging.getLogger(name)
++            logger.handlers = [logging.NullHandler()]
++            logger.propagate = False
++        uvicorn.run(
++            app,
++            host=config.listen_host,
++            port=config.listen_port,
++            ssl_certfile=str(config.tls_cert_file),
++            ssl_keyfile=str(config.tls_key_file),
++            access_log=False,
++            proxy_headers=False,
++            server_header=False,
++            log_config=None,
++            log_level="critical",
++            limit_concurrency=100,
++            timeout_keep_alive=5,
++        )
++        return 0
++    except SystemExit as error:
++        if error.code == 0:
++            return 0
++        print(str(StartupError()), file=sys.stderr)
++        return 1
++    except Exception:  # noqa: BLE001 -- prevent server/path/secret tracebacks
++        print(str(StartupError()), file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+
+
+## tests/test_security_server.py
+warning: in the working copy of 'tests/test_security_server.py', LF will be replaced by CRLF the next time Git touches it
+diff --git a/tests/test_security_server.py b/tests/test_security_server.py
+new file mode 100644
+index 0000000..2789124
+--- /dev/null
++++ b/tests/test_security_server.py
+@@ -0,0 +1,719 @@
++"""Trusted startup tests; loader doubles are separate from real PostgreSQL."""
++
++# ruff: noqa: F401,F811 -- imported pytest fixtures
++import os
++import secrets
++import socket
++import ssl
++import subprocess
++import sys
++import time
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import psycopg
++import pytest
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.x509.oid import NameOID
++from fastapi.testclient import TestClient
++from test_oidc_login import APP_ORIGIN, TENANT, configuration
++from test_patient_vertical import (
++    auth_system,
++    database,
++    oidc_database,
++    signing_key,
++    system,
++)
++
++from medical_rag import security_server
++from medical_rag.security_config import StartupError, load_configuration
++
++
++@pytest.fixture
++def config_file(tmp_path, signing_key):
++    (tmp_path / "dsn").write_text(
++        "postgresql://fictional-secret@localhost/test", encoding="utf-8"
++    )
++    (tmp_path / "client-secret").write_text("fictional-secret", encoding="utf-8")
++    (tmp_path / "key").write_bytes(b"x" * 32)
++    (tmp_path / "notice").write_text(
++        "Institution-approved fictional test notice", encoding="utf-8"
++    )
++    (tmp_path / "public.pem").write_bytes(
++        signing_key.public_key().public_bytes(
++            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
++        )
++    )
++    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "medical.example.org")])
++    cert = (
++        x509.CertificateBuilder()
++        .subject_name(name)
++        .issuer_name(name)
++        .public_key(signing_key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
++        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
++        .sign(signing_key, hashes.SHA256())
++    )
++    (tmp_path / "tls.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
++    (tmp_path / "tls.key").write_bytes(
++        signing_key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.PKCS8,
++            serialization.NoEncryption(),
++        )
++    )
++    build = tmp_path / "dist-patient"
++    (build / "assets").mkdir(parents=True)
++    (build / "patient.html").write_text(
++        '<html><script type="module" src="/assets/patient.js"></script></html>',
++        encoding="utf-8",
++    )
++    (build / "assets/patient.js").write_text(
++        'document.title="patient"', encoding="utf-8"
++    )
++    config = tmp_path / "patient.toml"
++    config.write_text(
++        """tenant_id = "00000000-0000-0000-0000-000000000101"
++database_dsn_file = "dsn"
++transaction_key_file = "key"
++frontend_dist = "dist-patient"
++listen_host = "127.0.0.1"
++listen_port = 8443
++tls_cert_file = "tls.pem"
++tls_key_file = "tls.key"
++[oidc]
++issuer = "https://identity.example.org/realms/hospital"
++authorization_endpoint = "https://identity.example.org/realms/hospital/protocol/openid-connect/auth"
++token_endpoint = "https://identity.example.org/realms/hospital/protocol/openid-connect/token"
++callback_uri = "https://medical.example.org/auth/callback"
++client_id = "medical-rag"
++client_secret_file = "client-secret"
++public_key_file = "public.pem"
++mfa_acr_values = ["urn:hospital:mfa"]
++[health_notice]
++version = "fictional-v1"
++text_file = "notice"
++validity_seconds = 3600
++""",
++        encoding="utf-8",
++    )
++    return config
++
++
++def test_relative_config_is_bounded_and_environment_independent(
++    config_file, tmp_path, monkeypatch
++):
++    monkeypatch.chdir(tmp_path.parent)
++    monkeypatch.setenv("DATABASE_URL", "secret-ignored")
++    loaded = load_configuration(config_file)
++    assert loaded.frontend_dist == config_file.parent / "dist-patient"
++    assert loaded.notice.version == "fictional-v1"
++    assert "fictional-secret" not in repr(loaded)
++    assert loaded.login.client_id == "medical-rag"
++
++
++@pytest.mark.parametrize(
++    "replace",
++    [
++        ("listen_port = 8443", "listen_port = true"),
++        ("listen_port = 8443", "listen_port = 0"),
++        ('listen_host = "127.0.0.1"', 'listen_host = "0.0.0.0"'),
++        ('listen_host = "127.0.0.1"', 'listen_host = "::"'),
++        ('listen_host = "127.0.0.1"', 'listen_host = "localhost"'),
++        ('tenant_id = "00000000-0000-0000-0000-000000000101"', 'tenant_id = "secret"'),
++        ('client_id = "medical-rag"', 'unknown = "secret"'),
++        ("listen_port = 8443", 'listen_port = 8443\nunknown = "secret"'),
++        ('mfa_acr_values = ["urn:hospital:mfa"]', 'mfa_acr_values = "secret"'),
++        ("validity_seconds = 3600", "validity_seconds = 31536001"),
++        ('database_dsn_file = "dsn"', "database_dsn_file = 5"),
++    ],
++)
++def test_invalid_configuration_is_sanitized(config_file, replace):
++    config_file.write_text(
++        config_file.read_text(encoding="utf-8").replace(*replace), encoding="utf-8"
++    )
++    with pytest.raises(StartupError, match="^患者服务启动失败，请联系机构运维。$"):
++        load_configuration(config_file)
++
++
++@pytest.mark.parametrize(
++    "file,data",
++    [
++        ("key", b"x" * 31),
++        ("public.pem", b"invalid-secret"),
++        ("dsn", b"x" * 16385),
++        ("client-secret", b""),
++        ("notice", b"x" * 65537),
++        ("tls.key", b"secret"),
++        ("patient.toml", b"x" * 65537),
++    ],
++    ids=[
++        "key",
++        "publickey",
++        "dsn-bound",
++        "empty-secret",
++        "notice-bound",
++        "tls",
++        "config-bound",
++    ],
++)
++def test_bad_files_fail_without_sensitive_details(config_file, file, data):
++    (config_file.parent / file).write_bytes(data)
++    with pytest.raises(StartupError) as error:
++        load_configuration(config_file)
++    assert str(error.value) == "患者服务启动失败，请联系机构运维。"
++
++
++def test_missing_files_and_dedicated_build_denied(config_file):
++    with pytest.raises(StartupError):
++        load_configuration(config_file.parent / "absent")
++    (config_file.parent / "dist-patient/patient.html").unlink()
++    with pytest.raises(StartupError):
++        security_server.load_patient_application(config_file)
++
++
++def test_cli_fixed_failure_and_no_sensitive_logs(capsys):
++    assert security_server.main(["--config", "never-exists-secret"]) == 1
++    output = capsys.readouterr()
++    assert output.err.strip() == "患者服务启动失败，请联系机构运维。"
++    assert "secret" not in output.out + output.err
++
++
++def test_direct_tls_invocation_guards(config_file, monkeypatch):
++    observed = {}
++    monkeypatch.setattr(security_server, "preflight", lambda *_: None)
++    monkeypatch.setattr(
++        security_server.uvicorn, "run", lambda app, **kwargs: observed.update(kwargs)
++    )
++    assert security_server.main(["--config", str(config_file)]) == 0
++    assert observed["access_log"] is False and observed["proxy_headers"] is False
++    assert observed["server_header"] is False and observed["log_config"] is None
++    assert observed["ssl_keyfile"] == str(config_file.parent / "tls.key")
++    assert observed["limit_concurrency"] == 100 and observed["timeout_keep_alive"] == 5
++
++
++def test_app_mounts_only_dedicated_build_with_self_only_csp(config_file, monkeypatch):
++    monkeypatch.setattr(security_server, "preflight", lambda *_: None)
++    app = security_server.load_patient_application(config_file)
++    with TestClient(app, base_url=APP_ORIGIN, headers={}) as client:
++        response = client.get("/")
++        assert response.status_code == 200 and "/assets/patient.js" in response.text
++        assert client.get("/assets/patient.js").status_code == 200
++        assert client.get("/assets/").status_code == 404
++        for path in [
++            "/ui",
++            "/chat",
++            "/api/chat",
++            "/settings",
++            "/docs",
++            "/openapi.json",
++            "/patient.toml",
++            "/assets/../patient.toml",
++        ]:
++            assert client.get(path).status_code == 404
++        csp = response.headers["content-security-policy"]
++        assert (
++            "script-src 'self'" in csp
++            and "unsafe-" not in csp
++            and "form-action 'self'" in csp
++        )
++        assert response.headers["cache-control"] == "no-store"
++        assert client.get("/", headers={"Host": "evil.example"}).status_code == 403
++        assert (
++            client.get("/", headers={"Origin": "https://evil.example"}).status_code
++            == 403
++        )
++        assert (
++            client.get("/", headers={"X-Forwarded-Host": "evil.example"}).status_code
++            == 200
++        )
++    with TestClient(app, base_url="http://medical.example.org", headers={}) as client:
++        assert (
++            client.get("/", headers={"X-Forwarded-Proto": "https"}).status_code == 403
++        )
++
++
++def test_headless_csp_default_is_unchanged(signing_key):
++    from medical_rag.oidc_login import OIDCLogin, create_auth_app
++
++    login = OIDCLogin(
++        configuration(signing_key),
++        lambda: None,
++        tenant_id=TENANT,
++        transaction_encryption_key=b"x" * 32,
++    )
++    with TestClient(create_auth_app(login), base_url=APP_ORIGIN, headers={}) as client:
++        assert (
++            client.get("/absent").headers["content-security-policy"]
++            == "default-src 'none'; frame-ancestors 'none'"
++        )
++
++
++def test_patient_form_csp_permits_only_trusted_fixed_idp_origin(signing_key):
++    from medical_rag.oidc_login import OIDCLogin, create_auth_app
++
++    login = OIDCLogin(
++        configuration(signing_key),
++        lambda: None,
++        tenant_id=TENANT,
++        transaction_encryption_key=b"x" * 32,
++    )
++    with TestClient(
++        create_auth_app(login, patient_html=True), base_url=APP_ORIGIN, headers={}
++    ) as client:
++        csp = client.get(
++            "/absent",
++            headers={
++                "Forwarded": "host=evil.example",
++                "X-Forwarded-Host": "evil.example",
++            },
++        ).headers["content-security-policy"]
++        directives = dict(part.strip().split(" ", 1) for part in csp.split(";"))
++        assert directives["form-action"] == "'self' https://identity.example.org"
++        assert (
++            directives["script-src"]
++            == directives["style-src"]
++            == directives["connect-src"]
++            == "'self'"
++        )
++        assert "evil" not in csp and "*" not in csp and "unsafe-" not in csp
++
++
++@pytest.mark.parametrize(
++    "authority",
++    [
++        "*.example.org",
++        "identity.example.org;script-src",
++        "identity.example.org'",
++        "identity\\evil.example.org",
++    ],
++)
++def test_patient_csp_rejects_unsafe_authority_syntax(authority):
++    from types import SimpleNamespace
++
++    from medical_rag.oidc_login import create_auth_app
++
++    login = SimpleNamespace(
++        config=SimpleNamespace(
++            app_origin=APP_ORIGIN,
++            authorization_endpoint="https://" + authority + "/authorize",
++        )
++    )
++    with pytest.raises(ValueError):
++        create_auth_app(login, patient_html=True)
++
++
++@pytest.mark.integration
++def test_owner_grant_recipe_supports_real_runtime_operations(
++    config_file, system, database
++):
++    from medical_rag.identity_sessions import SessionStore
++    from medical_rag.oidc_identity import VerifiedIdentity
++    from medical_rag.patient_service import PatientService
++
++    _, admin = database
++    role = "patient_recipe_" + secrets.token_hex(6)
++    with psycopg.connect(**admin) as db:
++        db.execute(
++            psycopg.sql.SQL(
++                "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
++            ).format(
++                psycopg.sql.Identifier(role), psycopg.sql.Literal(admin["password"])
++            )
++        )
++        recipe = (
++            Path(__file__).resolve().parents[1] / "database/patient_runtime_grants.sql"
++        ).read_text(encoding="utf-8")
++        recipe = "\n".join(
++            line for line in recipe.splitlines() if not line.startswith("\\")
++        )
++        db.execute(
++            recipe.replace(
++                ':"runtime_role"', psycopg.sql.Identifier(role).as_string(db)
++            )
++        )
++    params = dict(admin, user=role, autocommit=False)
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in params.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    loaded = load_configuration(config_file)
++    security_server.preflight(loaded)
++    sessions = SessionStore(lambda: psycopg.connect(**params), tenant_id=TENANT)
++    issued = sessions.issue(VerifiedIdentity(loaded.login.issuer, "subject-1", True))
++    service = PatientService(sessions, loaded.notice)
++    assert service.change_consent(
++        issued.token,
++        csrf_token=issued.csrf_token,
++        granted=True,
++        version=loaded.notice.version,
++    )["granted"]
++    created = service.create_conversation(
++        issued.token, csrf_token=issued.csrf_token, title="fictional"
++    )
++    service.append_turn(
++        issued.token, created["id"], csrf_token=issued.csrf_token, content="fictional"
++    )
++    assert len(service.list_turns(issued.token, created["id"])["items"]) == 1
++    login = __import__("medical_rag.oidc_login", fromlist=["OIDCLogin"]).OIDCLogin(
++        loaded.login,
++        lambda: psycopg.connect(**params),
++        tenant_id=TENANT,
++        transaction_encryption_key=loaded.transaction_key,
++    )
++    flow = login.transactions.create()
++    assert (
++        login.transactions.consume(flow.state, flow.browser_token).tenant_version >= 0
++    )
++
++
++@pytest.mark.integration
++def test_actual_recovery_postgres_denied(config_file, system, database):
++    """Create one OWN disposable clone; never change the existing primary."""
++    runtime, admin = database
++    # Resolve only the fixture's random primary port. Attach an OWN temporary
++    # network and create an OWN bounded-memory streaming standby container.
++    inventory = subprocess.run(
++        ["docker", "ps", "--format", "{{.ID}} {{.Ports}}"],
++        capture_output=True,
++        text=True,
++        check=True,
++    ).stdout.splitlines()
++    containers = [
++        line.split()[0]
++        for line in inventory
++        if f"127.0.0.1:{admin['port']}->5432" in line
++    ]
++    assert len(containers) == 1
++    container = containers[0]
++    network = "patient-recovery-" + secrets.token_hex(6)
++    standby = None
++    subprocess.run(
++        ["docker", "network", "create", network],
++        capture_output=True,
++        check=True,
++        timeout=10,
++    )
++    try:
++        subprocess.run(
++            [
++                "docker",
++                "network",
++                "connect",
++                "--alias",
++                "patient-primary",
++                network,
++                container,
++            ],
++            capture_output=True,
++            check=True,
++            timeout=10,
++        )
++        # Only this test's disposable primary: permit password-authenticated
++        # replication on the isolated temporary Docker network.
++        with psycopg.connect(**admin) as db:
++            hba = db.execute("SHOW hba_file").fetchone()[0]
++        subprocess.run(
++            [
++                "docker",
++                "exec",
++                container,
++                "sh",
++                "-c",
++                f"printf '\\nhost replication postgres all scram-sha-256\\n' >> '{hba}'",
++            ],
++            capture_output=True,
++            check=True,
++            timeout=10,
++        )
++        with psycopg.connect(**admin) as db:
++            db.execute("SELECT pg_reload_conf()")
++        standby = subprocess.run(
++            [
++                "docker",
++                "run",
++                "-d",
++                "--network",
++                network,
++                "-p",
++                "127.0.0.1::5432",
++                "--tmpfs",
++                "/standby:rw,size=256m,uid=70,gid=70,mode=0700",
++                "--user",
++                "postgres",
++                "-e",
++                f"PGPASSWORD={admin['password']}",
++                "--entrypoint",
++                "sh",
++                "postgres:18.6-alpine",
++                "-c",
++                "pg_basebackup -c fast -h patient-primary -U postgres -D /standby -R -X stream && exec postgres -D /standby -c listen_addresses='*'",
++            ],
++            capture_output=True,
++            text=True,
++            check=True,
++            timeout=10,
++        ).stdout.strip()
++        port = (
++            subprocess.run(
++                ["docker", "port", standby, "5432/tcp"],
++                capture_output=True,
++                text=True,
++                check=True,
++                timeout=10,
++            )
++            .stdout.strip()
++            .rsplit(":", 1)[1]
++        )
++        params = dict(runtime, port=int(port))
++        for _ in range(100):
++            try:
++                with psycopg.connect(**params) as db:
++                    assert db.execute("SELECT pg_is_in_recovery()").fetchone() == (
++                        True,
++                    )
++                break
++            except psycopg.OperationalError:
++                time.sleep(0.1)
++        else:
++            pytest.fail("disposable recovery server did not become ready")
++        (config_file.parent / "dsn").write_text(
++            psycopg.conninfo.make_conninfo(
++                **{k: v for k, v in params.items() if k != "autocommit"}
++            ),
++            encoding="utf-8",
++        )
++        with pytest.raises(StartupError):
++            security_server.load_patient_application(config_file)
++    finally:
++        if standby:
++            subprocess.run(
++                ["docker", "rm", "-f", standby],
++                capture_output=True,
++                timeout=15,
++                check=False,
++            )
++        subprocess.run(
++            ["docker", "network", "disconnect", network, container],
++            capture_output=True,
++            timeout=10,
++            check=False,
++        )
++        subprocess.run(
++            ["docker", "network", "rm", network],
++            capture_output=True,
++            timeout=10,
++            check=False,
++        )
++
++
++@pytest.mark.integration
++def test_actual_primary_least_privilege_startup_and_authority_denials(
++    config_file, system, database
++):
++    runtime, admin = database
++    dsn = config_file.parent / "dsn"
++    dsn.write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    assert security_server.load_patient_application(config_file) is not None
++    with psycopg.connect(**admin) as db:
++        for grant, revoke in [
++            (
++                "GRANT UPDATE(active) ON medical_rag.tenants TO login_test",
++                "REVOKE UPDATE(active) ON medical_rag.tenants FROM login_test",
++            ),
++            (
++                "GRANT INSERT(role) ON medical_rag.identity_roles TO login_test",
++                "REVOKE INSERT(role) ON medical_rag.identity_roles FROM login_test",
++            ),
++            (
++                "GRANT UPDATE(identity_verified) ON medical_rag.patient_subjects TO login_test",
++                "REVOKE UPDATE(identity_verified) ON medical_rag.patient_subjects FROM login_test",
++            ),
++            (
++                "GRANT UPDATE(granted) ON medical_rag.patient_consent_events TO login_test",
++                "REVOKE UPDATE(granted) ON medical_rag.patient_consent_events FROM login_test",
++            ),
++            (
++                "GRANT DELETE ON medical_rag.patient_consent_events TO login_test",
++                "REVOKE DELETE ON medical_rag.patient_consent_events FROM login_test",
++            ),
++        ]:
++            db.execute(grant)
++            try:
++                with pytest.raises(StartupError):
++                    security_server.load_patient_application(config_file)
++            finally:
++                db.execute(revoke)
++        db.execute(
++            "UPDATE medical_rag.tenants SET active=false WHERE tenant_id=%s", (TENANT,)
++        )
++        with pytest.raises(StartupError):
++            security_server.load_patient_application(config_file)
++        db.execute(
++            "UPDATE medical_rag.tenants SET active=true WHERE tenant_id=%s", (TENANT,)
++        )
++    dsn.write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in admin.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    with pytest.raises(StartupError):
++        security_server.load_patient_application(config_file)
++
++
++@pytest.mark.integration
++def test_actual_wrong_tenant_missing_schema_denied(config_file, system, database):
++    runtime, admin = database
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    original = config_file.read_text(encoding="utf-8")
++    config_file.write_text(
++        original.replace(TENANT, "00000000-0000-0000-0000-000000000999"),
++        encoding="utf-8",
++    )
++    with pytest.raises(StartupError):
++        security_server.load_patient_application(config_file)
++    config_file.write_text(original, encoding="utf-8")
++    with psycopg.connect(**admin) as db:
++        db.execute(
++            "ALTER TABLE medical_rag.patient_subjects RENAME COLUMN age_classification TO missing_age"
++        )
++        try:
++            with pytest.raises(StartupError):
++                security_server.load_patient_application(config_file)
++        finally:
++            db.execute(
++                "ALTER TABLE medical_rag.patient_subjects RENAME COLUMN missing_age TO age_classification"
++            )
++
++
++@pytest.mark.integration
++def test_required_dml_and_forced_rls_are_checked(config_file, system, database):
++    runtime, admin = database
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    with psycopg.connect(**admin) as db:
++        for table in ["patient_consent_events", "conversations", "identity_sessions"]:
++            db.execute(f"REVOKE INSERT ON medical_rag.{table} FROM login_test")
++            try:
++                with pytest.raises(StartupError):
++                    security_server.load_patient_application(config_file)
++            finally:
++                db.execute(f"GRANT INSERT ON medical_rag.{table} TO login_test")
++        db.execute("ALTER TABLE medical_rag.conversations NO FORCE ROW LEVEL SECURITY")
++        try:
++            with pytest.raises(StartupError):
++                security_server.load_patient_application(config_file)
++        finally:
++            db.execute("ALTER TABLE medical_rag.conversations FORCE ROW LEVEL SECURITY")
++
++
++@pytest.mark.parametrize(
++    "dsn",
++    [
++        "host=db.example.org dbname=postgres user=patient password=secret sslmode=disable",
++        "host=127.0.0.1,db.example.org dbname=postgres user=patient password=secret",
++        "host=127.0.0.1 hostaddr=203.0.113.1 dbname=postgres user=patient password=secret",
++    ],
++)
++def test_unsafe_remote_database_transport_denied(config_file, dsn, monkeypatch):
++    (config_file.parent / "dsn").write_text(dsn, encoding="utf-8")
++    connected = []
++    monkeypatch.setattr(
++        security_server.psycopg,
++        "connect",
++        lambda *args, **kwargs: connected.append(True),
++    )
++    with pytest.raises(StartupError):
++        security_server._connect(load_configuration(config_file))
++    assert connected == []
++
++
++def test_help_succeeds_without_startup_or_secret_access(capsys):
++    assert security_server.main(["--help"]) == 0
++    assert "启动失败" not in capsys.readouterr().err
++
++
++@pytest.mark.integration
++def test_real_direct_tls_process_serves_only_dedicated_build(
++    config_file, system, database
++):
++    runtime, _ = database
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    with socket.socket() as reserved:
++        reserved.bind(("127.0.0.1", 0))
++        port = reserved.getsockname()[1]
++    config_file.write_text(
++        config_file.read_text(encoding="utf-8").replace(
++            "listen_port = 8443", f"listen_port = {port}"
++        ),
++        encoding="utf-8",
++    )
++    process = subprocess.Popen(
++        [
++            sys.executable,
++            "-m",
++            "medical_rag.security_server",
++            "--config",
++            str(config_file),
++        ],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        env=dict(
++            os.environ,
++            PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
++        ),
++    )
++    context = ssl.create_default_context(cafile=str(config_file.parent / "tls.pem"))
++    try:
++        for _ in range(100):
++            try:
++                with (
++                    socket.create_connection(("127.0.0.1", port), timeout=0.2) as raw,
++                    context.wrap_socket(
++                        raw, server_hostname="medical.example.org"
++                    ) as tls,
++                ):
++                    tls.sendall(
++                        b"GET / HTTP/1.1\r\nHost: medical.example.org\r\nConnection: close\r\n\r\n"
++                    )
++                    response = b""
++                    while chunk := tls.recv(65536):
++                        response += chunk
++                break
++            except (ConnectionError, TimeoutError):
++                time.sleep(0.1)
++        else:
++            pytest.fail("direct TLS test listener did not become ready")
++        assert (
++            response.startswith(b"HTTP/1.1 200") and b"/assets/patient.js" in response
++        )
++        assert b"server: uvicorn" not in response.lower()
++        assert b"cache-control: no-store" in response.lower()
++    finally:
++        process.terminate()
++        stdout, stderr = process.communicate(timeout=10)
++    assert stdout == b"" and stderr == b""
+
+
+## database/patient_runtime_grants.sql
+warning: in the working copy of 'database/patient_runtime_grants.sql', LF will be replaced by CRLF the next time Git touches it
+diff --git a/database/patient_runtime_grants.sql b/database/patient_runtime_grants.sql
+new file mode 100644
+index 0000000..e1f700d
+--- /dev/null
++++ b/database/patient_runtime_grants.sql
+@@ -0,0 +1,44 @@
++-- Owner-run psql only, after migrations 0001-0004 and external role audit:
++-- psql ... -v runtime_role=patient_runtime -f database/patient_runtime_grants.sql
++-- runtime_role must already be a dedicated NOSUPERUSER NOBYPASSRLS,
++-- NOCREATEDB NOCREATEROLE NOREPLICATION role, with no privileged memberships,
++-- schema CREATE, table ownership, DDL or inherited broader/PUBLIC authority.
++-- This grant recipe does NOT revoke/audit old/inherited/PUBLIC permissions,
++-- create roles/accounts, provision verification, or auto-apply migrations.
++\set ON_ERROR_STOP on
++BEGIN;
++GRANT USAGE ON SCHEMA medical_rag TO :"runtime_role";
++GRANT EXECUTE ON FUNCTION medical_rag.runtime_role_basic_check() TO :"runtime_role";
++GRANT SELECT (tenant_id, active, session_version) ON medical_rag.tenants TO :"runtime_role";
++GRANT SELECT (tenant_id, account_id, issuer, subject, active, session_version)
++    ON medical_rag.identity_accounts TO :"runtime_role";
++GRANT SELECT (tenant_id, account_id, role) ON medical_rag.identity_roles TO :"runtime_role";
++GRANT SELECT (tenant_id, account_id, patient_id, verified) ON medical_rag.identity_bindings TO :"runtime_role";
++GRANT SELECT (tenant_id, patient_id, age_classification, identity_verified)
++    ON medical_rag.patient_subjects TO :"runtime_role";
++-- Harmless key UPDATE is solely required by PostgreSQL SELECT FOR UPDATE.
++GRANT UPDATE (patient_id) ON medical_rag.patient_subjects TO :"runtime_role";
++GRANT SELECT (token_hash, csrf_hash, tenant_id, account_id, mfa_verified,
++    account_version, tenant_version, created_at, last_seen_at, expires_at, revoked),
++    INSERT (token_hash, csrf_hash, tenant_id, account_id, mfa_verified,
++    account_version, tenant_version, expires_at), UPDATE (last_seen_at, revoked)
++    ON medical_rag.identity_sessions TO :"runtime_role";
++GRANT SELECT (tenant_id, state_hash, browser_hash, tenant_version, encrypted_context, created_at, expires_at),
++    INSERT (tenant_id, state_hash, browser_hash, tenant_version, encrypted_context, expires_at), DELETE
++    ON medical_rag.oidc_login_transactions TO :"runtime_role";
++-- PostgreSQL FOR UPDATE on login rows needs UPDATE on a harmless key.
++GRANT UPDATE (state_hash) ON medical_rag.oidc_login_transactions TO :"runtime_role";
++GRANT SELECT (tenant_id, patient_id, conversation_id, title, created_at),
++    INSERT (tenant_id, patient_id, conversation_id, title)
++    ON medical_rag.conversations TO :"runtime_role";
++GRANT SELECT (tenant_id, patient_id, conversation_id, turn_id, content, created_at),
++    INSERT (tenant_id, patient_id, conversation_id, turn_id, content)
++    ON medical_rag.conversation_turns TO :"runtime_role";
++GRANT SELECT (event_id, tenant_id, patient_id, grantor_account_id, purpose,
++    notice_version, granted, recorded_at, expires_at, event_order),
++    INSERT (event_id, tenant_id, patient_id, grantor_account_id, purpose,
++    notice_version, granted, expires_at)
++    ON medical_rag.patient_consent_events TO :"runtime_role";
++-- Migration 0004 allocates event_order in an invoker trigger, NOT a sequence;
++-- migrations 0001-0004 contain no sequence/identity requiring extra grants.
++COMMIT;
+
+
+## deploy/patient/config.example.toml
+warning: in the working copy of 'deploy/patient/config.example.toml', LF will be replaced by CRLF the next time Git touches it
+diff --git a/deploy/patient/config.example.toml b/deploy/patient/config.example.toml
+new file mode 100644
+index 0000000..2601af1
+--- /dev/null
++++ b/deploy/patient/config.example.toml
+@@ -0,0 +1,28 @@
++# Operator-owned example only. All paths resolve relative to this file.
++# No .env is read. Provision migrations 1-4, verified authority and audited
++# runtime grants separately. No accounts/consent/identity are created here.
++tenant_id = "00000000-0000-0000-0000-000000000101"
++database_dsn_file = "secrets/database-dsn.txt"
++transaction_key_file = "secrets/login-aes256.raw"
++frontend_dist = "../../frontend/dist-patient"
++listen_host = "127.0.0.1"
++listen_port = 8443
++tls_cert_file = "secrets/tls-chain.pem"
++tls_key_file = "secrets/tls-private-key.pem"
++
++[oidc]
++issuer = "https://identity.example.org/realms/institution"
++authorization_endpoint = "https://identity.example.org/realms/institution/protocol/openid-connect/auth"
++token_endpoint = "https://identity.example.org/realms/institution/protocol/openid-connect/token"
++# Exact public TLS origin including port, if non-default. This listener does
++# NOT trust Forwarded/X-Forwarded-* or integrate the legacy nginx HTTP upstream.
++callback_uri = "https://patient.example.org:8443/auth/callback"
++client_id = "institution-provisioned-patient-client"
++client_secret_file = "secrets/oidc-client-secret.txt"
++public_key_file = "secrets/oidc-rs256-public-key.pem"
++mfa_acr_values = ["urn:institution:approved-mfa"]
++
++[health_notice]
++version = "institution-approved-version-required"
++text_file = "institution-approved-health-notice.txt"
++validity_seconds = 86400
+

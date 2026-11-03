@@ -85,8 +85,8 @@ class TokenCounter:
                 self._tokenizer = AutoTokenizer.from_pretrained(
                     self.model_name, local_files_only=True
                 )
-            except Exception as error:  # noqa: BLE001 - any loader failure means fallback
-                logger.info("未加载分词器，使用保守 token 估算: %s", error)
+            except Exception:  # noqa: BLE001 - any loader failure means fallback
+                logger.info("未加载分词器，使用保守 token 估算")
                 self._tokenizer = None
 
     def count(self, text: str) -> int:
@@ -97,8 +97,8 @@ class TokenCounter:
         if tokenizer is not None:
             try:
                 return len(tokenizer.encode(text, add_special_tokens=False))
-            except Exception as error:  # noqa: BLE001 - a broken tokenizer is a fallback
-                logger.warning("分词器计数失败，改用保守估算: %s", error)
+            except Exception:  # noqa: BLE001 - a broken tokenizer is a fallback
+                logger.warning("分词器计数失败，改用保守估算")
                 self._tokenizer = None
         return estimate_tokens(text)
 

@@ -17,6 +17,11 @@ from .tokenization import (
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=Path(__file__).resolve().parents[2] / ".env", extra="ignore")
 
+    # Until identity and per-patient ownership are implemented, the legacy API
+    # must be unavailable by default. This switch is not an authentication mode.
+    access_mode: Literal["locked", "unsafe-local-demo"] = Field(
+        default="locked", validation_alias="MEDICAL_RAG_ACCESS_MODE"
+    )
     milvus_uri: str = "http://localhost:19531"
     milvus_token: str = ""
     collection_name: str = "medical_rag_resume_chunks"

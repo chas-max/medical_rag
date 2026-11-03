@@ -1,0 +1,2583 @@
+diff --git a/frontend/src/patient/PatientApp.tsx b/frontend/src/patient/PatientApp.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/patient/PatientApp.tsx
+@@ -0,0 +1,635 @@
++import { useCallback, useEffect, useRef, useState } from "react";
++import { object, PatientError, request } from "./client";
++
++import {
++  identity,
++  consent,
++  row,
++  rows,
++  roles,
++  type View,
++  type Identity,
++  type Consent,
++  type Row,
++} from "./model";
++type Terminal = {
++  kind: "logout" | "withdraw";
++  status: "pending" | "login" | "forbidden" | "unavailable" | "withdrawn";
++};
++function failureStatus(error: unknown) {
++  return error instanceof PatientError && error.status === 401
++    ? "login"
++    : error instanceof PatientError && error.status === 403
++      ? "forbidden"
++      : "unavailable";
++}
++export function PatientApp() {
++  const [status, setStatus] = useState("loading"),
++    [me, setMe] = useState<Identity | null>(null),
++    [view, setView] = useState<View>("identity");
++  const [notice, setNotice] = useState<Consent | null>(null),
++    [accepted, setAccepted] = useState(false),
++    [list, setList] = useState<Row[]>([]),
++    [turns, setTurns] = useState<Row[]>([]);
++  const [selected, setSelected] = useState<string | null>(null),
++    [title, setTitle] = useState(""),
++    [content, setContent] = useState(""),
++    [offset, setOffset] = useState(0),
++    [turnOffset, setTurnOffset] = useState(0),
++    [busy, setBusy] = useState(false);
++  const generation = useRef(0),
++    csrf = useRef<string | null>(null),
++    pending = useRef(false);
++  // Terminal actions belong to a separate lifecycle: hiding/navigating may
++  // invalidate view requests, but must never cancel logout/withdraw outcomes.
++  const terminal = useRef<Terminal | null>(null),
++    focused = useRef(document.hasFocus()),
++    active = useRef(
++      document.visibilityState !== "hidden" && document.hasFocus(),
++    ),
++    mounted = useRef(true);
++  const clear = useCallback(() => {
++    generation.current++;
++    csrf.current = null;
++    pending.current = false;
++    setMe(null);
++    setNotice(null);
++    setAccepted(false);
++    setList([]);
++    setTurns([]);
++    setSelected(null);
++    setTitle("");
++    setContent("");
++    setOffset(0);
++    setTurnOffset(0);
++    setBusy(false);
++  }, []);
++  const failure = useCallback(
++    (error: unknown) => {
++      clear();
++      setStatus(active.current ? failureStatus(error) : "hidden");
++    },
++    [clear],
++  );
++  const perform = useCallback(
++    async (operation: (live: () => boolean) => Promise<void>) => {
++      const current = generation.current;
++      const live = () =>
++        generation.current === current &&
++        active.current &&
++        terminal.current === null;
++      try {
++        await operation(live);
++      } catch (error) {
++        if (live()) failure(error);
++      }
++    },
++    [failure],
++  );
++  const refresh = useCallback(
++    (target: View = "identity", explicit = false) => {
++      if (!active.current) {
++        clear();
++        setStatus("hidden");
++        return;
++      }
++      const barrier = terminal.current;
++      if (barrier) {
++        if (barrier.status === "pending") {
++          setStatus("loading");
++          return;
++        }
++        if (!explicit && barrier.status !== "withdrawn") {
++          setStatus(barrier.status);
++          return;
++        }
++        if (!explicit) target = "consent";
++        terminal.current = null;
++      }
++      clear();
++      setStatus("loading");
++      void perform(async (live) => {
++        const session = await request("/auth/session");
++        if (!live()) return;
++        if (
++          !object(session) ||
++          typeof session.csrf_token !== "string" ||
++          !session.csrf_token
++        )
++          throw new PatientError();
++        const own = identity(await request("/me"));
++        if (!live()) return;
++        csrf.current = session.csrf_token;
++        setMe(own);
++        setView(target);
++        setStatus("ready");
++        if (
++          target !== "identity" &&
++          !(target === "consent"
++            ? own.permissions.health_consent
++            : own.permissions.conversations)
++        ) {
++          clear();
++          setStatus("forbidden");
++          return;
++        }
++        if (target === "consent") {
++          const data = consent(await request("/me/consents/health"));
++          if (live()) setNotice(data);
++        }
++        if (target === "conversations") {
++          const data = rows(
++            await request("/conversations?limit=20&offset=0"),
++            "title",
++          );
++          if (live()) setList(data);
++        }
++      });
++    },
++    [clear, perform],
++  );
++  useEffect(() => {
++    mounted.current = true;
++    focused.current = document.hasFocus();
++    active.current = document.visibilityState !== "hidden" && focused.current;
++    const requested = () =>
++      window.location.hash === "#consent"
++        ? "consent"
++        : window.location.hash === "#conversations"
++          ? "conversations"
++          : "identity";
++    refresh(requested());
++    const hide = () => {
++      active.current = false;
++      clear();
++      setStatus("hidden");
++    };
++    const focus = () => {
++      focused.current = true;
++      if (document.visibilityState !== "hidden") {
++        active.current = true;
++        refresh();
++      }
++    };
++    const visibility = () => {
++      if (document.visibilityState === "hidden") hide();
++      else if (focused.current && document.hasFocus()) focus();
++    };
++    const blur = () => {
++      focused.current = false;
++      hide();
++    };
++    const hash = () => refresh(requested());
++    window.addEventListener("blur", blur);
++    window.addEventListener("focus", focus);
++    window.addEventListener("hashchange", hash);
++    document.addEventListener("visibilitychange", visibility);
++    return () => {
++      mounted.current = false;
++      generation.current++;
++      window.removeEventListener("blur", blur);
++      window.removeEventListener("focus", focus);
++      window.removeEventListener("hashchange", hash);
++      document.removeEventListener("visibilitychange", visibility);
++    };
++  }, [clear, refresh]);
++  const navigate = (next: View) => {
++    if (terminal.current || pending.current || !active.current) return;
++    if (
++      !me ||
++      (next === "consent" && !me.permissions.health_consent) ||
++      (next === "conversations" && !me.permissions.conversations)
++    ) {
++      failure(new PatientError(403));
++      return;
++    }
++    generation.current++;
++    setView(next);
++    setList([]);
++    setTurns([]);
++    setSelected(null);
++    setTitle("");
++    setContent("");
++    setNotice(null);
++    setAccepted(false);
++    setOffset(0);
++    setTurnOffset(0);
++    pending.current = false;
++    setBusy(false);
++    void perform(async (live) => {
++      if (next === "consent") {
++        const data = consent(await request("/me/consents/health"));
++        if (live()) setNotice(data);
++      }
++      if (next === "conversations") {
++        const data = rows(
++          await request("/conversations?limit=20&offset=0"),
++          "title",
++        );
++        if (live()) setList(data);
++      }
++    });
++  };
++  const mutate = (
++    operation: (token: string, live: () => boolean) => Promise<void>,
++  ) => {
++    if (pending.current || !csrf.current || terminal.current || !active.current)
++      return;
++    // Invalidates initial/pagination reads before a mutation and its canonical
++    // server reload; older reads cannot overwrite the newly saved page.
++    generation.current++;
++    pending.current = true;
++    setBusy(true);
++    const token = csrf.current;
++    void perform(async (live) => {
++      try {
++        await operation(token, live);
++      } finally {
++        if (live()) {
++          pending.current = false;
++          setBusy(false);
++        }
++      }
++    });
++  };
++  const terminate = (kind: "logout" | "withdraw") => {
++    if (terminal.current || !csrf.current || !active.current) return;
++    const token = csrf.current;
++    const barrier: Terminal = { kind, status: "pending" };
++    terminal.current = barrier;
++    clear();
++    setStatus("loading");
++    void (async () => {
++      try {
++        await request(
++          kind === "logout" ? "/auth/logout" : "/me/consents/health",
++          kind === "logout" ? "POST" : "DELETE",
++          undefined,
++          token,
++        );
++        barrier.status = kind === "logout" ? "login" : "withdrawn";
++      } catch (error) {
++        barrier.status = failureStatus(error);
++      }
++      if (!mounted.current || terminal.current !== barrier) return;
++      clear();
++      if (!active.current) setStatus("hidden");
++      else if (barrier.status === "withdrawn") refresh("consent");
++      else setStatus(barrier.status);
++    })();
++  };
++  const logout = () => terminate("logout");
++  const withdraw = () => terminate("withdraw");
++  const page = (amount: number, isTurn = false) => {
++    if (pending.current || terminal.current || !active.current) return;
++    generation.current++;
++    const next = Math.min(
++      10000,
++      Math.max(0, (isTurn ? turnOffset : offset) + amount),
++    );
++    void perform(async (live) => {
++      const data = rows(
++        await request(
++          isTurn
++            ? `/conversations/${selected}/turns?limit=20&offset=${next}`
++            : `/conversations?limit=20&offset=${next}`,
++        ),
++        isTurn ? "content" : "title",
++      );
++      if (live()) {
++        if (isTurn) {
++          setTurns(data);
++          setTurnOffset(next);
++        } else {
++          setList(data);
++          setOffset(next);
++        }
++      }
++    });
++  };
++  return (
++    <div className="patient-shell">
++      <header>
++        <div className="patient-mark">机构服务 · 患者门户</div>
++        <h1>身份与会话记录</h1>
++        <p>虚构数据开发环境 · 不提供诊断或模型生成</p>
++      </header>
++      <main>
++        <p className="patient-note">
++          离开或隐藏页面会清空本页敏感内容；返回时重新验证身份与权限。闲置期间不提供即时推送撤权。
++        </p>
++        {status === "loading" && <p role="status">正在安全验证…</p>}
++        {status === "hidden" && (
++          <p role="status">页面已锁定，返回后重新验证。</p>
++        )}
++        {status === "login" && (
++          <section>
++            <h2>机构身份验证</h2>
++            <form action="/auth/login" method="post">
++              <button type="submit">机构登录</button>
++            </form>
++          </section>
++        )}
++        {status === "unavailable" && (
++          <section>
++            <p role="alert">服务暂不可用，请重试。</p>
++            <button onClick={() => refresh("identity", true)}>重试</button>
++          </section>
++        )}
++        {status === "forbidden" && (
++          <section>
++            <p role="alert">403 · 当前权限不允许访问此内容。</p>
++            <button onClick={() => refresh("identity", true)}>
++              重新验证身份
++            </button>
++          </section>
++        )}
++        {status === "ready" && me && (
++          <>
++            <nav aria-label="服务导航">
++              <button disabled={busy} onClick={() => navigate("identity")}>
++                我的身份
++              </button>
++              {me.permissions.health_consent && (
++                <button disabled={busy} onClick={() => navigate("consent")}>
++                  健康信息授权
++                </button>
++              )}
++              {me.permissions.conversations && (
++                <button
++                  disabled={busy}
++                  onClick={() => navigate("conversations")}
++                >
++                  会话记录
++                </button>
++              )}
++              <button className="patient-secondary" onClick={logout}>
++                退出登录
++              </button>
++            </nav>
++            {view === "identity" && (
++              <section>
++                <h2>我的身份</h2>
++                <dl>
++                  <dt>本系统账户</dt>
++                  <dd>{me.user_id}</dd>
++                  <dt>所属机构</dt>
++                  <dd>{me.tenant_id}</dd>
++                  <dt>系统角色</dt>
++                  <dd>
++                    {me.roles
++                      .map((role) => roles[role] ?? "未开放角色")
++                      .join("、")}
++                  </dd>
++                </dl>
++                <p>系统角色声明不等于医院身份核验。</p>
++                {me.roles.some((role) =>
++                  [
++                    "org_admin",
++                    "support",
++                    "platform_operator",
++                    "knowledge_admin",
++                    "integration_admin",
++                    "auditor",
++                  ].includes(role),
++                ) && (
++                  <p>
++                    管理身份不授予患者内容访问权；管理与支持业务模块尚未开放。
++                  </p>
++                )}
++                {(!me.binding.verified || !me.permissions.health_consent) && (
++                  <p>
++                    需机构完成身份与绑定核验，并确认年龄及监护规则；未核验、未成年人、监护人及年龄未知路径不开放患者内容。
++                  </p>
++                )}
++              </section>
++            )}
++            {view === "consent" && (
++              <section>
++                <h2>健康信息使用授权</h2>
++                <p>
++                  不包含医院病历接入或外部模型处理。撤回仅停止未来目的使用，不删除历史记录。
++                </p>
++                {!notice ? (
++                  <p role="status">正在读取机构告知…</p>
++                ) : (
++                  <>
++                    <h3>机构告知 · {notice.notice.version}</h3>
++                    <p className="patient-prose">{notice.notice.text}</p>
++                    <p role="status">
++                      {notice.granted ? "当前已授权" : "当前未授权"}
++                      {notice.expires_at
++                        ? ` · 有效至 ${notice.expires_at}`
++                        : ""}
++                    </p>
++                    {notice.granted ? (
++                      <button disabled={busy} onClick={withdraw}>
++                        撤回授权
++                      </button>
++                    ) : (
++                      <>
++                        <label className="patient-check">
++                          <input
++                            type="checkbox"
++                            checked={accepted}
++                            onChange={(event) =>
++                              setAccepted(event.target.checked)
++                            }
++                          />
++                          我已完整阅读上述机构告知并明确同意本目的使用
++                        </label>
++                        <button
++                          disabled={!accepted || busy}
++                          onClick={() =>
++                            mutate(async (token, live) => {
++                              const updated = consent(
++                                await request(
++                                  "/me/consents/health",
++                                  "POST",
++                                  {
++                                    version: notice.notice.version,
++                                    accepted: true,
++                                  },
++                                  token,
++                                ),
++                              );
++                              if (!live()) return;
++                              const own = identity(await request("/me"));
++                              if (live()) {
++                                setNotice(updated);
++                                setAccepted(false);
++                                setMe(own);
++                              }
++                            })
++                          }
++                        >
++                          明确同意
++                        </button>
++                      </>
++                    )}
++                  </>
++                )}
++              </section>
++            )}
++            {view === "conversations" && (
++              <section>
++                <h2>会话记录</h2>
++                <p>仅保存您输入的文字记录，不生成医疗建议或助手回复。</p>
++                <form
++                  onSubmit={(event) => {
++                    event.preventDefault();
++                    mutate(async (token, live) => {
++                      row(
++                        await request(
++                          "/conversations",
++                          "POST",
++                          { title },
++                          token,
++                        ),
++                        "title",
++                      );
++                      if (!live()) return;
++                      const page = rows(
++                        await request("/conversations?limit=20&offset=0"),
++                        "title",
++                      );
++                      if (live()) {
++                        setTitle("");
++                        setList(page);
++                        setOffset(0);
++                      }
++                    });
++                  }}
++                >
++                  <label>
++                    会话标题
++                    <input
++                      maxLength={200}
++                      value={title}
++                      onChange={(event) => setTitle(event.target.value)}
++                    />
++                  </label>
++                  <button disabled={busy || !title.trim()}>创建会话</button>
++                </form>
++                <ul>
++                  {list.map((item) => (
++                    <li key={item.id}>
++                      <button
++                        disabled={busy}
++                        onClick={() => {
++                          generation.current++;
++                          setSelected(item.id);
++                          setTurns([]);
++                          setContent("");
++                          setTurnOffset(0);
++                          void perform(async (live) => {
++                            const data = rows(
++                              await request(
++                                `/conversations/${item.id}/turns?limit=20&offset=0`,
++                              ),
++                              "content",
++                            );
++                            if (live()) setTurns(data);
++                          });
++                        }}
++                      >
++                        {item.title}
++                      </button>
++                    </li>
++                  ))}
++                </ul>
++                <div className="patient-paging">
++                  <button
++                    disabled={busy || offset === 0}
++                    onClick={() => page(-20)}
++                  >
++                    上一页会话
++                  </button>
++                  <span>第 {offset / 20 + 1} 页</span>
++                  <button
++                    disabled={busy || list.length === 0 || offset >= 10000}
++                    onClick={() => page(20)}
++                  >
++                    下一页会话
++                  </button>
++                </div>
++                {selected && (
++                  <section>
++                    <h3>文字记录</h3>
++                    <ol>
++                      {turns.map((item) => (
++                        <li className="patient-prose" key={item.id}>
++                          {item.content}
++                        </li>
++                      ))}
++                    </ol>
++                    <div className="patient-paging">
++                      <button
++                        disabled={busy || turnOffset === 0}
++                        onClick={() => page(-20, true)}
++                      >
++                        上一页记录
++                      </button>
++                      <button
++                        disabled={
++                          busy || turns.length === 0 || turnOffset >= 10000
++                        }
++                        onClick={() => page(20, true)}
++                      >
++                        下一页记录
++                      </button>
++                    </div>
++                    <form
++                      onSubmit={(event) => {
++                        event.preventDefault();
++                        mutate(async (token, live) => {
++                          row(
++                            await request(
++                              `/conversations/${selected}/turns`,
++                              "POST",
++                              { content },
++                              token,
++                            ),
++                            "content",
++                          );
++                          if (!live()) return;
++                          const page = rows(
++                            await request(
++                              `/conversations/${selected}/turns?limit=20&offset=0`,
++                            ),
++                            "content",
++                          );
++                          if (live()) {
++                            setContent("");
++                            setTurns(page);
++                            setTurnOffset(0);
++                          }
++                        });
++                      }}
++                    >
++                      <label>
++                        记录内容
++                        <textarea
++                          maxLength={16000}
++                          value={content}
++                          onChange={(event) => setContent(event.target.value)}
++                        />
++                      </label>
++                      <button disabled={busy || !content.trim()}>
++                        保存记录
++                      </button>
++                    </form>
++                  </section>
++                )}
++              </section>
++            )}
++          </>
++        )}
++      </main>
++      <footer>
++        机构规则与真实身份核验仍须由可信机构流程完成。本环境不代表生产、临床或法律验收。
++      </footer>
++    </div>
++  );
++}
++
+diff --git a/frontend/src/test/patient-app.test.tsx b/frontend/src/test/patient-app.test.tsx
+new file mode 100644
+--- /dev/null
++++ b/frontend/src/test/patient-app.test.tsx
+@@ -0,0 +1,738 @@
++import {
++  act,
++  cleanup,
++  fireEvent,
++  render,
++  screen,
++  waitFor,
++} from "@testing-library/react";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { PatientApp } from "../patient/PatientApp";
++
++const identity = {
++  user_id: "account-own",
++  tenant_id: "institution-own",
++  roles: ["patient"],
++  binding: { verified: true },
++  permissions: { identity: true, health_consent: true, conversations: true },
++};
++const notice = {
++  notice: {
++    version: "institution-v7",
++    text: "机构完整告知 <script>private</script>",
++    validity_seconds: 3600,
++  },
++  granted: false,
++  expires_at: null,
++};
++const item = {
++  id: "00000000-0000-0000-0000-000000000001",
++  title: "私密标题",
++  created_at: "2026-01-01",
++};
++let handler: (url: string, init: RequestInit) => unknown;
++let calls: string[];
++const ok = (data: unknown) =>
++  new Response(JSON.stringify({ success: true, data, error: null }), {
++    headers: { "Content-Type": "application/json" },
++  });
++beforeEach(() => {
++  vi.spyOn(document, "hasFocus").mockReturnValue(true);
++  Object.defineProperty(document, "visibilityState", {
++    configurable: true,
++    value: "visible",
++  });
++  calls = [];
++  window.history.replaceState(null, "", window.location.pathname);
++  handler = (url) =>
++    url === "/auth/session"
++      ? { ...identity, csrf_token: "csrf-memory" }
++      : url === "/me"
++        ? identity
++        : url.includes("consents")
++          ? notice
++          : url.includes("turns")
++            ? {
++                items: [
++                  {
++                    id: item.id,
++                    content: "私密记录",
++                    created_at: item.created_at,
++                  },
++                ],
++                limit: 20,
++                offset: 0,
++              }
++            : { items: [item], limit: 20, offset: 0 };
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async (url: string, init: RequestInit) => {
++      calls.push(url);
++      const result = await handler(url, init);
++      return result instanceof Response ? result : ok(result);
++    }),
++  );
++});
++afterEach(() => {
++  cleanup();
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++const open = async (name: string) => {
++  await screen.findByRole("button", { name });
++  fireEvent.click(screen.getByRole("button", { name }));
++};
++it("shows only a same-origin institutional POST login after 401", async () => {
++  handler = () => new Response("secret", { status: 401 });
++  render(<PatientApp />);
++  const login = await screen.findByRole("button", { name: "机构登录" });
++  expect(login.closest("form")).toHaveAttribute("action", "/auth/login");
++  expect(login.closest("form")).toHaveAttribute("method", "post");
++  expect(calls).toEqual(["/auth/session"]);
++});
++it("loads identity, translates roles, keeps staff and unverified paths closed", async () => {
++  handler = (url) =>
++    url === "/auth/session"
++      ? { ...identity, csrf_token: "csrf" }
++      : {
++          ...identity,
++          roles: [
++            "org_admin",
++            "support",
++            "platform_operator",
++            "guardian",
++            "unknown",
++          ],
++          binding: { verified: false },
++          permissions: {
++            identity: true,
++            health_consent: false,
++            conversations: false,
++          },
++        };
++  render(<PatientApp />);
++  expect(await screen.findByText("account-own")).toBeInTheDocument();
++  expect(screen.getByText(/管理身份不授予/)).toBeInTheDocument();
++  expect(
++    screen.queryByRole("button", { name: "会话记录" }),
++  ).not.toBeInTheDocument();
++  expect(calls).toEqual(["/auth/session", "/me"]);
++});
++it("explicit forbidden hash shows 403 without fetching sensitive content", async () => {
++  window.history.replaceState(null, "", "#conversations");
++  handler = (url) =>
++    url === "/auth/session"
++      ? { ...identity, csrf_token: "csrf" }
++      : {
++          ...identity,
++          permissions: {
++            identity: true,
++            health_consent: false,
++            conversations: false,
++          },
++        };
++  render(<PatientApp />);
++  expect(await screen.findByText(/403/)).toBeInTheDocument();
++  expect(calls).toEqual(["/auth/session", "/me"]);
++});
++it("requires unchecked acknowledgment and submits exact version+CSRF, then refreshes authority", async () => {
++  render(<PatientApp />);
++  await open("健康信息授权");
++  expect(await screen.findByText(notice.notice.text)).toBeInTheDocument();
++  expect(screen.getByRole("button", { name: "明确同意" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("checkbox"));
++  fireEvent.click(screen.getByRole("button", { name: "明确同意" }));
++  await waitFor(() => expect(calls.filter((x) => x === "/me")).toHaveLength(2));
++  expect(fetch).toHaveBeenCalledWith(
++    "/me/consents/health",
++    expect.objectContaining({
++      method: "POST",
++      body: JSON.stringify({ version: "institution-v7", accepted: true }),
++      headers: {
++        "Content-Type": "application/json",
++        "X-CSRF-Token": "csrf-memory",
++      },
++    }),
++  );
++  expect(document.querySelector("script")).toBeNull();
++});
++it("lists/selects/paginates, creates and appends only plain records; duplicates disabled", async () => {
++  const original = handler;
++  let appended = false;
++  handler = (url, init) =>
++    init.method === "POST"
++      ? url.includes("turns")
++        ? ((appended = true),
++          {
++            id: "00000000-0000-0000-0000-000000000002",
++            content: "新记录",
++            created_at: item.created_at,
++          })
++        : { ...item, id: "00000000-0000-0000-0000-000000000003" }
++      : url.includes("turns") && appended
++        ? {
++            items: [
++              { id: item.id, content: "新记录", created_at: item.created_at },
++            ],
++            limit: 20,
++            offset: 0,
++          }
++        : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  expect(await screen.findByText("私密记录")).toBeInTheDocument();
++  fireEvent.change(screen.getByLabelText("记录内容"), {
++    target: { value: "新记录" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
++  await screen.findByText("新记录");
++  fireEvent.change(screen.getByLabelText("会话标题"), {
++    target: { value: "新标题" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "创建会话" }));
++  await waitFor(() =>
++    expect(fetch).toHaveBeenCalledWith(
++      "/conversations",
++      expect.objectContaining({ body: JSON.stringify({ title: "新标题" }) }),
++    ),
++  );
++  fireEvent.click(screen.getByRole("button", { name: "下一页会话" }));
++  await waitFor(() =>
++    expect(calls).toContain("/conversations?limit=20&offset=20"),
++  );
++  fireEvent.click(screen.getByRole("button", { name: "上一页会话" }));
++  expect(window.location.href).not.toContain(item.id);
++});
++it("logout clears sensitive state synchronously and rejects delayed old replies", async () => {
++  let resolve!: (value: unknown) => void;
++  const original = handler;
++  handler = (url, init) =>
++    url.includes("turns")
++      ? new Promise((r) => {
++          resolve = r;
++        })
++      : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  await open("退出登录");
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  await act(async () =>
++    resolve({
++      items: [
++        { id: item.id, content: "迟到敏感记录", created_at: item.created_at },
++      ],
++      limit: 20,
++      offset: 0,
++    }),
++  );
++  expect(screen.queryByText("迟到敏感记录")).not.toBeInTheDocument();
++  await screen.findByRole("button", { name: "机构登录" });
++});
++it.each([401, 403, 503])(
++  "clears on content authority failure %s with static errors",
++  async (status) => {
++    const original = handler;
++    handler = (url, init) =>
++      url.includes("turns")
++        ? new Response("backend-secret", { status })
++        : original(url, init);
++    render(<PatientApp />);
++    await open("会话记录");
++    await open("私密标题");
++    await waitFor(() =>
++      expect(screen.queryByText("私密标题")).not.toBeInTheDocument(),
++    );
++    expect(document.body.textContent).not.toContain("backend-secret");
++  },
++);
++it("withdraw clears before awaiting failed network and does not restore content", async () => {
++  let resolve!: (value: unknown) => void;
++  const original = handler;
++  handler = (url, init) =>
++    init.method === "DELETE"
++      ? new Promise((r) => {
++          resolve = r;
++        })
++      : url.includes("consents")
++        ? { ...notice, granted: true }
++        : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  await screen.findByText("私密记录");
++  await open("健康信息授权");
++  await open("撤回授权");
++  expect(screen.queryByText("私密记录")).not.toBeInTheDocument();
++  await act(async () => resolve(new Response("secret", { status: 503 })));
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++});
++it("blur clears drafts/content; focus reauthenticates before content", async () => {
++  render(<PatientApp />);
++  await open("会话记录");
++  await screen.findByText("私密标题");
++  fireEvent.change(screen.getByLabelText("会话标题"), {
++    target: { value: "私密草稿" },
++  });
++  fireEvent.blur(window);
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  fireEvent.focus(window);
++  await waitFor(() =>
++    expect(calls.filter((x) => x === "/auth/session")).toHaveLength(2),
++  );
++  await screen.findByText("account-own");
++  expect(screen.queryByDisplayValue("私密草稿")).not.toBeInTheDocument();
++});
++it("network unavailable offers safe retry and never persists patient data", async () => {
++  const storage = vi.spyOn(Storage.prototype, "setItem");
++  handler = () => Promise.reject(Error("secret"));
++  render(<PatientApp />);
++  await screen.findByText("服务暂不可用，请重试。");
++  expect(storage).not.toHaveBeenCalled();
++  expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
++});
++it("locks selection during mutation and reloads real server pages after create/append", async () => {
++  let release!: (data: unknown) => void;
++  const original = handler;
++  let created = false,
++    appended = false;
++  handler = (url, init) => {
++    if (init.method === "POST")
++      return new Promise((resolve) => {
++        release = resolve;
++      });
++    if (url.startsWith("/conversations?") && created)
++      return {
++        items: [{ ...item, title: "服务器第一页" }],
++        limit: 20,
++        offset: 0,
++      };
++    if (url.includes("turns") && appended)
++      return {
++        items: [
++          { id: item.id, content: "服务器记录页", created_at: item.created_at },
++        ],
++        limit: 20,
++        offset: 0,
++      };
++    return original(url, init);
++  };
++  render(<PatientApp />);
++  await open("会话记录");
++  await open("私密标题");
++  await screen.findByText("私密记录");
++  fireEvent.click(screen.getByRole("button", { name: "下一页记录" }));
++  await waitFor(() =>
++    expect(calls).toContain(
++      `/conversations/${item.id}/turns?limit=20&offset=20`,
++    ),
++  );
++  fireEvent.change(screen.getByLabelText("记录内容"), {
++    target: { value: "new" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
++  expect(screen.getByRole("button", { name: "私密标题" })).toBeDisabled();
++  expect(screen.getByRole("button", { name: "会话记录" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
++  expect(calls.filter((x) => x.endsWith("/turns"))).toHaveLength(1);
++  appended = true;
++  await act(async () =>
++    release({ id: item.id, content: "new", created_at: item.created_at }),
++  );
++  await screen.findByText("服务器记录页");
++  expect(screen.getByRole("button", { name: "上一页记录" })).toBeDisabled();
++  fireEvent.click(screen.getByRole("button", { name: "下一页会话" }));
++  await waitFor(() =>
++    expect(calls).toContain("/conversations?limit=20&offset=20"),
++  );
++  fireEvent.change(screen.getByLabelText("会话标题"), {
++    target: { value: "new" },
++  });
++  fireEvent.click(screen.getByRole("button", { name: "创建会话" }));
++  created = true;
++  await act(async () => release({ ...item, title: "new" }));
++  await screen.findByRole("button", { name: "服务器第一页" });
++  expect(screen.getByRole("button", { name: "上一页会话" })).toBeDisabled();
++  expect(screen.queryByText("new")).not.toBeInTheDocument();
++});
++it.each(["session", "identity", "notice", "page", "row"])(
++  "rejects malformed %s data without echo",
++  async (kind) => {
++    const original = handler;
++    handler = (url, init) =>
++      kind === "session" && url === "/auth/session"
++        ? {}
++        : kind === "identity" && url === "/me"
++          ? {}
++          : kind === "notice" && url.includes("consents")
++            ? {}
++            : kind === "page" && url.startsWith("/conversations?")
++              ? {}
++              : kind === "row" && url.startsWith("/conversations?")
++                ? {
++                    items: [
++                      { id: "secret", title: "secret", created_at: "secret" },
++                    ],
++                    limit: 20,
++                    offset: 0,
++                  }
++                : original(url, init);
++    render(<PatientApp />);
++    if (kind === "notice") await open("健康信息授权");
++    if (kind === "page" || kind === "row") await open("会话记录");
++    await screen.findByText("服务暂不可用，请重试。");
++    expect(document.body.textContent).not.toContain("secret");
++  },
++);
++it("successful withdrawal reauthenticates and no longer offers conversations", async () => {
++  const original = handler;
++  let withdrawn = false;
++  handler = (url, init) => {
++    if (init.method === "DELETE") {
++      withdrawn = true;
++      return notice;
++    }
++    if (url === "/me" && withdrawn)
++      return {
++        ...identity,
++        permissions: {
++          identity: true,
++          health_consent: true,
++          conversations: false,
++        },
++      };
++    if (url.includes("consents")) return { ...notice, granted: !withdrawn };
++    return original(url, init);
++  };
++  render(<PatientApp />);
++  await open("健康信息授权");
++  await open("撤回授权");
++  await screen.findByText("当前未授权");
++  expect(
++    screen.queryByRole("button", { name: "会话记录" }),
++  ).not.toBeInTheDocument();
++  await open("我的身份");
++  expect(await screen.findByText("account-own")).toBeInTheDocument();
++});
++it("visibility hiding rejects late old page responses and rechecks on return", async () => {
++  const original = handler;
++  let release!: (data: unknown) => void;
++  handler = (url, init) =>
++    url.startsWith("/conversations?")
++      ? new Promise((r) => (release = r))
++      : original(url, init);
++  render(<PatientApp />);
++  await open("会话记录");
++  Object.defineProperty(document, "visibilityState", {
++    configurable: true,
++    value: "hidden",
++  });
++  fireEvent(document, new Event("visibilitychange"));
++  await act(async () => release({ items: [item], limit: 20, offset: 0 }));
++  expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  Object.defineProperty(document, "visibilityState", {
++    configurable: true,
++    value: "visible",
++  });
++  fireEvent(document, new Event("visibilitychange"));
++  await screen.findByText("account-own");
++});
++it("safe retry rechecks after unavailable response", async () => {
++  const original = handler;
++  handler = () => new Response("secret", { status: 503 });
++  render(<PatientApp />);
++  await screen.findByText("服务暂不可用，请重试。");
++  handler = original;
++  await open("重试");
++  await screen.findByText("account-own");
++});
++
++it.each(["logout", "withdraw"] as const)(
++  "%s survives focus/hash/visibility without private revalidation",
++  async (kind) => {
++    const original = handler;
++    let release!: (value: unknown) => void;
++    let withdrawn = false;
++    handler = (url, init) => {
++      if (
++        (kind === "logout" && url === "/auth/logout") ||
++        (kind === "withdraw" && init.method === "DELETE")
++      )
++        return new Promise((r) => (release = r));
++      if (url === "/me" && withdrawn)
++        return {
++          ...identity,
++          permissions: {
++            identity: true,
++            health_consent: true,
++            conversations: false,
++          },
++        };
++      if (url.includes("consents")) return { ...notice, granted: !withdrawn };
++      return original(url, init);
++    };
++    render(<PatientApp />);
++    await open("会话记录");
++    await screen.findByText("私密标题");
++    if (kind === "withdraw") {
++      await open("健康信息授权");
++      await open("撤回授权");
++    } else await open("退出登录");
++    const requests = calls.length;
++    fireEvent.blur(window);
++    fireEvent.focus(window);
++    window.history.replaceState(null, "", "#conversations");
++    fireEvent(window, new Event("hashchange"));
++    Object.defineProperty(document, "visibilityState", {
++      configurable: true,
++      value: "hidden",
++    });
++    fireEvent(document, new Event("visibilitychange"));
++    Object.defineProperty(document, "visibilityState", {
++      configurable: true,
++      value: "visible",
++    });
++    fireEvent(document, new Event("visibilitychange"));
++    await act(async () => {});
++    expect(calls).toHaveLength(requests);
++    expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++    withdrawn = true;
++    await act(async () => release(kind === "logout" ? null : notice));
++    if (kind === "logout")
++      await screen.findByRole("button", { name: "机构登录" });
++    else await screen.findByText("当前未授权");
++    expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++  },
++);
++
++it.each(
++  (["logout", "withdraw"] as const).flatMap((kind) =>
++    ([401, 403, 503, "network", "malformed"] as const).flatMap((outcome) =>
++      [false, true].map((inactive) => ({ kind, outcome, inactive })),
++    ),
++  ),
++)(
++  "failed $kind ($outcome, inactive=$inactive) stays locked until explicit retry",
++  async ({ kind, outcome, inactive }) => {
++    const original = handler;
++    let release!: (value: unknown) => void;
++    handler = (url, init) =>
++      (kind === "logout" && url === "/auth/logout") ||
++      (kind === "withdraw" && init.method === "DELETE")
++        ? new Promise((r) => (release = r))
++        : url.includes("consents")
++          ? { ...notice, granted: true }
++          : original(url, init);
++    render(<PatientApp />);
++    if (kind === "withdraw") {
++      await open("健康信息授权");
++      await open("撤回授权");
++    } else await open("退出登录");
++    const beforeReturn = calls.length;
++    fireEvent.blur(window);
++    if (inactive) {
++      Object.defineProperty(document, "visibilityState", {
++        configurable: true,
++        value: "hidden",
++      });
++      fireEvent(document, new Event("visibilitychange"));
++    } else fireEvent.focus(window);
++    await act(async () =>
++      release(
++        outcome === "network"
++          ? Promise.reject(Error("terminal-secret"))
++          : outcome === "malformed"
++            ? new Response("terminal-secret", {
++                headers: { "Content-Type": "application/json" },
++              })
++            : new Response("terminal-secret", { status: outcome }),
++      ),
++    );
++    if (inactive) {
++      expect(screen.getByText(/页面已锁定/)).toBeInTheDocument();
++      expect(calls).toHaveLength(beforeReturn);
++      window.history.replaceState(null, "", "#conversations");
++      fireEvent(window, new Event("hashchange"));
++      Object.defineProperty(document, "visibilityState", {
++        configurable: true,
++        value: "visible",
++      });
++      fireEvent(document, new Event("visibilitychange"));
++      expect(calls).toHaveLength(beforeReturn);
++      fireEvent.focus(window);
++    }
++    if (outcome === 401)
++      await screen.findByRole("button", { name: "机构登录" });
++    else if (outcome === 403) await screen.findByText(/403/);
++    else await screen.findByText("服务暂不可用，请重试。");
++    const requests = calls.length;
++    fireEvent.blur(window);
++    fireEvent.focus(window);
++    window.history.replaceState(null, "", "#conversations");
++    fireEvent(window, new Event("hashchange"));
++    await act(async () => {});
++    expect(calls).toHaveLength(requests);
++    expect(screen.queryByText("account-own")).not.toBeInTheDocument();
++    expect(screen.queryByText("私密标题")).not.toBeInTheDocument();
++    expect(document.body.textContent).not.toContain("terminal-secret");
++    if (outcome !== 401) {
++      await open(outcome === 403 ? "重新验证身份" : "重试");
++      await screen.findByText("account-own");
++    }
++  },
++);
++
++it.each(["logout", "withdraw"] as const)(
++  "inactive completion of %s stays cleared until return",
++  async (kind) => {
++    const original = handler;
++    let release!: (value: unknown) => void;
++    let withdrawn = false;
++    handler = (url, init) => {
++      if (
++        (kind === "logout" && url === "/auth/logout") ||
++        (kind === "withdraw" && init.method === "DELETE")
++      )
++        return new Promise((r) => (release = r));
++      if (url === "/me" && withdrawn)
++        return {
++          ...identity,
++          permissions: {
++            identity: true,
++            health_consent: true,
++            conversations: false,
++          },
++        };
++      return url.includes("consents")
++        ? { ...notice, granted: !withdrawn }
++        : original(url, init);
++    };
++    render(<PatientApp />);
++    if (kind === "withdraw") {
++      await open("健康信息授权");
++      await open("撤回授权");
++    } else await open("退出登录");
++    fireEvent.blur(window);
++    Object.defineProperty(document, "visibilityState", {
++      configurable: true,
++      value: "hidden",
++    });
++    fireEvent(document, new Event("visibilitychange"));
++    const requests = calls.length;
++    withdrawn = true;
++    await act(async () => release(kind === "logout" ? null : notice));
++    expect(calls).toHaveLength(requests);
++    expect(screen.queryByText("account-own")).not.toBeInTheDocument();
++    expect(screen.getByText(/页面已锁定/)).toBeInTheDocument();
++    Object.defineProperty(document, "visibilityState", {
++      configurable: true,
++      value: "visible",
++    });
++    fireEvent(document, new Event("visibilitychange"));
++    expect(calls).toHaveLength(requests);
++    fireEvent.focus(window);
++    if (kind === "logout")
++      await screen.findByRole("button", { name: "机构登录" });
++    else await screen.findByText("当前未授权");
++  },
++);
++
++it.each(["initial-turns", "page-turns", "initial-list", "page-list"])(
++  "old %s cannot overwrite post-mutation page",
++  async (kind) => {
++    const original = handler;
++    let release!: (value: unknown) => void;
++    let saved = false,
++      initialHeld = false;
++    const turn = kind.includes("turns");
++    handler = (url, init) => {
++      if (init.method === "POST") {
++        saved = true;
++        return turn
++          ? { id: item.id, content: "新保存记录", created_at: item.created_at }
++          : { ...item, title: "新保存标题" };
++      }
++      const relevant = turn
++        ? url.includes("turns?")
++        : url.startsWith("/conversations?");
++      if (relevant && saved)
++        return {
++          items: [
++            turn
++              ? {
++                  id: item.id,
++                  content: "新保存记录",
++                  created_at: item.created_at,
++                }
++              : { ...item, title: "新保存标题" },
++          ],
++          limit: 20,
++          offset: 0,
++        };
++      if (
++        relevant &&
++        ((kind.startsWith("initial") && !initialHeld) ||
++          url.endsWith("offset=20"))
++      ) {
++        initialHeld = true;
++        return new Promise((r) => (release = r));
++      }
++      return original(url, init);
++    };
++    render(<PatientApp />);
++    await open("会话记录");
++    if (turn) await open("私密标题");
++    if (kind === "page-turns") {
++      await screen.findByText("私密记录");
++      await open("下一页记录");
++    }
++    if (kind === "page-list") {
++      await screen.findByText("私密标题");
++      await open("下一页会话");
++    }
++    fireEvent.change(screen.getByLabelText(turn ? "记录内容" : "会话标题"), {
++      target: { value: "new" },
++    });
++    await open(turn ? "保存记录" : "创建会话");
++    await screen.findByText(turn ? "新保存记录" : "新保存标题");
++    await act(async () =>
++      release({
++        items: [
++          turn
++            ? { id: item.id, content: "旧响应", created_at: item.created_at }
++            : { ...item, title: "旧响应" },
++        ],
++        limit: 20,
++        offset: kind.startsWith("page") ? 20 : 0,
++      }),
++    );
++    expect(
++      screen.getByText(turn ? "新保存记录" : "新保存标题"),
++    ).toBeInTheDocument();
++    expect(screen.queryByText("旧响应")).not.toBeInTheDocument();
++  },
++);
++
++it("visibility alone cannot unlock an unfocused window", async () => {
++  render(<PatientApp />);
++  await screen.findByText("account-own");
++  fireEvent.blur(window);
++  const count = calls.length;
++  fireEvent(document, new Event("visibilitychange"));
++  await act(async () => {});
++  expect(calls).toHaveLength(count);
++  expect(screen.queryByText("account-own")).not.toBeInTheDocument();
++  fireEvent.focus(window);
++  await screen.findByText("account-own");
++});
++it("initially unfocused window waits for actual focus", async () => {
++  vi.mocked(document.hasFocus).mockReturnValue(false);
++  render(<PatientApp />);
++  await act(async () => {});
++  expect(calls).toEqual([]);
++  expect(screen.getByText(/页面已锁定/)).toBeInTheDocument();
++  fireEvent.focus(window);
++  await screen.findByText("account-own");
++});
++
+diff --git a/src/medical_rag/oidc_login.py b/src/medical_rag/oidc_login.py
+new file mode 100644
+--- /dev/null
++++ b/src/medical_rag/oidc_login.py
+@@ -0,0 +1,468 @@
++"""Experimental, isolated OIDC login application; never mounted on the legacy API.
++
++This provides authorization-code + S256 PKCE, browser-bound one-use PostgreSQL
++login transactions, ID-token verification, and opaque sessions. It is not a
++production deployment or patient authorization system. An institution must
++independently configure a real provider, approved MFA mapping, keys/rotation,
++TLS and trusted proxy handling, request limits, database privileges, audit and
++back-channel logout. Provider tokens are discarded; local account/role/patient
++provisioning remains a separate trusted process. Existing endpoints/workers
++stay locked. The returned session identity is a per-operation snapshot, not
++permission to process patient content or a way to interrupt in-flight work.
++Pending login state is institution-version-bound, but cannot bind an unknown
++account's version before the provider reveals its subject. Account disable/
++re-enable during a pending login and provider-side account revocation require
++an additional institution-approved login/event policy; they are not solved by
++local session invalidation or by this headless application.
++
++The AES-GCM key must come from institutional secret management, not the DB or
++clients. Expired login rows require a bounded operational cleanup policy. Do
++not enable request/response body or callback query logging at any proxy/server;
++in particular Uvicorn must run with access_log=False/--no-access-log. This app
++does not configure or override external server/proxy loggers.
++"""
++
++import asyncio
++import ipaddress
++import json
++import re
++from collections.abc import Callable
++from contextlib import AbstractContextManager, contextmanager
++from dataclasses import dataclass, field
++from hashlib import sha256
++from secrets import token_bytes, token_urlsafe
++from urllib.parse import urlsplit
++from uuid import UUID
++
++import httpx
++from authlib.integrations.httpx_client import AsyncOAuth2Client
++from cryptography.exceptions import InvalidTag
++from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
++from cryptography.hazmat.primitives.ciphers.aead import AESGCM
++from fastapi import FastAPI, Request
++from fastapi.responses import JSONResponse, RedirectResponse
++from psycopg import Connection
++from psycopg.pq import TransactionStatus
++from starlette.concurrency import run_in_threadpool
++from starlette.exceptions import HTTPException as StarletteHTTPException
++
++from .identity_sessions import AuthenticationDenied, IssuedSession, SessionStore
++from .oidc_identity import InvalidIdentity, OIDCIdentityVerifier
++
++_OPAQUE = re.compile(r"[A-Za-z0-9_-]{43}\Z")
++_LOGIN_COOKIE = "__Host-medical-oidc"
++_SESSION_COOKIE = "__Host-medical-session"
++_CSRF_COOKIE = "__Host-medical-csrf"
++_MAX_TOKEN_RESPONSE = 65536
++ConnectionFactory = Callable[[], AbstractContextManager[Connection]]
++
++
++class InvalidLogin(Exception):
++    """Missing, expired, already consumed or wrong-browser login request."""
++
++
++def _https_url(value: object):
++    if (type(value) is not str or "?" in value or "#" in value
++            or any(ord(char) <= 32 or ord(char) == 127 for char in value)):
++        raise ValueError("Invalid trusted OIDC configuration")
++    try:
++        parsed = urlsplit(value)
++        if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
++                or parsed.query or parsed.fragment):
++            raise ValueError("Invalid trusted OIDC configuration")
++        _ = parsed.port
++        return parsed
++    except (TypeError, ValueError):
++        raise ValueError("Invalid trusted OIDC configuration") from None
++
++
++@dataclass(frozen=True, slots=True)
++class LoginConfiguration:
++    """Fixed, trusted institutional settings, never derived from a request."""
++
++    issuer: str
++    authorization_endpoint: str
++    token_endpoint: str
++    callback_uri: str
++    client_id: str
++    client_secret: str = field(repr=False)
++    public_key: RSAPublicKey = field(repr=False)
++    mfa_acr_values: frozenset[str]
++    max_authentication_age_seconds: int = 600
++
++    def __post_init__(self) -> None:
++        issuer = _https_url(self.issuer)
++        authorization = _https_url(self.authorization_endpoint)
++        token = _https_url(self.token_endpoint)
++        callback = _https_url(self.callback_uri)
++        if (authorization.netloc != issuer.netloc or token.netloc != issuer.netloc
++                or not authorization.path.startswith(issuer.path.rstrip("/") + "/")
++                or not token.path.startswith(issuer.path.rstrip("/") + "/")
++                or callback.path != "/auth/callback" or type(self.client_secret) is not str
++                or not self.client_secret or any(ord(char) < 32 for char in self.client_secret)):
++            raise ValueError("Invalid trusted OIDC configuration")
++        OIDCIdentityVerifier(issuer=self.issuer, audience=self.client_id, public_key=self.public_key,
++                             mfa_acr_values=self.mfa_acr_values,
++                             max_authentication_age_seconds=self.max_authentication_age_seconds)
++
++    @property
++    def app_origin(self) -> str:
++        parsed = urlsplit(self.callback_uri)
++        return "https://" + parsed.netloc
++
++
++@dataclass(frozen=True, slots=True)
++class LoginChallenge:
++    state: str = field(repr=False)
++    browser_token: str = field(repr=False)
++    nonce: str = field(repr=False)
++    code_verifier: str = field(repr=False)
++
++
++@dataclass(frozen=True, slots=True)
++class ConsumedLogin:
++    nonce: str = field(repr=False)
++    code_verifier: str = field(repr=False)
++    tenant_version: int
++
++
++def _hash(value: object) -> bytes:
++    if type(value) is not str or _OPAQUE.fullmatch(value) is None:
++        raise InvalidLogin()
++    return sha256(value.encode("ascii")).digest()
++
++
++class LoginTransactionStore:
++    """Encrypt PKCE material and consume a browser-bound flow exactly once."""
++
++    def __init__(self, connection_factory: ConnectionFactory, *, tenant_id: str,
++                 encryption_key: bytes, lifetime_seconds: int = 300) -> None:
++        try:
++            self._tenant = UUID(tenant_id)
++        except (TypeError, ValueError, AttributeError):
++            raise ValueError("Invalid institution configuration") from None
++        if (type(encryption_key) is not bytes or len(encryption_key) != 32
++                or type(lifetime_seconds) is not int or not 1 <= lifetime_seconds <= 600):
++            raise ValueError("Invalid login storage configuration")
++        self._cipher = AESGCM(encryption_key)
++        self._connection_factory = connection_factory
++        self.lifetime_seconds = lifetime_seconds
++
++    @contextmanager
++    def _transaction(self):
++        with self._connection_factory() as connection:
++            if connection.info.transaction_status != TransactionStatus.IDLE:
++                raise InvalidLogin()
++            with connection.transaction():
++                connection.execute("SET TRANSACTION ISOLATION LEVEL READ COMMITTED READ WRITE")
++                connection.execute("SET LOCAL search_path TO pg_catalog")
++                connection.execute("SET LOCAL lock_timeout = '3s'")
++                connection.execute("SET LOCAL statement_timeout = '5s'")
++                if connection.execute("SELECT medical_rag.runtime_role_basic_check() "
++                                      "AND NOT pg_catalog.pg_is_in_recovery()").fetchone() != (True,):
++                    raise InvalidLogin()
++                yield connection
++
++    def create(self) -> LoginChallenge:
++        challenge = LoginChallenge(token_urlsafe(32), token_urlsafe(32), token_urlsafe(32), token_urlsafe(64))
++        digest = _hash(challenge.state)
++        iv = token_bytes(12)
++        payload = json.dumps({"nonce": challenge.nonce, "code_verifier": challenge.code_verifier}).encode("ascii")
++        context = iv + self._cipher.encrypt(iv, payload, self._tenant.bytes + digest)
++        with self._transaction() as connection:
++            row = connection.execute(
++                "INSERT INTO medical_rag.oidc_login_transactions "
++                "(tenant_id,state_hash,browser_hash,encrypted_context,tenant_version,expires_at) "
++                "SELECT t.tenant_id,%s,%s,%s,t.session_version,clock_timestamp()+(%s*interval '1 second') "
++                "FROM medical_rag.tenants t WHERE t.tenant_id=%s AND t.active RETURNING state_hash",
++                (digest, _hash(challenge.browser_token), context, self.lifetime_seconds, self._tenant),
++            ).fetchone()
++            if row is None:
++                raise InvalidLogin()
++        return challenge
++
++    def consume(self, state: str, browser_token: str) -> ConsumedLogin:
++        digest, browser = _hash(state), _hash(browser_token)
++        with self._transaction() as connection:
++            # Lock before evaluating time: a waiting statement must not extend
++            # the usable life of a flow whose expiry passed while it waited.
++            if connection.execute(
++                "SELECT 1 FROM medical_rag.oidc_login_transactions "
++                "WHERE tenant_id=%s AND state_hash=%s AND browser_hash=%s FOR UPDATE",
++                (self._tenant, digest, browser),
++            ).fetchone() is None:
++                raise InvalidLogin()
++            row = connection.execute(
++                "DELETE FROM medical_rag.oidc_login_transactions f USING medical_rag.tenants t "
++                "WHERE f.tenant_id=%s AND f.state_hash=%s AND f.browser_hash=%s "
++                "AND f.expires_at>clock_timestamp() AND f.tenant_id=t.tenant_id AND t.active "
++                "AND f.tenant_version=t.session_version "
++                "RETURNING f.encrypted_context,f.tenant_version", (self._tenant, digest, browser),
++            ).fetchone()
++            if row is None:
++                raise InvalidLogin()
++        # The committed deletion remains final, including on decrypt/provider
++        # failure. Neither a retry nor another worker can reuse this request.
++        try:
++            context = bytes(row[0])
++            values = json.loads(self._cipher.decrypt(context[:12], context[12:], self._tenant.bytes + digest))
++            nonce, verifier = values["nonce"], values["code_verifier"]
++            _hash(nonce)
++            if type(verifier) is not str or re.fullmatch(r"[A-Za-z0-9_-]{86}", verifier) is None:
++                raise InvalidLogin()
++            return ConsumedLogin(nonce, verifier, row[1])
++        except (InvalidTag, ValueError, TypeError, KeyError, OverflowError, RecursionError):
++            raise InvalidLogin() from None
++
++
++class _LimitedStream(httpx.AsyncByteStream):
++    def __init__(self, stream: httpx.AsyncByteStream) -> None:
++        self._stream = stream
++
++    async def __aiter__(self):
++        length = 0
++        async for part in self._stream:
++            length += len(part)
++            if length > _MAX_TOKEN_RESPONSE:
++                raise InvalidLogin()
++            yield part
++
++    async def aclose(self) -> None:
++        await self._stream.aclose()
++
++
++class _LimitedTransport(httpx.AsyncBaseTransport):
++    def __init__(self, inner: httpx.AsyncBaseTransport) -> None:
++        self._inner = inner
++
++    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
++        response = await self._inner.handle_async_request(request)
++        # A parseable, signed ID token is not an OAuth success response by
++        # itself. Reject HTTP errors/redirects before Authlib parses the body.
++        if (response.status_code != 200
++                or response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json"
++                or response.headers.get("content-encoding", "identity").lower() != "identity"
++                or (response.is_stream_consumed and len(response.content) > _MAX_TOKEN_RESPONSE)):
++            await response.aclose()
++            raise InvalidLogin()
++        response.stream = _LimitedStream(response.stream)
++        return response
++
++    async def aclose(self) -> None:
++        await self._inner.aclose()
++
++
++class OIDCLogin:
++    """A confidential OIDC client, fixed to one institution and provider."""
++
++    def __init__(self, config: LoginConfiguration, connection_factory: ConnectionFactory, *, tenant_id: str,
++                 transaction_encryption_key: bytes, transport: httpx.AsyncBaseTransport | None = None) -> None:
++        if type(config) is not LoginConfiguration:
++            raise ValueError("Trusted login configuration is required")
++        self.config = config
++        self.transactions = LoginTransactionStore(connection_factory, tenant_id=tenant_id,
++                                                   encryption_key=transaction_encryption_key)
++        self.sessions = SessionStore(connection_factory, tenant_id=tenant_id)
++        self._verifier = OIDCIdentityVerifier(issuer=config.issuer, audience=config.client_id,
++                                             public_key=config.public_key, mfa_acr_values=config.mfa_acr_values,
++                                             max_authentication_age_seconds=config.max_authentication_age_seconds)
++        self._test_transport = transport
++
++    def _client(self) -> AsyncOAuth2Client:
++        transport = self._test_transport or httpx.AsyncHTTPTransport(verify=True, trust_env=False, retries=0)
++        return AsyncOAuth2Client(
++            client_id=self.config.client_id, client_secret=self.config.client_secret,
++            token_endpoint_auth_method="client_secret_basic", redirect_uri=self.config.callback_uri,
++            scope="openid", code_challenge_method="S256", follow_redirects=False,
++            headers={"Accept-Encoding": "identity"},
++            trust_env=False, timeout=httpx.Timeout(5.0, connect=3.0), transport=_LimitedTransport(transport),
++        )
++
++    async def start(self) -> tuple[str, LoginChallenge]:
++        challenge = await run_in_threadpool(self.transactions.create)
++        async with self._client() as client:
++            url, _ = client.create_authorization_url(
++                self.config.authorization_endpoint, state=challenge.state, nonce=challenge.nonce,
++                code_verifier=challenge.code_verifier, max_age=self.config.max_authentication_age_seconds,
++            )
++        return url, challenge
++
++    async def finish(self, *, state: str, browser_token: str, code: str) -> IssuedSession:
++        if type(code) is not str or not 0 < len(code) <= 2048 or any(not 33 <= ord(char) <= 126 for char in code):
++            raise InvalidLogin()
++        flow = await run_in_threadpool(self.transactions.consume, state, browser_token)
++        try:
++            async with asyncio.timeout(10), self._client() as client:
++                token = await client.fetch_token(
++                    self.config.token_endpoint, grant_type="authorization_code", code=code,
++                    code_verifier=flow.code_verifier,
++                )
++            if not isinstance(token, dict):
++                raise InvalidLogin()
++            access_token, token_type, id_token = token.get("access_token"), token.get("token_type"), token.get("id_token")
++            if (type(access_token) is not str or not 0 < len(access_token) <= 16384
++                    or any(not 33 <= ord(char) <= 126 for char in access_token)
++                    or type(token_type) is not str or token_type.lower() != "bearer"
++                    or type(id_token) is not str or not 0 < len(id_token) <= 16384):
++                raise InvalidLogin()
++            identity = self._verifier.verify(id_token, expected_nonce=flow.nonce)
++        except InvalidIdentity:
++            raise InvalidLogin() from None
++        except Exception:  # noqa: BLE001 - upstream error text is never public
++            # OAuth/provider errors can include credentials and response bodies.
++            raise InvalidLogin() from None
++        return await run_in_threadpool(self.sessions.issue, identity, expected_tenant_version=flow.tenant_version)
++
++
++def _cookie(request: Request, name: str) -> str:
++    occurrences = sum(1 for header in request.headers.getlist("cookie") for part in header.split(";")
++                      if part.partition("=")[0].strip() == name)
++    value = request.cookies.get(name)
++    if occurrences != 1 or not value:
++        raise InvalidLogin()
++    return value
++
++
++def _failure(status: int) -> JSONResponse:
++    return JSONResponse({"success": False, "data": None,
++                         "error": {"code": "AUTHENTICATION_FAILED" if status != 503 else "AUTHENTICATION_UNAVAILABLE",
++                                   "message": "身份验证失败" if status != 503 else "身份服务暂不可用"}},
++                        status_code=status)
++
++
++def _set_cookie(response, name: str, value: str, *, max_age: int | None = None) -> None:
++    response.set_cookie(name, value, max_age=max_age, secure=True, httponly=True, samesite="lax", path="/")
++
++
++def _clear_cookie(response, name: str) -> None:
++    response.delete_cookie(name, secure=True, httponly=True, samesite="lax", path="/")
++
++
++def _authorization_origin(endpoint: str) -> str:
++    """Serialize one fixed HTTPS CSP source, rejecting source-list injection."""
++    parsed = _https_url(endpoint)
++    host = parsed.hostname
++    try:
++        address = ipaddress.ip_address(host)
++        if getattr(address, "scope_id", None) is not None:
++            raise ValueError("Invalid trusted OIDC configuration")
++        authority = f"[{address}]" if address.version == 6 else str(address)
++    except ValueError:
++        if (not host or len(host) > 253 or any(
++                re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label) is None
++                for label in host.split("."))):
++            raise ValueError("Invalid trusted OIDC configuration") from None
++        authority = host.lower()
++    if parsed.port is not None:
++        if not 1 <= parsed.port <= 65535:
++            raise ValueError("Invalid trusted OIDC configuration")
++        authority += f":{parsed.port}"
++    return "https://" + authority
++
++
++def create_auth_app(login: OIDCLogin, *, patient_html: bool = False) -> FastAPI:
++    """Create a headless auth-only app, without legacy business endpoints."""
++    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
++    origin = login.config.app_origin
++    authority = urlsplit(origin).netloc
++    # Fixed trusted factory choice only; never derive this policy from a request.
++    csp = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
++           f"base-uri 'none'; form-action 'self' {_authorization_origin(login.config.authorization_endpoint)}; "
++           "frame-ancestors 'none'" if patient_html
++           else "default-src 'none'; frame-ancestors 'none'")
++
++    @app.middleware("http")
++    async def enforce_origin_and_headers(request: Request, call_next):
++        hosts = request.headers.getlist("host")
++        origins = request.headers.getlist("origin")
++        if (request.url.scheme != "https" or len(hosts) != 1 or hosts[0].lower() != authority.lower()
++                or (request.method not in {"GET", "HEAD", "OPTIONS"} and origins != [origin])
++                or (origins and origins != [origin] and request.url.path != "/auth/callback")):
++            response = _failure(403)
++        else:
++            try:
++                response = await call_next(request)
++            except Exception:  # noqa: BLE001 - prevent sensitive ASGI tracebacks
++                # Catch before ServerErrorMiddleware can re-raise a storage or
++                # provider exception to an ASGI server's traceback logger.
++                response = _failure(503)
++        response.headers.update({"Cache-Control": "no-store", "Pragma": "no-cache", "Referrer-Policy": "no-referrer",
++                                 "X-Content-Type-Options": "nosniff", "X-Frame-Options": "DENY",
++                                 "Content-Security-Policy": csp,
++                                 "Cross-Origin-Resource-Policy": "same-origin"})
++        return response
++
++    @app.exception_handler(InvalidLogin)
++    @app.exception_handler(AuthenticationDenied)
++    async def deny(request: Request, error: Exception):
++        response = _failure(401)
++        if request.url.path == "/auth/callback":
++            _clear_cookie(response, _LOGIN_COOKIE)
++        return response
++
++    @app.exception_handler(Exception)
++    async def unavailable(request: Request, error: Exception):
++        return _failure(503)
++
++    @app.exception_handler(StarletteHTTPException)
++    async def framework_error(request: Request, error: StarletteHTTPException):
++        return _failure(error.status_code if error.status_code in {404, 405} else 400)
++
++    @app.post("/auth/login")
++    async def begin():
++        url, challenge = await login.start()
++        response = RedirectResponse(url, status_code=303)
++        _set_cookie(response, _LOGIN_COOKIE, challenge.browser_token, max_age=login.transactions.lifetime_seconds)
++        return response
++
++    @app.get("/auth/callback")
++    async def callback(request: Request):
++        pairs = request.query_params.multi_items()
++        allowed = {"state", "code", "iss", "session_state"}
++        if (any(key not in allowed for key, _ in pairs) or len({key for key, _ in pairs}) != len(pairs)
++                or ("iss" in request.query_params and request.query_params["iss"] != login.config.issuer)):
++            raise InvalidLogin()
++        session = await login.finish(state=request.query_params.get("state"), browser_token=_cookie(request, _LOGIN_COOKIE),
++                                     code=request.query_params.get("code"))
++        # Replace this browser's existing session after re-authentication; raw
++        # values are never accepted from query/body fields or reused as new IDs.
++        try:
++            previous, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
++        except InvalidLogin:
++            pass
++        else:
++            try:
++                await run_in_threadpool(login.sessions.revoke, previous, csrf_token=csrf)
++            except AuthenticationDenied:
++                pass
++        response = RedirectResponse("/", status_code=303)
++        _clear_cookie(response, _LOGIN_COOKIE)
++        _set_cookie(response, _SESSION_COOKIE, session.token)
++        _set_cookie(response, _CSRF_COOKIE, session.csrf_token)
++        return response
++
++    @app.get("/auth/session")
++    async def session_info(request: Request):
++        token, csrf = _cookie(request, _SESSION_COOKIE), _cookie(request, _CSRF_COOKIE)
++        principal = await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=csrf)
++        return {"success": True, "data": {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
++                                          "roles": sorted(principal.roles), "csrf_token": csrf}, "error": None}
++
++    @app.post("/auth/logout")
++    async def logout(request: Request):
++        try:
++            headers = request.headers.getlist("x-csrf-token")
++            if len(headers) != 1:
++                return _failure(403)
++            token = _cookie(request, _SESSION_COOKIE)
++            await run_in_threadpool(login.sessions.authenticate, token, require_csrf=True, csrf_token=headers[0])
++            await run_in_threadpool(login.sessions.revoke, token, csrf_token=headers[0])
++        except (InvalidLogin, AuthenticationDenied):
++            return _failure(403)
++        response = JSONResponse({"success": True, "data": None, "error": None})
++        for name in (_SESSION_COOKIE, _CSRF_COOKIE, _LOGIN_COOKIE):
++            _clear_cookie(response, name)
++        return response
++
++    return app
++
+diff --git a/tests/test_security_server.py b/tests/test_security_server.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_security_server.py
+@@ -0,0 +1,722 @@
++"""Trusted startup tests; loader doubles are separate from real PostgreSQL."""
++
++# ruff: noqa: F401,F811 -- imported pytest fixtures
++import os
++import secrets
++import socket
++import ssl
++import subprocess
++import sys
++import time
++from datetime import UTC, datetime, timedelta
++from pathlib import Path
++
++import psycopg
++import pytest
++from cryptography import x509
++from cryptography.hazmat.primitives import hashes, serialization
++from cryptography.x509.oid import NameOID
++from fastapi.testclient import TestClient
++from test_oidc_login import APP_ORIGIN, TENANT, configuration
++from test_patient_vertical import (
++    auth_system,
++    database,
++    oidc_database,
++    signing_key,
++    system,
++)
++
++from medical_rag import security_server
++from medical_rag.security_config import StartupError, load_configuration
++
++
++@pytest.fixture
++def config_file(tmp_path, signing_key):
++    (tmp_path / "dsn").write_text(
++        "postgresql://fictional-secret@localhost/test", encoding="utf-8"
++    )
++    (tmp_path / "client-secret").write_text("fictional-secret", encoding="utf-8")
++    (tmp_path / "key").write_bytes(b"x" * 32)
++    (tmp_path / "notice").write_text(
++        "Institution-approved fictional test notice", encoding="utf-8"
++    )
++    (tmp_path / "public.pem").write_bytes(
++        signing_key.public_key().public_bytes(
++            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo
++        )
++    )
++    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "medical.example.org")])
++    cert = (
++        x509.CertificateBuilder()
++        .subject_name(name)
++        .issuer_name(name)
++        .public_key(signing_key.public_key())
++        .serial_number(x509.random_serial_number())
++        .not_valid_before(datetime.now(UTC) - timedelta(minutes=1))
++        .not_valid_after(datetime.now(UTC) + timedelta(days=1))
++        .sign(signing_key, hashes.SHA256())
++    )
++    (tmp_path / "tls.pem").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
++    (tmp_path / "tls.key").write_bytes(
++        signing_key.private_bytes(
++            serialization.Encoding.PEM,
++            serialization.PrivateFormat.PKCS8,
++            serialization.NoEncryption(),
++        )
++    )
++    build = tmp_path / "dist-patient"
++    (build / "assets").mkdir(parents=True)
++    (build / "patient.html").write_text(
++        '<html><script type="module" src="/assets/patient.js"></script></html>',
++        encoding="utf-8",
++    )
++    (build / "assets/patient.js").write_text(
++        'document.title="patient"', encoding="utf-8"
++    )
++    config = tmp_path / "patient.toml"
++    config.write_text(
++        """tenant_id = "00000000-0000-0000-0000-000000000101"
++database_dsn_file = "dsn"
++transaction_key_file = "key"
++frontend_dist = "dist-patient"
++listen_host = "127.0.0.1"
++listen_port = 8443
++tls_cert_file = "tls.pem"
++tls_key_file = "tls.key"
++[oidc]
++issuer = "https://identity.example.org/realms/hospital"
++authorization_endpoint = "https://identity.example.org/realms/hospital/protocol/openid-connect/auth"
++token_endpoint = "https://identity.example.org/realms/hospital/protocol/openid-connect/token"
++callback_uri = "https://medical.example.org/auth/callback"
++client_id = "medical-rag"
++client_secret_file = "client-secret"
++public_key_file = "public.pem"
++mfa_acr_values = ["urn:hospital:mfa"]
++[health_notice]
++version = "fictional-v1"
++text_file = "notice"
++validity_seconds = 3600
++""",
++        encoding="utf-8",
++    )
++    return config
++
++
++def test_relative_config_is_bounded_and_environment_independent(
++    config_file, tmp_path, monkeypatch
++):
++    monkeypatch.chdir(tmp_path.parent)
++    monkeypatch.setenv("DATABASE_URL", "secret-ignored")
++    loaded = load_configuration(config_file)
++    assert loaded.frontend_dist == config_file.parent / "dist-patient"
++    assert loaded.notice.version == "fictional-v1"
++    assert "fictional-secret" not in repr(loaded)
++    assert loaded.login.client_id == "medical-rag"
++
++
++@pytest.mark.parametrize(
++    "replace",
++    [
++        ("listen_port = 8443", "listen_port = true"),
++        ("listen_port = 8443", "listen_port = 0"),
++        ('listen_host = "127.0.0.1"', 'listen_host = "0.0.0.0"'),
++        ('listen_host = "127.0.0.1"', 'listen_host = "::"'),
++        ('listen_host = "127.0.0.1"', 'listen_host = "localhost"'),
++        ('tenant_id = "00000000-0000-0000-0000-000000000101"', 'tenant_id = "secret"'),
++        ('client_id = "medical-rag"', 'unknown = "secret"'),
++        ("listen_port = 8443", 'listen_port = 8443\nunknown = "secret"'),
++        ('mfa_acr_values = ["urn:hospital:mfa"]', 'mfa_acr_values = "secret"'),
++        ("validity_seconds = 3600", "validity_seconds = 31536001"),
++        ('database_dsn_file = "dsn"', "database_dsn_file = 5"),
++    ],
++)
++def test_invalid_configuration_is_sanitized(config_file, replace):
++    config_file.write_text(
++        config_file.read_text(encoding="utf-8").replace(*replace), encoding="utf-8"
++    )
++    with pytest.raises(StartupError, match="^患者服务启动失败，请联系机构运维。$"):
++        load_configuration(config_file)
++
++
++@pytest.mark.parametrize(
++    "file,data",
++    [
++        ("key", b"x" * 31),
++        ("public.pem", b"invalid-secret"),
++        ("dsn", b"x" * 16385),
++        ("client-secret", b""),
++        ("notice", b"x" * 65537),
++        ("tls.key", b"secret"),
++        ("patient.toml", b"x" * 65537),
++    ],
++    ids=[
++        "key",
++        "publickey",
++        "dsn-bound",
++        "empty-secret",
++        "notice-bound",
++        "tls",
++        "config-bound",
++    ],
++)
++def test_bad_files_fail_without_sensitive_details(config_file, file, data):
++    (config_file.parent / file).write_bytes(data)
++    with pytest.raises(StartupError) as error:
++        load_configuration(config_file)
++    assert str(error.value) == "患者服务启动失败，请联系机构运维。"
++
++
++def test_missing_files_and_dedicated_build_denied(config_file):
++    with pytest.raises(StartupError):
++        load_configuration(config_file.parent / "absent")
++    (config_file.parent / "dist-patient/patient.html").unlink()
++    with pytest.raises(StartupError):
++        security_server.load_patient_application(config_file)
++
++
++def test_cli_fixed_failure_and_no_sensitive_logs(capsys):
++    assert security_server.main(["--config", "never-exists-secret"]) == 1
++    output = capsys.readouterr()
++    assert output.err.strip() == "患者服务启动失败，请联系机构运维。"
++    assert "secret" not in output.out + output.err
++
++
++def test_direct_tls_invocation_guards(config_file, monkeypatch):
++    observed = {}
++    monkeypatch.setattr(security_server, "preflight", lambda *_: None)
++    monkeypatch.setattr(
++        security_server.uvicorn, "run", lambda app, **kwargs: observed.update(kwargs)
++    )
++    assert security_server.main(["--config", str(config_file)]) == 0
++    assert observed["access_log"] is False and observed["proxy_headers"] is False
++    assert observed["server_header"] is False and observed["log_config"] is None
++    assert observed["ssl_keyfile"] == str(config_file.parent / "tls.key")
++    assert observed["limit_concurrency"] == 100 and observed["timeout_keep_alive"] == 5
++
++
++def test_app_mounts_only_dedicated_build_with_self_only_csp(config_file, monkeypatch):
++    monkeypatch.setattr(security_server, "preflight", lambda *_: None)
++    app = security_server.load_patient_application(config_file)
++    with TestClient(app, base_url=APP_ORIGIN, headers={}) as client:
++        response = client.get("/")
++        assert response.status_code == 200 and "/assets/patient.js" in response.text
++        assert client.get("/assets/patient.js").status_code == 200
++        assert client.get("/assets/").status_code == 404
++        for path in [
++            "/ui",
++            "/chat",
++            "/api/chat",
++            "/settings",
++            "/docs",
++            "/openapi.json",
++            "/patient.toml",
++            "/assets/../patient.toml",
++        ]:
++            assert client.get(path).status_code == 404
++        csp = response.headers["content-security-policy"]
++        assert (
++            "script-src 'self'" in csp
++            and "unsafe-" not in csp
++            and "form-action 'self'" in csp
++        )
++        assert response.headers["cache-control"] == "no-store"
++        assert client.get("/", headers={"Host": "evil.example"}).status_code == 403
++        assert (
++            client.get("/", headers={"Origin": "https://evil.example"}).status_code
++            == 403
++        )
++        assert (
++            client.get("/", headers={"X-Forwarded-Host": "evil.example"}).status_code
++            == 200
++        )
++    with TestClient(app, base_url="http://medical.example.org", headers={}) as client:
++        assert (
++            client.get("/", headers={"X-Forwarded-Proto": "https"}).status_code == 403
++        )
++
++
++def test_headless_csp_default_is_unchanged(signing_key):
++    from medical_rag.oidc_login import OIDCLogin, create_auth_app
++
++    login = OIDCLogin(
++        configuration(signing_key),
++        lambda: None,
++        tenant_id=TENANT,
++        transaction_encryption_key=b"x" * 32,
++    )
++    with TestClient(create_auth_app(login), base_url=APP_ORIGIN, headers={}) as client:
++        assert (
++            client.get("/absent").headers["content-security-policy"]
++            == "default-src 'none'; frame-ancestors 'none'"
++        )
++
++
++def test_patient_form_csp_permits_only_trusted_fixed_idp_origin(signing_key):
++    from medical_rag.oidc_login import OIDCLogin, create_auth_app
++
++    login = OIDCLogin(
++        configuration(signing_key),
++        lambda: None,
++        tenant_id=TENANT,
++        transaction_encryption_key=b"x" * 32,
++    )
++    with TestClient(
++        create_auth_app(login, patient_html=True), base_url=APP_ORIGIN, headers={}
++    ) as client:
++        csp = client.get(
++            "/absent",
++            headers={
++                "Forwarded": "host=evil.example",
++                "X-Forwarded-Host": "evil.example",
++            },
++        ).headers["content-security-policy"]
++        directives = dict(part.strip().split(" ", 1) for part in csp.split(";"))
++        assert directives["form-action"] == "'self' https://identity.example.org"
++        assert (
++            directives["script-src"]
++            == directives["style-src"]
++            == directives["connect-src"]
++            == "'self'"
++        )
++        assert "evil" not in csp and "*" not in csp and "unsafe-" not in csp
++
++
++@pytest.mark.parametrize(
++    "authority",
++    [
++        "*.example.org",
++        "identity.example.org;script-src",
++        "identity.example.org'",
++        "identity\\evil.example.org",
++        "[::1%25;upgrade-insecure-requests;]",
++        "[fe80::1%25eth0]",
++    ],
++)
++def test_patient_csp_rejects_unsafe_authority_syntax(authority):
++    from types import SimpleNamespace
++
++    from medical_rag.oidc_login import create_auth_app
++
++    login = SimpleNamespace(
++        config=SimpleNamespace(
++            app_origin=APP_ORIGIN,
++            authorization_endpoint="https://" + authority + "/authorize",
++        )
++    )
++    with pytest.raises(ValueError):
++        create_auth_app(login, patient_html=True)
++
++
++@pytest.mark.integration
++def test_owner_grant_recipe_supports_real_runtime_operations(
++    config_file, system, database
++):
++    from medical_rag.identity_sessions import SessionStore
++    from medical_rag.oidc_identity import VerifiedIdentity
++    from medical_rag.patient_service import PatientService
++
++    _, admin = database
++    role = "patient_recipe_" + secrets.token_hex(6)
++    with psycopg.connect(**admin) as db:
++        db.execute(
++            psycopg.sql.SQL(
++                "CREATE ROLE {} LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS NOCREATEDB NOCREATEROLE"
++            ).format(
++                psycopg.sql.Identifier(role), psycopg.sql.Literal(admin["password"])
++            )
++        )
++        recipe = (
++            Path(__file__).resolve().parents[1] / "database/patient_runtime_grants.sql"
++        ).read_text(encoding="utf-8")
++        recipe = "\n".join(
++            line for line in recipe.splitlines() if not line.startswith("\\")
++        )
++        db.execute(
++            recipe.replace(
++                ':"runtime_role"', psycopg.sql.Identifier(role).as_string(db)
++            )
++        )
++    params = dict(admin, user=role, autocommit=False)
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in params.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    loaded = load_configuration(config_file)
++    security_server.preflight(loaded)
++    sessions = SessionStore(lambda: psycopg.connect(**params), tenant_id=TENANT)
++    issued = sessions.issue(VerifiedIdentity(loaded.login.issuer, "subject-1", True))
++    service = PatientService(sessions, loaded.notice)
++    assert service.change_consent(
++        issued.token,
++        csrf_token=issued.csrf_token,
++        granted=True,
++        version=loaded.notice.version,
++    )["granted"]
++    created = service.create_conversation(
++        issued.token, csrf_token=issued.csrf_token, title="fictional"
++    )
++    service.append_turn(
++        issued.token, created["id"], csrf_token=issued.csrf_token, content="fictional"
++    )
++    assert len(service.list_turns(issued.token, created["id"])["items"]) == 1
++    login = __import__("medical_rag.oidc_login", fromlist=["OIDCLogin"]).OIDCLogin(
++        loaded.login,
++        lambda: psycopg.connect(**params),
++        tenant_id=TENANT,
++        transaction_encryption_key=loaded.transaction_key,
++    )
++    flow = login.transactions.create()
++    assert (
++        login.transactions.consume(flow.state, flow.browser_token).tenant_version >= 0
++    )
++
++
++@pytest.mark.integration
++def test_actual_recovery_postgres_denied(config_file, system, database):
++    """Create one OWN disposable clone; never change the existing primary."""
++    runtime, admin = database
++    # Resolve only the fixture's random primary port. Attach an OWN temporary
++    # network and create an OWN bounded-memory streaming standby container.
++    inventory = subprocess.run(
++        ["docker", "ps", "--format", "{{.ID}} {{.Ports}}"],
++        capture_output=True,
++        text=True,
++        check=True,
++    ).stdout.splitlines()
++    containers = [
++        line.split()[0]
++        for line in inventory
++        if f"127.0.0.1:{admin['port']}->5432" in line
++    ]
++    assert len(containers) == 1
++    container = containers[0]
++    network = "patient-recovery-" + secrets.token_hex(6)
++    standby = None
++    subprocess.run(
++        ["docker", "network", "create", network],
++        capture_output=True,
++        check=True,
++        timeout=10,
++    )
++    try:
++        subprocess.run(
++            [
++                "docker",
++                "network",
++                "connect",
++                "--alias",
++                "patient-primary",
++                network,
++                container,
++            ],
++            capture_output=True,
++            check=True,
++            timeout=10,
++        )
++        # Only this test's disposable primary: permit password-authenticated
++        # replication on the isolated temporary Docker network.
++        with psycopg.connect(**admin) as db:
++            hba = db.execute("SHOW hba_file").fetchone()[0]
++        subprocess.run(
++            [
++                "docker",
++                "exec",
++                container,
++                "sh",
++                "-c",
++                f"printf '\\nhost replication postgres all scram-sha-256\\n' >> '{hba}'",
++            ],
++            capture_output=True,
++            check=True,
++            timeout=10,
++        )
++        with psycopg.connect(**admin) as db:
++            db.execute("SELECT pg_reload_conf()")
++        standby = subprocess.run(
++            [
++                "docker",
++                "run",
++                "-d",
++                "--network",
++                network,
++                "-p",
++                "127.0.0.1::5432",
++                "--tmpfs",
++                "/standby:rw,size=256m,uid=70,gid=70,mode=0700",
++                "--user",
++                "postgres",
++                "-e",
++                f"PGPASSWORD={admin['password']}",
++                "--entrypoint",
++                "sh",
++                "postgres:18.6-alpine",
++                "-c",
++                "pg_basebackup -c fast -h patient-primary -U postgres -D /standby -R -X stream && exec postgres -D /standby -c listen_addresses='*'",
++            ],
++            capture_output=True,
++            text=True,
++            check=True,
++            timeout=10,
++        ).stdout.strip()
++        port = (
++            subprocess.run(
++                ["docker", "port", standby, "5432/tcp"],
++                capture_output=True,
++                text=True,
++                check=True,
++                timeout=10,
++            )
++            .stdout.strip()
++            .rsplit(":", 1)[1]
++        )
++        params = dict(runtime, port=int(port))
++        for _ in range(100):
++            try:
++                with psycopg.connect(**params) as db:
++                    assert db.execute("SELECT pg_is_in_recovery()").fetchone() == (
++                        True,
++                    )
++                break
++            except psycopg.OperationalError:
++                time.sleep(0.1)
++        else:
++            pytest.fail("disposable recovery server did not become ready")
++        (config_file.parent / "dsn").write_text(
++            psycopg.conninfo.make_conninfo(
++                **{k: v for k, v in params.items() if k != "autocommit"}
++            ),
++            encoding="utf-8",
++        )
++        with pytest.raises(StartupError):
++            security_server.load_patient_application(config_file)
++    finally:
++        if standby:
++            subprocess.run(
++                ["docker", "rm", "-f", standby],
++                capture_output=True,
++                timeout=15,
++                check=False,
++            )
++        subprocess.run(
++            ["docker", "network", "disconnect", network, container],
++            capture_output=True,
++            timeout=10,
++            check=False,
++        )
++        subprocess.run(
++            ["docker", "network", "rm", network],
++            capture_output=True,
++            timeout=10,
++            check=False,
++        )
++
++
++@pytest.mark.integration
++def test_actual_primary_least_privilege_startup_and_authority_denials(
++    config_file, system, database
++):
++    runtime, admin = database
++    dsn = config_file.parent / "dsn"
++    dsn.write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    assert security_server.load_patient_application(config_file) is not None
++    with psycopg.connect(**admin) as db:
++        for grant, revoke in [
++            (
++                "GRANT UPDATE(active) ON medical_rag.tenants TO login_test",
++                "REVOKE UPDATE(active) ON medical_rag.tenants FROM login_test",
++            ),
++            (
++                "GRANT INSERT(role) ON medical_rag.identity_roles TO login_test",
++                "REVOKE INSERT(role) ON medical_rag.identity_roles FROM login_test",
++            ),
++            (
++                "GRANT UPDATE(identity_verified) ON medical_rag.patient_subjects TO login_test",
++                "REVOKE UPDATE(identity_verified) ON medical_rag.patient_subjects FROM login_test",
++            ),
++            (
++                "GRANT UPDATE(granted) ON medical_rag.patient_consent_events TO login_test",
++                "REVOKE UPDATE(granted) ON medical_rag.patient_consent_events FROM login_test",
++            ),
++            (
++                "GRANT DELETE ON medical_rag.patient_consent_events TO login_test",
++                "REVOKE DELETE ON medical_rag.patient_consent_events FROM login_test",
++            ),
++        ]:
++            db.execute(grant)
++            try:
++                with pytest.raises(StartupError):
++                    security_server.load_patient_application(config_file)
++            finally:
++                db.execute(revoke)
++        db.execute(
++            "UPDATE medical_rag.tenants SET active=false WHERE tenant_id=%s", (TENANT,)
++        )
++        with pytest.raises(StartupError):
++            security_server.load_patient_application(config_file)
++        db.execute(
++            "UPDATE medical_rag.tenants SET active=true WHERE tenant_id=%s", (TENANT,)
++        )
++    dsn.write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in admin.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    with pytest.raises(StartupError):
++        security_server.load_patient_application(config_file)
++
++
++@pytest.mark.integration
++def test_actual_wrong_tenant_missing_schema_denied(config_file, system, database):
++    runtime, admin = database
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    original = config_file.read_text(encoding="utf-8")
++    config_file.write_text(
++        original.replace(TENANT, "00000000-0000-0000-0000-000000000999"),
++        encoding="utf-8",
++    )
++    with pytest.raises(StartupError):
++        security_server.load_patient_application(config_file)
++    config_file.write_text(original, encoding="utf-8")
++    with psycopg.connect(**admin) as db:
++        db.execute(
++            "ALTER TABLE medical_rag.patient_subjects RENAME COLUMN age_classification TO missing_age"
++        )
++        try:
++            with pytest.raises(StartupError):
++                security_server.load_patient_application(config_file)
++        finally:
++            db.execute(
++                "ALTER TABLE medical_rag.patient_subjects RENAME COLUMN missing_age TO age_classification"
++            )
++
++
++@pytest.mark.integration
++def test_required_dml_and_forced_rls_are_checked(config_file, system, database):
++    runtime, admin = database
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    with psycopg.connect(**admin) as db:
++        for table in ["patient_consent_events", "conversations", "identity_sessions"]:
++            db.execute(f"REVOKE INSERT ON medical_rag.{table} FROM login_test")
++            try:
++                with pytest.raises(StartupError):
++                    security_server.load_patient_application(config_file)
++            finally:
++                db.execute(f"GRANT INSERT ON medical_rag.{table} TO login_test")
++        db.execute("ALTER TABLE medical_rag.conversations NO FORCE ROW LEVEL SECURITY")
++        try:
++            with pytest.raises(StartupError):
++                security_server.load_patient_application(config_file)
++        finally:
++            db.execute("ALTER TABLE medical_rag.conversations FORCE ROW LEVEL SECURITY")
++
++
++@pytest.mark.parametrize(
++    "dsn",
++    [
++        "host=db.example.org dbname=postgres user=patient password=secret sslmode=disable",
++        "host=127.0.0.1,db.example.org dbname=postgres user=patient password=secret",
++        "host=127.0.0.1 hostaddr=203.0.113.1 dbname=postgres user=patient password=secret",
++    ],
++)
++def test_unsafe_remote_database_transport_denied(config_file, dsn, monkeypatch):
++    (config_file.parent / "dsn").write_text(dsn, encoding="utf-8")
++    connected = []
++    monkeypatch.setattr(
++        security_server.psycopg,
++        "connect",
++        lambda *args, **kwargs: connected.append(True),
++    )
++    with pytest.raises(StartupError):
++        security_server._connect(load_configuration(config_file))
++    assert connected == []
++
++
++def test_help_succeeds_without_startup_or_secret_access(capsys):
++    assert security_server.main(["--help"]) == 0
++    assert "启动失败" not in capsys.readouterr().err
++
++
++@pytest.mark.integration
++def test_real_direct_tls_process_serves_only_dedicated_build(
++    config_file, system, database
++):
++    runtime, _ = database
++    (config_file.parent / "dsn").write_text(
++        psycopg.conninfo.make_conninfo(
++            **{k: v for k, v in runtime.items() if k != "autocommit"}
++        ),
++        encoding="utf-8",
++    )
++    with socket.socket() as reserved:
++        reserved.bind(("127.0.0.1", 0))
++        port = reserved.getsockname()[1]
++    config_file.write_text(
++        config_file.read_text(encoding="utf-8").replace(
++            "listen_port = 8443", f"listen_port = {port}"
++        ),
++        encoding="utf-8",
++    )
++    process = subprocess.Popen(
++        [
++            sys.executable,
++            "-m",
++            "medical_rag.security_server",
++            "--config",
++            str(config_file),
++        ],
++        stdout=subprocess.PIPE,
++        stderr=subprocess.PIPE,
++        env=dict(
++            os.environ,
++            PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
++        ),
++    )
++    context = ssl.create_default_context(cafile=str(config_file.parent / "tls.pem"))
++    try:
++        for _ in range(100):
++            try:
++                with (
++                    socket.create_connection(("127.0.0.1", port), timeout=0.2) as raw,
++                    context.wrap_socket(
++                        raw, server_hostname="medical.example.org"
++                    ) as tls,
++                ):
++                    tls.sendall(
++                        b"GET / HTTP/1.1\r\nHost: medical.example.org\r\nConnection: close\r\n\r\n"
++                    )
++                    response = b""
++                    while chunk := tls.recv(65536):
++                        response += chunk
++                break
++            except (ConnectionError, TimeoutError):
++                time.sleep(0.1)
++        else:
++            pytest.fail("direct TLS test listener did not become ready")
++        assert (
++            response.startswith(b"HTTP/1.1 200") and b"/assets/patient.js" in response
++        )
++        assert b"server: uvicorn" not in response.lower()
++        assert b"cache-control: no-store" in response.lower()
++    finally:
++        process.terminate()
++        stdout, stderr = process.communicate(timeout=10)
++    assert stdout == b"" and stderr == b""
++

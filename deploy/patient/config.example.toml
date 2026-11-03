@@ -1,0 +1,37 @@
+# Operator-owned example only. All paths resolve relative to this file.
+# No .env is read. Provision migrations 1-7, verified authority and audited
+# runtime grants separately. No accounts/consent/identity are created here.
+tenant_id = "00000000-0000-0000-0000-000000000101"
+database_dsn_file = "secrets/database-dsn.txt"
+transaction_key_file = "secrets/login-aes256.raw"
+frontend_dist = "../../frontend/dist-patient"
+listen_host = "127.0.0.1"
+listen_port = 8443
+tls_cert_file = "secrets/tls-chain.pem"
+tls_key_file = "secrets/tls-private-key.pem"
+
+[oidc]
+# Optional operator-owned PUBLIC PEM trust bundle, resolved relative to this file.
+# Omit to retain verified system/public-CA trust. Never supply a private key here.
+# provider_ca_file = "institution-provider-ca.pem"
+issuer = "https://identity.example.org/realms/institution"
+authorization_endpoint = "https://identity.example.org/realms/institution/protocol/openid-connect/auth"
+token_endpoint = "https://identity.example.org/realms/institution/protocol/openid-connect/token"
+# Exact public TLS origin including port, if non-default. This listener does
+# NOT trust Forwarded/X-Forwarded-* or integrate the legacy nginx HTTP upstream.
+callback_uri = "https://patient.example.org:8443/auth/callback"
+client_id = "institution-provisioned-patient-client"
+client_secret_file = "secrets/oidc-client-secret.txt"
+public_key_file = "secrets/oidc-rs256-public-key.pem"
+# Routine overlap alternative: REMOVE public_key_file above, then approve
+# exactly 1..8 named RSA public keys. Names must match the provider JWT kid.
+# This is an immutable local trust set, never a JWKS URL or automatic refresh.
+# verification_key_files = { old_approved_kid = "keys/old-public.pem", new_approved_kid = "keys/new-public.pem" }
+# Deploy/reload every verifier instance when changing the set; see
+# docs/security/signing-keyring-runbook.md. Removal does not revoke local sessions.
+mfa_acr_values = ["urn:institution:approved-mfa"]
+
+[health_notice]
+version = "institution-approved-version-required"
+text_file = "institution-approved-health-notice.txt"
+validity_seconds = 86400

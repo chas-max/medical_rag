@@ -1,0 +1,8 @@
+# Placeholders only: operator provisioning and review are separate obligations.
+# POSIX paths are container mount targets, not host filenames or key contents.
+public_origin = "https://patient.example.org:8443"
+upstream_url = "https://patient-app:8443"
+upstream_tls_name = "patient.internal.example.org"
+tls_certificate = "/run/tls/gateway.pem"
+tls_key = "/run/tls/gateway.key"
+upstream_ca = "/run/tls/upstream-ca.pem"

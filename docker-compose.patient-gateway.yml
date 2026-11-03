@@ -1,0 +1,47 @@
+services:
+  patient-gateway:
+    image: nginx:1.30.6-alpine@sha256:0e52bd054126cdc040b1276c0af347aeb02a41b9cfe305d6094767ac30e97949
+    entrypoint: ["/bin/sh", "/run/patient-gateway/start.sh"]
+    user: "101:101"
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 32
+    mem_limit: 128m
+    cpus: 1.0
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m,uid=101,gid=101
+    ports:
+      - "127.0.0.1:${PATIENT_GATEWAY_PORT:-8443}:8443"
+    volumes:
+      - type: bind
+        source: ${PATIENT_GATEWAY_CONFIG:?Set the reviewed rendered configuration file}
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./deploy/patient-gateway/start.sh
+        target: /run/patient-gateway/start.sh
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PATIENT_GATEWAY_CERT:?Set the operator certificate file}
+        target: /run/tls/gateway.pem
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PATIENT_GATEWAY_KEY:?Set the operator private key file}
+        target: /run/tls/gateway.key
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PATIENT_GATEWAY_UPSTREAM_CA:?Set the operator upstream CA file}
+        target: /run/tls/upstream-ca.pem
+        read_only: true
+        bind: {create_host_path: false}
+    networks: [edge, backend]
+
+networks:
+  edge: {}
+  backend:
+    internal: true

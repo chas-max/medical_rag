@@ -1,0 +1,33 @@
+{
+  "browserFlow": "medical-reference-browser",
+  "attributes": {"acr.loa.map": "{\"urn:medical-rag:reference:otp\":2}"},
+  "roles": {"realm": [{"name": "medical-staff-mfa"}]},
+  "authenticatorConfig": [
+    {"alias": "medical-reference-level1", "config": {"loa-condition-level": "1", "loa-max-age": "36000"}},
+    {"alias": "medical-reference-level2", "config": {"loa-condition-level": "2", "loa-max-age": "0"}},
+    {"alias": "medical-reference-staff", "config": {"condUserRole": "medical-staff-mfa", "negate": "false"}}
+  ],
+  "authenticationFlows": [
+    {"alias": "medical-reference-browser", "providerId": "basic-flow", "topLevel": true, "builtIn": false,
+     "authenticationExecutions": [
+       {"authenticator": "auth-cookie", "requirement": "ALTERNATIVE", "priority": 10, "authenticatorFlow": false},
+       {"flowAlias": "medical-reference-interactive", "requirement": "ALTERNATIVE", "priority": 20, "authenticatorFlow": true}
+     ]},
+    {"alias": "medical-reference-interactive", "providerId": "basic-flow", "topLevel": false, "builtIn": false,
+     "authenticationExecutions": [
+       {"flowAlias": "medical-reference-level1", "requirement": "CONDITIONAL", "priority": 10, "authenticatorFlow": true},
+       {"flowAlias": "medical-reference-staff-level2", "requirement": "CONDITIONAL", "priority": 20, "authenticatorFlow": true}
+     ]},
+    {"alias": "medical-reference-level1", "providerId": "basic-flow", "topLevel": false, "builtIn": false,
+     "authenticationExecutions": [
+       {"authenticator": "conditional-level-of-authentication", "authenticatorConfig": "medical-reference-level1", "requirement": "REQUIRED", "priority": 10, "authenticatorFlow": false},
+       {"authenticator": "auth-username-password-form", "requirement": "REQUIRED", "priority": 20, "authenticatorFlow": false}
+     ]},
+    {"alias": "medical-reference-staff-level2", "providerId": "basic-flow", "topLevel": false, "builtIn": false,
+     "authenticationExecutions": [
+       {"authenticator": "conditional-user-role", "authenticatorConfig": "medical-reference-staff", "requirement": "REQUIRED", "priority": 10, "authenticatorFlow": false},
+       {"authenticator": "conditional-level-of-authentication", "authenticatorConfig": "medical-reference-level2", "requirement": "REQUIRED", "priority": 20, "authenticatorFlow": false},
+       {"authenticator": "auth-otp-form", "requirement": "REQUIRED", "priority": 30, "authenticatorFlow": false}
+     ]}
+  ]
+}
