@@ -2,7 +2,12 @@
 .idea/
 __pycache__/
 .pytest_cache/
+.ruff_cache/
 pytest-tmp-*/
+.pytest-tmp-*/
+.coverage.*
+htmlcov/
+*.py[cod]
 frontend/page-test-report*.json
 .coverage
 .venv/
@@ -11,6 +16,7 @@ settings.json
 *.egg-info/
 frontend/node_modules/
 frontend/dist/
+frontend/dist-patient/
 frontend/coverage/
 frontend/dist.sandbox-bak/
 outputs/
