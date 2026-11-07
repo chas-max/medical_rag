@@ -27,12 +27,30 @@ def test_chat_cannot_select_another_workflow():
         ChatRunRequest(**payload, workflow_id="medical-answer-agentic")
 
 
-def test_settings_use_project_env_even_when_launched_from_another_directory(monkeypatch):
+def test_settings_use_project_env_even_when_launched_from_another_directory(
+    tmp_path, monkeypatch
+):
+    from pathlib import Path
+
+    from medical_rag import config
     from medical_rag.config import Settings
 
+    # 项目 .env 必须由模块位置推导出绝对路径（仓库根目录），不能跟随进程启动目录。
+    anchored = Path(Settings.model_config["env_file"])
+    assert anchored.is_absolute()
+    assert anchored == Path(config.__file__).resolve().parents[2] / ".env"
+
+    # 用临时 .env 证明：即使从没有 .env 的其他目录启动，绝对路径 env_file 仍然生效。
+    env_file = tmp_path / "project.env"
+    env_file.write_text(
+        "MILVUS_URI=http://127.0.0.1:19531\n"
+        "COLLECTION_NAME=medical_rag_resume_chunks\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(Settings.model_config, "env_file", env_file)
     monkeypatch.delenv("MILVUS_URI", raising=False)
     monkeypatch.delenv("COLLECTION_NAME", raising=False)
-    monkeypatch.chdir("D:/project_rag")
+    monkeypatch.chdir(tmp_path.parent)
     settings = Settings()
     assert settings.milvus_uri == "http://127.0.0.1:19531"
     assert settings.collection_name == "medical_rag_resume_chunks"

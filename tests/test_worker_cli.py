@@ -208,7 +208,8 @@ async def test_periodic_heartbeat_recovers_and_shutdown_preserves_cancellation(
         memory_episodes_dir=str(tmp_path / "episodes"),
     )
     with pytest.raises(asyncio.CancelledError, match="original cancellation"):
-        await asyncio.wait_for(worker.run_role("memory", settings), timeout=0.5)
+        # 超时只防挂起：正常路径由事件立即结束，余量放宽以兼容慢速 CI 机器。
+        await asyncio.wait_for(worker.run_role("memory", settings), timeout=5.0)
     assert len(heartbeats) >= 3 and heartbeats[-1] == "stopped"
     assert "secret" not in caplog.text
 
@@ -293,5 +294,6 @@ async def test_relay_maintenance_storage_failure_does_not_block_publication(
         memory_episodes_dir=str(tmp_path / "episodes"),
     )
     with pytest.raises(asyncio.CancelledError, match="stop after publication"):
-        await asyncio.wait_for(worker.run_role("relay", settings), timeout=0.2)
+        # 超时只防挂起：发布成功后立即抛出取消，余量放宽以兼容慢速 CI 机器。
+        await asyncio.wait_for(worker.run_role("relay", settings), timeout=5.0)
     assert events == ["maintenance", "published"]
