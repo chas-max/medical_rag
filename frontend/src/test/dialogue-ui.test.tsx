@@ -83,6 +83,7 @@ it("keeps the clarification type when history is reloaded", () => {
       role: "assistant",
       citations: [],
       answer_type: "clarification",
+      created_at: "2026-01-01T00:00:00Z",
     },
     "content",
   );
