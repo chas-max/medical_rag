@@ -1,0 +1,87 @@
+# CI/CD 流水线：
+# - CI：每次推送 master / 提交 PR 时，自动运行后端与前端全部检查。
+# - CD：推送到 master 且检查通过后，把前端生产构建包交付到 Actions 产物区，
+#   在运行页面底部的 Artifacts 可随时下载。
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# 同一分支的新推送会取消尚未完成的旧运行，节省 Actions 时长。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    name: Backend (ruff + pytest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # sentence-transformers 依赖 torch，首次安装较慢，之后命中 pip 缓存会快很多。
+      - name: Install project and dev dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint (ruff)
+        run: python -m ruff check src tests
+
+      # 集成测试需要 Milvus/PostgreSQL/网关等真实服务，按仓库约定自动跳过；
+      # pinned_release 需要未入库的本地源 PDF（data/*.pdf），在 CI 排除。
+      - name: Test (pytest)
+        run: python -m pytest -m "not integration and not pinned_release"
+
+  frontend:
+    name: Frontend (lint + test + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint (tsc + eslint)
+        run: npm run lint
+
+      - name: Test (vitest)
+        run: npm test
+
+      - name: Build admin UI
+        run: npm run build
+
+      - name: Build patient UI
+        run: npm run build:patient
+
+      - name: Deliver frontend production bundles
+        if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+        uses: actions/upload-artifact@v4
+        with:
+          name: medical-rag-frontend-${{ github.sha }}
+          path: |
+            frontend/dist
+            frontend/dist-patient
+          retention-days: 14
