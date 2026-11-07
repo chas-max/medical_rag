@@ -118,8 +118,9 @@ def test_stream_route_publishes_verified_claims_before_the_final_result(tmp_path
     assert done["status"] == "success"
     assert done["output"]["answer"] == "\n".join(item["text"] for item in published)
     assert done["output"]["citations"][0]["filename"] == "guide.md"
-    # 流式请求不得退化成整段同步生成；回答规划先走一次 complete，生成本体走流式。
-    assert (transport.streams, transport.completes) == (1, 2)
+    # 流式请求不得退化成整段同步生成；HyDE、纠错重写与回答规划各走一次 complete，
+    # 生成本体走流式。
+    assert (transport.streams, transport.completes) == (1, 3)
     assert api.get(f"/runs/{done['run_id']}").json()["data"]["run_id"] == done["run_id"]
     assert service.last_workflow_id == "medical-answer"
 
@@ -232,8 +233,8 @@ def test_stream_route_keeps_the_synchronous_route_on_the_plain_call(tmp_path):
     api, _, transport = client(tmp_path)
     run = chat_post(api, "高血压", stream=False)
     assert run.json()["data"]["status"] == "success"
-    # 同步路由：回答规划与生成本体各走一次 complete。
-    assert (transport.streams, transport.completes) == (0, 3)
+    # 同步路由：HyDE、纠错重写、回答规划与生成本体各走一次 complete。
+    assert (transport.streams, transport.completes) == (0, 4)
 
 
 def test_stream_route_reports_rejected_inputs_as_an_error_event(tmp_path):

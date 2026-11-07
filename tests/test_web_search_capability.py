@@ -1,6 +1,7 @@
 """联网检索是全局内置能力：工作流不声明、节点不配置，运行时对所有工作流一视同仁。"""
 
 import asyncio
+import json
 from pathlib import Path
 import sys
 
@@ -63,10 +64,22 @@ class WebTransport:
 
 
 class AnswerTransport(WebTransport):
-    """问题路由节点也会问模型一次，这里按结构化协议回答。"""
+    """问题路由/结构化解析节点也会问模型一次，这里按各自协议回答。"""
 
     def complete(self, provider, system, user):
+        payload = json.loads(user)
+        if "context" in payload:
+            question = payload["question"]
+            return json.dumps({
+                "status": "resolved", "relation": "standalone",
+                "resolved_question": question, "topic": None, "intent": "other",
+                "intent_text": "", "references": [], "clarification": None,
+            }, ensure_ascii=False)
         return '{"route":"direct"}' if "route" in system else CLAIMS
+
+    def complete_with_timeout(self, provider, system, user, timeout):
+        # The structured resolver only uses the bounded call.
+        return self.complete(provider, system, user)
 
 
 class WebSearch:
@@ -131,7 +144,8 @@ def test_every_published_answer_workflow_reaches_the_web_without_node_config():
         registry = registry_for(transport, search)
 
         result = asyncio.run(WorkflowEngine(registry, {CAPABILITY_WEB_SEARCH: True}).run(
-            repository.get(workflow_id), {"question": "未知", "provider": "qwen", "top_k": 5}))
+            repository.get_published(workflow_id),
+            {"question": "未知", "provider": "qwen", "top_k": 5}))
 
         assert search.calls == ["未知"], workflow_id
         assert transport.chat_calls == 1, workflow_id

@@ -46,6 +46,7 @@ class AuditAction(StrEnum):
     CONVERSATION_READ = "conversation.read"
     TURN_APPEND = "turn.append"
     TURN_LIST = "turn.list"
+    CHAT_ASK = "chat.ask"
     AUDIT_READ = "audit.read"
     SUPPORT_CREATE = "support.create"
     SUPPORT_LIST = "support.list"
@@ -82,6 +83,7 @@ _RESOURCES = {
     **dict.fromkeys((AuditAction.CONVERSATION_CREATE, AuditAction.CONVERSATION_LIST,
                      AuditAction.CONVERSATION_READ), AuditResource.CONVERSATION),
     AuditAction.TURN_APPEND: AuditResource.TURN, AuditAction.TURN_LIST: AuditResource.TURN,
+    AuditAction.CHAT_ASK: AuditResource.CONVERSATION,
     AuditAction.AUDIT_READ: AuditResource.AUDIT, AuditAction.REQUEST: AuditResource.APPLICATION,
 }
 
@@ -115,6 +117,7 @@ def _action(request: Request) -> AuditAction | None:
         ("DELETE", "/me/consents/health"): AuditAction.CONSENT_WITHDRAW,
         ("GET", "/conversations"): AuditAction.CONVERSATION_LIST,
         ("POST", "/conversations"): AuditAction.CONVERSATION_CREATE,
+        ("POST", "/chat"): AuditAction.CHAT_ASK,
         ("GET", "/audit"): AuditAction.AUDIT_READ,
         ("POST", "/support/cases"): AuditAction.SUPPORT_CREATE,
         ("GET", "/support/cases"): AuditAction.SUPPORT_LIST,

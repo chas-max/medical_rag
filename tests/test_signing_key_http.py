@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from threading import Event
 
-import httpx
+import httpx2 as httpx
 import jwt
 import psycopg
 import pytest

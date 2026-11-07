@@ -13,7 +13,7 @@ from hashlib import sha256
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-import httpx
+import httpx2 as httpx
 import jwt
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -83,7 +83,8 @@ def database():
         with connection:
             for name in ("0001_patient_scope.sql", "0002_identity_sessions.sql", "0003_oidc_login.sql",
                          "0004_patient_access.sql", "0005_security_audit.sql", "0006_provider_logout.sql",
-                         "0007_support_cases.sql"):
+                         "0007_support_cases.sql", "0008_conversation_answers.sql",
+                         "0009_conversation_dialogue_state.sql"):
                 connection.execute((ROOT / "database/migrations" / name).read_text(encoding="utf-8"))
             connection.execute(psycopg.sql.SQL("CREATE ROLE login_test LOGIN PASSWORD {} NOSUPERUSER NOBYPASSRLS")
                                .format(psycopg.sql.Literal(password)))

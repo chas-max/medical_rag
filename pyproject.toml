@@ -16,8 +16,13 @@ dependencies = [
     "pypdf>=5.0",
     "pymilvus>=2.5.11,<2.7",
     "sentence-transformers>=3.0",
-    "openai>=1.60",
-    "httpx>=0.27",
+    # HTTP clients use a deliberate two-stack split. The application code and
+    # OpenAI 1.x speak httpx; Starlette >=1.10 TestClient speaks httpx2. Both
+    # modules can coexist, but leaving either range open lets a fresh install
+    # resolve a mismatched pair (e.g. OpenAI 3.x dropping httpx, or httpx 0.29).
+    "openai>=1.60,<2",
+    "httpx>=0.27,<0.29",
+    "httpx2>=2.16,<3",
     "certifi>=2024.2.2",
     "psycopg[binary]>=3.2,<4",
     "PyJWT[crypto]>=2.15.1,<3",

@@ -40,8 +40,8 @@ _COLUMNS = {
     "oidc_login_transactions": "tenant_id state_hash browser_hash tenant_version encrypted_context created_at expires_at",
     "patient_subjects": "tenant_id patient_id age_classification identity_verified",
     "patient_consent_events": "event_id tenant_id patient_id grantor_account_id purpose notice_version granted recorded_at expires_at event_order",
-    "conversations": "tenant_id patient_id conversation_id title created_at",
-    "conversation_turns": "tenant_id patient_id conversation_id turn_id content created_at",
+    "conversations": "tenant_id patient_id conversation_id title created_at dialogue_state dialogue_revision context_version",
+    "conversation_turns": "tenant_id patient_id conversation_id turn_id content role citations ordinal created_at answer_type",
     "security_audit_events": "event_id tenant_id operator_id action resource_type outcome reason_code recorded_at event_order request_id",
     "provider_logout_events": "event_id tenant_id issuer jti_hash subject_hash sid_hash issued_at expires_at recorded_at",
     "support_cases": "tenant_id case_id requester_account_id category status assigned_account_id resolution_code created_at updated_at",
@@ -144,6 +144,17 @@ def preflight(config: PatientConfiguration) -> None:
                             "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute WHERE attrelid=%s::regclass AND attnum>0 AND NOT attisdropped AND attname<>'patient_id' AND has_column_privilege(current_user,attrelid,attname,'UPDATE'))",
                             ("medical_rag." + table,),
                         ).fetchone()[0]
+                    elif privilege == "UPDATE" and table == "conversations":
+                        # 0009 makes the dialogue columns the only mutable part of
+                        # the row, so the check scans columns instead of dropping it:
+                        # any other column UPDATE (or a table-level grant) fails.
+                        bad = db.execute(
+                            "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_attribute "
+                            "WHERE attrelid=%s::regclass AND attnum>0 AND NOT attisdropped "
+                            "AND attname<>ALL(%s) AND has_column_privilege(current_user,attrelid,attname,'UPDATE'))",
+                            ("medical_rag.conversations",
+                             ["dialogue_state", "dialogue_revision", "context_version"]),
+                        ).fetchone()[0]
                     elif privilege in {"INSERT", "UPDATE", "REFERENCES"}:
                         bad = db.execute(
                             "SELECT has_any_column_privilege(current_user,%s,%s)",
@@ -174,10 +185,11 @@ def preflight(config: PatientConfiguration) -> None:
                     "INSERT": "event_id tenant_id patient_id grantor_account_id purpose notice_version granted expires_at"
                 },
                 "conversations": {
-                    "INSERT": "tenant_id patient_id conversation_id title"
+                    "INSERT": "tenant_id patient_id conversation_id title",
+                    "UPDATE": "dialogue_state dialogue_revision context_version",
                 },
                 "conversation_turns": {
-                    "INSERT": "tenant_id patient_id conversation_id turn_id content"
+                    "INSERT": "tenant_id patient_id conversation_id turn_id content role citations answer_type"
                 },
                 "security_audit_events": {
                     "INSERT": "tenant_id operator_id action resource_type outcome reason_code request_id"
@@ -234,7 +246,8 @@ def _application(config: PatientConfiguration) -> FastAPI:
             tenant_id=config.tenant_id,
             transaction_encryption_key=config.transaction_key,
         )
-        app = create_patient_app(login, config.notice, patient_html=True)
+        app = create_patient_app(login, config.notice, patient_html=True, chat=config.chat,
+                                 dialogue_state_enabled=config.dialogue_state_enabled)
 
         @app.get("/", include_in_schema=False)
         async def index():

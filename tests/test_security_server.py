@@ -112,6 +112,37 @@ def test_relative_config_is_bounded_and_environment_independent(
     assert loaded.notice.version == "fictional-v1"
     assert "fictional-secret" not in repr(loaded)
     assert loaded.login.client_id == "medical-rag"
+    assert loaded.chat is None
+
+
+def test_optional_chat_endpoint_is_loopback_only(config_file):
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8")
+        + '\n[chat]\nbase_url = "http://127.0.0.1:8001"\ntimeout_seconds = 120\ntop_k = 6\n',
+        encoding="utf-8",
+    )
+    loaded = load_configuration(config_file)
+    assert loaded.chat is not None
+    assert loaded.chat.base_url == "http://127.0.0.1:8001"
+
+
+@pytest.mark.parametrize(
+    "section",
+    [
+        'base_url = "https://example.org"\ntimeout_seconds = 120\ntop_k = 6',
+        'base_url = "http://127.0.0.1:8001/path"\ntimeout_seconds = 120\ntop_k = 6',
+        'base_url = "http://127.0.0.1:8001"\ntimeout_seconds = 0\ntop_k = 6',
+        'base_url = "http://127.0.0.1:8001"\ntimeout_seconds = 120\ntop_k = 21',
+        'base_url = "http://127.0.0.1:8001"\ntimeout_seconds = 120\ntop_k = 6\nsecret = "x"',
+    ],
+)
+def test_invalid_chat_configuration_is_sanitized(config_file, section):
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8") + "\n[chat]\n" + section + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(StartupError, match="^患者服务启动失败，请联系机构运维。$"):
+        load_configuration(config_file)
 
 
 @pytest.mark.parametrize(
@@ -204,7 +235,6 @@ def test_app_mounts_only_dedicated_build_with_self_only_csp(config_file, monkeyp
         assert client.get("/assets/").status_code == 404
         for path in [
             "/ui",
-            "/chat",
             "/api/chat",
             "/settings",
             "/docs",
@@ -217,7 +247,10 @@ def test_app_mounts_only_dedicated_build_with_self_only_csp(config_file, monkeyp
             # than silently disabling audit to return an ordinary route404.
             assert client.get(path).status_code == 503
         registered = {getattr(route, "path", None) for route in app.routes}
-        assert not registered & {"/ui", "/chat", "/api/chat", "/settings", "/docs", "/openapi.json"}
+        # /chat is the dedicated POST-only patient answer route, not legacy chat.
+        assert "/chat" in registered
+        assert client.get("/chat").status_code in {405, 503}
+        assert not registered & {"/ui", "/api/chat", "/settings", "/docs", "/openapi.json"}
         csp = response.headers["content-security-policy"]
         assert (
             "script-src 'self'" in csp

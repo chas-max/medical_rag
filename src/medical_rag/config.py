@@ -30,6 +30,15 @@ class Settings(BaseSettings):
     settings_file: str = "settings.json"
     chat_history_file: str = "data/chat-history.sqlite3"
     memory_episodes_dir: str = "data/memory/episodes"
+    # Conversation-turn vectors are a separate collection from the document store:
+    # recall must be scoped to one session and never mixed into medical evidence.
+    chat_recall_enabled: bool = True
+    chat_turn_collection: str = "medical_rag_chat_turns"
+    chat_recall_top_k: int = Field(default=3, ge=1, le=10)
+    # "conversation" keeps recall inside the current session; "global" opens it to
+    # the local user's other sessions, ranked with a recency half-life.
+    chat_recall_scope: Literal["conversation", "global"] = "conversation"
+    chat_recall_half_life_days: float = Field(default=7.0, gt=0, le=365)
     document_uploads_dir: str = "data/document-uploads"
     rabbitmq_url: str = "amqp://medical_rag@127.0.0.1:5673/medical-rag"
     qwen_api_key: str = ""
@@ -60,6 +69,10 @@ class Settings(BaseSettings):
     clear_evidence_threshold: float = Field(default=0.65, ge=0, le=1)
     min_clear_evidence: int = Field(default=2, ge=1, le=20)
     max_agent_tool_calls: int = Field(default=2, ge=0, le=5)
+    # Structured dialogue state ships dark. Both the local chat entry and the
+    # patient deployment must inject the same named environment variable; enabling
+    # only half the chain would persist state nobody reads.
+    dialogue_state_enabled: bool = False
 
     @model_validator(mode="after")
     def _validate_chunking(self) -> "Settings":

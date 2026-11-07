@@ -14,6 +14,10 @@ def isolated_chat_history(tmp_path, monkeypatch):
     monkeypatch.setenv("CHAT_HISTORY_FILE", str(tmp_path / "chat-history.sqlite3"))
     monkeypatch.setenv("MEMORY_EPISODES_DIR", str(tmp_path / "episodes"))
     monkeypatch.setenv("DOCUMENT_UPLOADS_DIR", str(tmp_path / "uploads"))
+    # The operator's .env may turn the continuous-follow-up path on for the local
+    # demo. Tests pin the switch off (process env beats .env for Settings) and
+    # opt in explicitly where the structured path is under test.
+    monkeypatch.setenv("DIALOGUE_STATE_ENABLED", "false")
     # Starlette's synthetic default peer is not an IP address. Give legacy
     # local-demo tests a loopback peer; tests can still specify a remote peer.
     original_init = TestClient.__init__

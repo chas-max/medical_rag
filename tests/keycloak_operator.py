@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
-import httpx
+import httpx2 as httpx
 from authlib.integrations.httpx_client import OAuth2Client
 from jwt.algorithms import RSAAlgorithm
 from keycloak_forms import password_redirect

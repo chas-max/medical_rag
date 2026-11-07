@@ -1,6 +1,11 @@
 # Operator-owned example only. All paths resolve relative to this file.
-# No .env is read. Provision migrations 1-7, verified authority and audited
+# No .env is read. Provision migrations 1-9, verified authority and audited
 # runtime grants separately. No accounts/consent/identity are created here.
+# Continuous follow-up (structured dialogue state) is NOT configured here: set
+# DIALOGUE_STATE_ENABLED=true in the operator process environment, and the same
+# variable for the local answer service. Apply 0009 first, then publish
+# medical-answer v7 explicitly; rolling back means turning the switch off and
+# keeping the derived state columns, never deleting patient rows.
 tenant_id = "00000000-0000-0000-0000-000000000101"
 database_dsn_file = "secrets/database-dsn.txt"
 transaction_key_file = "secrets/login-aes256.raw"
@@ -35,3 +40,15 @@ mfa_acr_values = ["urn:institution:approved-mfa"]
 version = "institution-approved-version-required"
 text_file = "institution-approved-health-notice.txt"
 validity_seconds = 86400
+# If [chat] is enabled, this notice MUST disclose that questions are sent to
+# the institution-configured retrieval/model service. It still must not claim
+# hospital record access unless that is separately implemented and approved.
+
+# OPTIONAL patient question answering. Omit the whole section to keep the UI
+# in records-only mode. The endpoint must be a bare loopback http(s) origin;
+# the browser never receives it. Production should point this at an internal
+# authenticated RAG service, not the unsafe-local-demo legacy app.
+# [chat]
+# base_url = "http://127.0.0.1:8001"
+# timeout_seconds = 120
+# top_k = 6

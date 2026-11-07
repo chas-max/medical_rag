@@ -88,8 +88,8 @@ def test_document_to_answer_flow_and_duplicate_upload():
     assert answer["citations"][0]["filename"] == "guide.md"
     assert upload_and_process(client, files=payload)["result"]["duplicate"] is True
     assert len(store.chunks["guide.md"]) == 1
-    # HyDE、回答规划与生成各调用一次。
-    assert transport.calls == 3
+    # HyDE、纠错重写（单块证据低于反馈阈值后回退原问题）、规划与生成各调用一次。
+    assert transport.calls == 4
 
 
 def test_unrelated_question_abstains_after_optional_hyde():
@@ -99,7 +99,8 @@ def test_unrelated_question_abstains_after_optional_hyde():
     upload_and_process(client, files={"file": ("guide.txt", "高血压患者应规律随访。".encode())})
     result = client.post("/answers", json={"question": "糖尿病"}).json()["data"]
     assert result["abstained"] is True
-    assert transport.calls == 1
+    # HyDE 一次；反馈规则再花一次重写，重写回退成原问题即停，答案模型未被调用。
+    assert transport.calls == 2
 
 
 def test_chunk_endpoint_serves_stored_block_for_citation_display():
@@ -218,3 +219,142 @@ def test_unparsable_model_output_is_reported_as_a_generation_fault_through_the_a
     assert answer["abstain_reason"] == "ABSTAIN_PARSE_ERROR"
     # 正文必须是“生成异常”，而不是把模型输出故障写成资料不足。
     assert "生成异常" in answer["answer"]
+
+# -- dialogue feature flag and answer-version selection ----------------------
+
+import pytest
+
+from medical_rag.dialogue_flags import dialogue_enabled
+from medical_rag.service import selected_answer_version
+from medical_rag.workflow.engine import WorkflowRunResult
+from medical_rag.workflow.repository import WorkflowRepository
+
+DEFAULT_WORKFLOWS = Path(__file__).resolve().parents[1] / "workflows"
+
+
+@pytest.mark.parametrize("enabled,requested,expected", [
+    (False, None, 6), (False, 6, 6), (True, None, 7), (True, 6, 6), (True, 7, 7),
+])
+def test_answer_version_selection(enabled, requested, expected):
+    assert selected_answer_version(enabled, requested) == expected
+
+
+def test_disabled_flag_rejects_explicit_v7():
+    from medical_rag.types import ApiError
+
+    with pytest.raises(ApiError) as caught:
+        selected_answer_version(False, 7)
+    assert caught.value.code == "DIALOGUE_FEATURE_DISABLED"
+
+
+@pytest.mark.parametrize("value,expected", [
+    (None, False), ("true", True), ("1", True), ("TRUE", True),
+    ("false", False), ("0", False), (" False ", False),
+])
+def test_dialogue_flag_reads_only_explicit_spellings(value, expected):
+    environ = {} if value is None else {"DIALOGUE_STATE_ENABLED": value}
+    assert dialogue_enabled(environ) is expected
+
+
+def test_dialogue_flag_rejects_unknown_spelling_without_echoing_it():
+    with pytest.raises(ValueError) as caught:
+        dialogue_enabled({"DIALOGUE_STATE_ENABLED": "yes-please"})
+    assert "yes-please" not in str(caught.value)
+
+
+class RecordingRepository:
+    def __init__(self, definition):
+        self.definition = definition
+        self.calls = []
+
+    def get_published(self, workflow_id):
+        self.calls.append(("published", workflow_id))
+        return self.definition
+
+    def get(self, workflow_id, version=None):
+        self.calls.append(("get", workflow_id, version))
+        return self.definition
+
+
+class StubEngine:
+    async def run(self, definition, inputs, **kwargs):
+        return WorkflowRunResult("run-1", "success",
+                                 {"answer": "合成回答", "citations": [], "abstained": False}, [])
+
+
+def _version_service(enabled):
+    import asyncio
+
+    definition = WorkflowRepository(DEFAULT_WORKFLOWS).get("medical-answer", 6)
+    repository = RecordingRepository(definition)
+    service = RagService(Settings(dialogue_state_enabled=enabled), MemoryStore(), Embedder(),
+                         Reranker(), GroundedGenerator(Transport()))
+    service.repository = repository
+    service.engine = StubEngine()
+    asyncio.run(service.run_workflow("medical-answer", {"question": "高血压", "provider": "qwen"}))
+    return repository.calls
+
+
+def test_disabled_switch_selects_explicit_v6_not_the_latest_published():
+    assert _version_service(False) == [("get", "medical-answer", 6)]
+
+
+def test_enabled_switch_selects_v7():
+    assert _version_service(True) == [("get", "medical-answer", 7)]
+
+
+def test_other_workflows_keep_the_repository_version_semantics():
+    import asyncio
+
+    definition = WorkflowRepository(DEFAULT_WORKFLOWS).get("medical-search", 1)
+    repository = RecordingRepository(definition)
+    service = RagService(Settings(dialogue_state_enabled=True), MemoryStore(), Embedder(),
+                         Reranker(), GroundedGenerator(Transport()))
+    service.repository = repository
+    service.engine = StubEngine()
+    asyncio.run(service.run_workflow("medical-search", {"question": "高血压"}))
+    assert repository.calls == [("published", "medical-search")]
+
+
+# -- ephemeral run slot ------------------------------------------------------
+
+def test_ephemeral_context_run_is_not_cached_or_readable(tmp_path):
+    import asyncio
+
+    from medical_rag.dialogue_models import DialogueRun, DialogueSnapshot
+    from medical_rag.types import ApiError
+
+    definition = WorkflowRepository(DEFAULT_WORKFLOWS).get("medical-answer", 7)
+    WorkflowRepository(tmp_path).save(definition.model_copy(update={"status": "published"}))
+    service = RagService(Settings(dialogue_state_enabled=True), MemoryStore(), Embedder(),
+                         Reranker(), GroundedGenerator(Transport()), workflow_root=tmp_path)
+    service.engine = StubEngine()
+
+    result = asyncio.run(service.run_workflow(
+        "medical-answer", {"question": "糖尿病是由什么引起的？", "provider": "qwen"},
+        dialogue=DialogueRun(DialogueSnapshot()), retain_run=False))
+
+    assert result.status == "success"
+    assert service.runs == {}
+    with pytest.raises(ApiError):
+        service.get_run(result.run_id)
+
+    cached = asyncio.run(service.run_workflow(
+        "medical-answer", {"question": "糖尿病是由什么引起的？", "provider": "qwen"},
+        dialogue=DialogueRun(DialogueSnapshot()), retain_run=True))
+    assert service.get_run(cached.run_id) is cached
+
+def test_disabled_switch_stays_on_v6_even_when_v7_is_published():
+    import asyncio
+
+    v7 = WorkflowRepository(DEFAULT_WORKFLOWS).get("medical-answer", 7).model_copy(
+        update={"status": "published"})
+    repository = RecordingRepository(v7)
+    service = RagService(Settings(dialogue_state_enabled=False), MemoryStore(), Embedder(),
+                         Reranker(), GroundedGenerator(Transport()))
+    service.repository = repository
+    service.engine = StubEngine()
+
+    asyncio.run(service.run_workflow("medical-answer", {"question": "高血压", "provider": "qwen"}))
+
+    assert repository.calls == [("get", "medical-answer", 6)]

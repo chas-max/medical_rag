@@ -36,7 +36,10 @@ from secrets import token_bytes, token_urlsafe
 from urllib.parse import urlsplit
 from uuid import UUID
 
-import httpx
+# Authlib >=1.9 speaks httpx2; mixing its client with an httpx (v1) transport
+# fails inside httpx2 with a type assertion. Keep this module entirely on the
+# same client stack as the OAuth integration.
+import httpx2 as httpx
 from authlib.integrations.httpx_client import AsyncOAuth2Client
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey

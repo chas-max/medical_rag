@@ -11,6 +11,7 @@ export type Identity = {
     identity: boolean;
     health_consent: boolean;
     conversations: boolean;
+    chat: boolean;
     audit: boolean;
     support_self: boolean;
     support_queue: boolean;
@@ -21,11 +22,28 @@ export type Consent = {
   granted: boolean;
   expires_at: string | null;
 };
+export type Citation = {
+  chunk_id: string;
+  filename: string;
+  section: string;
+  page?: number;
+  origin?: string;
+  excerpt?: string;
+};
 export type Row = {
   id: string;
   title?: string;
   content?: string;
+  role: "user" | "assistant";
+  citations: Citation[];
+  /** 服务端权威回答类型；旧记录缺失时按普通回答解释。 */
+  answer_type: "answer" | "clarification";
   created_at: string;
+};
+export type ChatResult = {
+  conversation: Row;
+  answer: Row;
+  abstained: boolean;
 };
 export const roles: Record<string, string> = {
   patient: "患者",
@@ -37,6 +55,55 @@ export const roles: Record<string, string> = {
   auditor: "审计员",
   guardian: "监护人",
 };
+
+const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function citation(value: unknown): Citation {
+  if (
+    !object(value) ||
+    typeof value.chunk_id !== "string" ||
+    !value.chunk_id ||
+    value.chunk_id.length > 256 ||
+    typeof value.filename !== "string" ||
+    !value.filename ||
+    value.filename.length > 512 ||
+    typeof value.section !== "string" ||
+    value.section.length > 512
+  )
+    throw new PatientError();
+  const result: Citation = {
+    chunk_id: value.chunk_id,
+    filename: value.filename,
+    section: value.section,
+  };
+  if (value.page !== undefined) {
+    if (
+      typeof value.page !== "number" ||
+      !Number.isInteger(value.page) ||
+      value.page < 0 ||
+      value.page > 100000
+    )
+      throw new PatientError();
+    result.page = value.page;
+  }
+  if (value.origin !== undefined) {
+    if (typeof value.origin !== "string" || !value.origin || value.origin.length > 32)
+      throw new PatientError();
+    result.origin = value.origin;
+  }
+  if (value.excerpt !== undefined) {
+    if (typeof value.excerpt !== "string" || value.excerpt.length > 2000)
+      throw new PatientError();
+    result.excerpt = value.excerpt;
+  }
+  return result;
+}
+
+function citations(value: unknown): Citation[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 50) throw new PatientError();
+  return value.map(citation);
+}
 
 export function identity(value: unknown): Identity {
   if (
@@ -51,6 +118,7 @@ export function identity(value: unknown): Identity {
     value.permissions.identity !== true ||
     typeof value.permissions.health_consent !== "boolean" ||
     typeof value.permissions.conversations !== "boolean" ||
+    typeof value.permissions.chat !== "boolean" ||
     typeof value.permissions.audit !== "boolean" ||
     typeof value.permissions.support_self !== "boolean" ||
     typeof value.permissions.support_queue !== "boolean"
@@ -71,18 +139,33 @@ export function consent(value: unknown): Consent {
     throw new PatientError();
   return value as Consent;
 }
+function answerType(value: unknown): "answer" | "clarification" {
+  if (value === undefined || value === "answer") return "answer";
+  if (value === "clarification") return value;
+  throw new PatientError();
+}
+
 export function row(value: unknown, field: "title" | "content"): Row {
   if (
     !object(value) ||
     typeof value.id !== "string" ||
-    !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
-      value.id,
-    ) ||
+    !uuid.test(value.id) ||
     typeof value[field] !== "string" ||
     typeof value.created_at !== "string"
   )
     throw new PatientError();
-  return value as Row;
+  const role = value.role === undefined ? "user" : value.role;
+  if (role !== "user" && role !== "assistant") throw new PatientError();
+  const result: Row = {
+    id: value.id,
+    role,
+    citations: citations(value.citations),
+    answer_type: answerType(value.answer_type),
+    created_at: value.created_at,
+  };
+  if (field === "title") result.title = value[field] as string;
+  else result.content = value[field] as string;
+  return result;
 }
 export function rows(value: unknown, field: "title" | "content"): Row[] {
   if (
@@ -94,4 +177,18 @@ export function rows(value: unknown, field: "title" | "content"): Row[] {
   )
     throw new PatientError();
   return value.items.map((x) => row(x, field));
+}
+export function chatResult(value: unknown): ChatResult {
+  if (
+    !object(value) ||
+    !("conversation" in value) ||
+    !("answer" in value) ||
+    typeof value.abstained !== "boolean"
+  )
+    throw new PatientError();
+  const conversation = row(value.conversation, "title");
+  const answer = row(value.answer, "content");
+  if (answer.role !== "assistant" || conversation.title === undefined)
+    throw new PatientError();
+  return { conversation, answer, abstained: value.abstained };
 }

@@ -137,7 +137,7 @@ def test_default_graphs_are_valid():
     _, _, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
     for name in ("medical-answer", "medical-search", "document-ingestion"):
-        graph = repository.get(name)
+        graph = repository.get_published(name)
         assert graph.status == "published"
         assert validate_workflow(graph, registry) == []
 
@@ -157,7 +157,7 @@ def test_the_three_pre_retrieval_shapes_all_publish():
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
     for workflow_id in ("medical-answer-expanded", "medical-answer-decompose",
                         "medical-answer-direct", "medical-answer", "medical-search"):
-        graph = repository.get(workflow_id)
+        graph = repository.get_published(workflow_id)
         assert graph.status == "published", workflow_id
         assert validate_workflow(graph, registry) == [], workflow_id
 
@@ -216,7 +216,7 @@ def test_reranker_outage_abstains_instead_of_answering_from_unrelated_chunks():
     registry = build_registry(store, Embedder(), BgeReranker(model=Unavailable()),
                               GroundedGenerator(transport), Settings())
     graph = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows").get(
-        "medical-answer")
+        "medical-answer", 6)
 
     result = asyncio.run(WorkflowEngine(registry).run(
         graph, {"question": "高血压如何随访", "provider": "qwen", "top_k": 5}))
@@ -245,7 +245,7 @@ def test_explicit_fail_open_only_answers_from_high_coverage_lexical_evidence():
                               GroundedGenerator(transport),
                               Settings(rerank_fail_closed=False))
     graph = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows").get(
-        "medical-answer")
+        "medical-answer", 6)
 
     result = asyncio.run(WorkflowEngine(registry).run(
         graph, {"question": "高血压如何随访", "provider": "qwen", "top_k": 5}))
@@ -276,7 +276,7 @@ def test_routing_is_a_graph_property_not_a_node_implementation():
 
 
 def test_document_to_answer_workflow_and_duplicate():
-    store, transport, registry = setup()
+    _store, transport, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
     engine = WorkflowEngine(registry)
     ingestion = repository.get("document-ingestion")
@@ -286,25 +286,28 @@ def test_document_to_answer_workflow_and_duplicate():
     assert first.output["duplicate"] is False
     second = asyncio.run(engine.run(ingestion, inputs))
     assert second.output["duplicate"] is True
-    answer = asyncio.run(engine.run(repository.get("medical-answer"), {
+    answer = asyncio.run(engine.run(repository.get("medical-answer", 6), {
         "question": "高血压", "provider": "qwen", "top_k": 5}))
     assert answer.output["abstained"] is False
     assert answer.output["citations"][0]["filename"] == "guide.md"
-    # HyDE、回答规划和生成各一次。
-    assert transport.calls == 3
+    # HyDE、纠错重写（证据只有 1 块，低于反馈阈值后回退原问题）、规划与生成各一次。
+    assert transport.calls == 4
 
 
 def test_no_evidence_skips_model_and_returns_abstention():
     _, transport, registry = setup()
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 6), {
         "question": "未知", "provider": "qwen", "top_k": 5}))
     assert result.output["abstained"] is True
     assert result.output["answer"].startswith("现有资料不足")
     # 规划节点接的是门控证据：门控拒答时规划一并剪掉，不浪费一次模型调用。
     assert result.trace_by_node("plan").status == "skipped"
     assert result.trace_by_node("llm").status == "skipped"
-    assert transport.calls == 1
+    # 反馈规则只多花一次重写（重写回退成原问题即停），答案模型仍然一次都没调。
+    assert result.trace_by_node("corrective").status == "success"
+    assert result.trace_by_node("corrective").metadata["corrective"]["stop_reason"] == "unchanged_query"
+    assert transport.calls == 2
 
 
 def test_planned_graph_answers_through_the_planning_node():
@@ -328,7 +331,7 @@ def test_planned_graph_answers_through_the_planning_node():
     registry = build_registry(store, Embedder(), Reranker(),
                               GroundedGenerator(RecordingTransport()), Settings())
     graph = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows").get(
-        "medical-answer")
+        "medical-answer", 6)
 
     result = asyncio.run(WorkflowEngine(registry).run(graph, {
         "question": "高血压", "top_k": 5}))
@@ -355,9 +358,9 @@ def test_default_graph_answers_from_web_when_retrieval_misses():
     generator = GroundedGenerator(transport, ToolRegistry([tavily_search_tool(search)]))
     registry = build_registry(store, Embedder(), Reranker(), generator, Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    graph = repository.get("medical-answer")
+    graph = repository.get("medical-answer", 6)
 
-    assert (graph.version, graph.status) == (3, "published")
+    assert (graph.version, graph.status) == (6, "published")
     assert validate_workflow(graph, registry) == []
     engine = WorkflowEngine(registry, {CAPABILITY_WEB_SEARCH: True})
     result = asyncio.run(engine.run(graph, {"question": "未知", "provider": "qwen", "top_k": 5}))
@@ -370,8 +373,8 @@ def test_default_graph_answers_from_web_when_retrieval_misses():
     assert result.output["citations"] == [{"chunk_id": "web-x", "filename": "随访指引",
                                            "section": "https://example.org/guide", "page": None,
                                            "excerpt": "应每月随访一次", "origin": "web"}]
-    # 门控放行空证据后交给生成兜底：规划先用一次 complete，生成再走 agent 轮次。
-    assert (transport.complete_calls, transport.chat_calls) == (2, 1)
+    # 门控放行空证据后交给生成兜底：纠错重写一次 complete，规划一次，生成再走 agent 轮次。
+    assert (transport.complete_calls, transport.chat_calls) == (3, 1)
 
 
 def test_published_history_keeps_its_own_evidence_wiring():
@@ -403,7 +406,7 @@ def test_invalid_citation_from_workflow_abstains():
         validate = GroundedGenerator(Transport()).validate
     registry = build_registry(store, Embedder(), Reranker(), MaliciousGenerator(), Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 6), {
         "question": "高血压", "provider": "qwen", "top_k": 5}))
     assert result.output["abstained"] is True
     assert result.output["citations"] == []
@@ -427,7 +430,7 @@ def test_workflow_output_exposes_analysis_without_changing_the_verified_answer()
     registry = build_registry(store, Embedder(), Reranker(),
                               GroundedGenerator(AnalysisTransport()), Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 6), {
         "question": "高血压", "provider": "qwen", "top_k": 5}))
 
     assert result.status == "success"
@@ -497,7 +500,7 @@ def test_draft_node_without_a_streaming_generator_stays_off_the_wire():
 
 
 def test_rrf_fuses_duplicate_chunks():
-    store, _, registry = setup()
+    _, _, registry = setup()
     chunk = Chunk("same", "d", "guide.md", "高血压", "guide.md", "", None, 0)
     result = asyncio.run(registry.get("retrieval.rrf").execute({
         "sources": [[Evidence(chunk, 0.7)], [Evidence(chunk, 0.9)]]},
@@ -583,7 +586,7 @@ def test_truncated_model_output_is_traced_as_truncation_not_evidence_shortage():
     store.chunks = [Chunk("c1", "d1", "guide.md", "高血压应规律随访。", "guide.md", "", 1, 0)]
     registry = build_registry(store, Embedder(), Reranker(), TruncatedGenerator(), Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 6), {
         "question": "高血压", "provider": "qwen", "top_k": 5}))
 
     assert result.output["abstained"] is True
@@ -610,7 +613,7 @@ def test_unanchored_draft_is_never_traced_as_an_evidence_shortage():
     store.chunks = [Chunk("c1", "d1", "guide.md", "高血压应规律随访。", "guide.md", "", 1, 0)]
     registry = build_registry(store, Embedder(), Reranker(), UnanchoredGenerator(), Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 6), {
         "question": "高血压", "provider": "qwen", "top_k": 5}))
 
     assert result.output["abstain_reason"] == "ABSTAIN_UNANCHORED"
@@ -632,7 +635,7 @@ def test_numeric_mismatch_is_filtered_and_traced_by_the_published_workflow():
     store.chunks = [Chunk("c1", "d1", "guide.md", "高血压每日30mg。", "guide.md", "", 1, 0)]
     registry = build_registry(store, Embedder(), Reranker(), NumericGenerator(), Settings())
     repository = WorkflowRepository(Path(__file__).resolve().parents[1] / "workflows")
-    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer"), {
+    result = asyncio.run(WorkflowEngine(registry).run(repository.get("medical-answer", 6), {
         "question": "高血压", "provider": "qwen", "top_k": 5}))
 
     assert result.output["abstained"] is True

@@ -17,6 +17,7 @@ const identity = {
   permissions: {
     identity: true,
     health_consent: true,
+    chat: true,
     conversations: true,
     audit: false,
     support_self: true,
@@ -86,8 +87,13 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 const open = async (name: string) => {
-  await screen.findByRole("button", { name });
-  fireEvent.click(screen.getByRole("button", { name }));
+  let target = screen.queryByRole("button", { name });
+  if (!target) {
+    // Account-only actions live behind the bottom-left avatar menu.
+    fireEvent.click(await screen.findByRole("button", { name: "账户菜单" }));
+    target = await screen.findByRole("button", { name });
+  }
+  fireEvent.click(target);
 };
 const auditItem = {
   id: item.id,
@@ -106,6 +112,7 @@ const auditorIdentity = {
   permissions: {
     identity: true,
     health_consent: false,
+    chat: true,
     conversations: false,
     audit: true,
     support_self: true,
@@ -171,7 +178,7 @@ it("discards delayed audit metadata on logout and keeps audit503 logout terminal
   render(<PatientApp />);
   await open("安全审计");
   await waitFor(() => expect(calls).toContain("/audit?limit=20&offset=0"));
-  fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
+  await open("退出登录");
   expect(await screen.findByText("服务暂不可用，请重试。")).toBeInTheDocument();
   await act(async () =>
     resolveAudit({ items: [auditItem], limit: 20, offset: 0 }),
@@ -207,6 +214,7 @@ it("loads identity, translates roles, keeps staff and unverified paths closed", 
           permissions: {
             identity: true,
             health_consent: false,
+            chat: true,
             conversations: false,
             audit: false,
             support_self: true,
@@ -214,7 +222,8 @@ it("loads identity, translates roles, keeps staff and unverified paths closed", 
           },
         };
   render(<PatientApp />);
-  expect(await screen.findByText("account-own")).toBeInTheDocument();
+  await open("我的身份");
+  expect(await screen.findAllByText("account-own")).not.toHaveLength(0);
   expect(screen.getByText(/管理身份不授予/)).toBeInTheDocument();
   expect(
     screen.queryByRole("button", { name: "会话记录" }),
@@ -231,6 +240,7 @@ it("explicit forbidden hash shows 403 without fetching sensitive content", async
           permissions: {
             identity: true,
             health_consent: false,
+            chat: true,
             conversations: false,
             audit: false,
             support_self: true,
@@ -240,6 +250,53 @@ it("explicit forbidden hash shows 403 without fetching sensitive content", async
   render(<PatientApp />);
   expect(await screen.findByText(/403/)).toBeInTheDocument();
   expect(calls).toEqual(["/auth/session", "/me"]);
+});
+it("lands on the question surface and reveals account facts from the avatar menu", async () => {
+  render(<PatientApp />);
+  expect(await screen.findByLabelText("输入消息")).toBeInTheDocument();
+  expect(screen.queryByRole("dialog", { name: "账户信息" })).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "账户菜单" }));
+  const dialog = await screen.findByRole("dialog", { name: "账户信息" });
+  expect(dialog).toHaveTextContent("account-own");
+  expect(dialog).toHaveTextContent("institution-own");
+  expect(dialog).toHaveTextContent("已核验");
+  fireEvent.keyDown(document, { key: "Escape" });
+  await waitFor(() =>
+    expect(
+      screen.queryByRole("dialog", { name: "账户信息" }),
+    ).not.toBeInTheDocument(),
+  );
+});
+it("without conversation permission shows the consent gate instead of fetching records", async () => {
+  handler = (url) =>
+    url === "/auth/session"
+      ? { ...identity, csrf_token: "csrf" }
+      : url === "/me"
+        ? {
+            ...identity,
+            permissions: {
+              identity: true,
+              health_consent: true,
+              chat: true,
+              conversations: false,
+              audit: false,
+              support_self: true,
+              support_queue: false,
+            },
+          }
+        : url.includes("consents")
+          ? notice
+          : identity;
+  render(<PatientApp />);
+  expect(
+    await screen.findByRole("heading", { name: "需要健康信息授权" }),
+  ).toBeInTheDocument();
+  expect(
+    screen.queryByRole("button", { name: "会话记录" }),
+  ).not.toBeInTheDocument();
+  expect(calls).toEqual(["/auth/session", "/me"]);
+  await open("前往健康信息授权");
+  expect(await screen.findByText(notice.notice.text)).toBeInTheDocument();
 });
 it("requires unchecked acknowledgment and submits exact version+CSRF, then refreshes authority", async () => {
   render(<PatientApp />);
@@ -262,23 +319,42 @@ it("requires unchecked acknowledgment and submits exact version+CSRF, then refre
   );
   expect(document.querySelector("script")).toBeNull();
 });
-it("lists/selects/paginates, creates and appends only plain records; duplicates disabled", async () => {
+const citation = {
+  chunk_id: "c1",
+  filename: "指南.pdf",
+  section: "第一章",
+  page: 3,
+  origin: "knowledge_base",
+};
+const answerRow = (content: string, sources = [citation]) => ({
+  id: "00000000-0000-0000-0000-000000000002",
+  content,
+  role: "assistant",
+  citations: sources,
+  created_at: item.created_at,
+});
+const chatReply = (title: string, content: string) => ({
+  conversation: { ...item, title },
+  answer: answerRow(content),
+  abstained: false,
+});
+it("selects a conversation, asks through the answer route and shows citations", async () => {
   const original = handler;
-  let appended = false;
+  let asked = false;
   handler = (url, init) =>
-    init.method === "POST"
-      ? url.includes("turns")
-        ? ((appended = true),
-          {
-            id: "00000000-0000-0000-0000-000000000002",
-            content: "新记录",
-            created_at: item.created_at,
-          })
-        : { ...item, id: "00000000-0000-0000-0000-000000000003" }
-      : url.includes("turns") && appended
+    init.method === "POST" && url === "/chat"
+      ? ((asked = true), chatReply("私密标题", "回答[c1]"))
+      : url.includes("turns") && asked
         ? {
             items: [
-              { id: item.id, content: "新记录", created_at: item.created_at },
+              {
+                id: item.id,
+                content: "我的问题",
+                role: "user",
+                citations: [],
+                created_at: item.created_at,
+              },
+              answerRow("回答[c1]"),
             ],
             limit: 20,
             offset: 0,
@@ -288,27 +364,138 @@ it("lists/selects/paginates, creates and appends only plain records; duplicates 
   await open("会话记录");
   await open("私密标题");
   expect(await screen.findByText("私密记录")).toBeInTheDocument();
-  fireEvent.change(screen.getByLabelText("记录内容"), {
-    target: { value: "新记录" },
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "我的问题" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
-  await screen.findByText("新记录");
-  fireEvent.change(screen.getByLabelText("会话标题"), {
-    target: { value: "新标题" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "创建会话" }));
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
   await waitFor(() =>
     expect(fetch).toHaveBeenCalledWith(
-      "/conversations",
-      expect.objectContaining({ body: JSON.stringify({ title: "新标题" }) }),
+      "/chat",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ conversation_id: item.id, question: "我的问题" }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": "csrf-memory",
+        },
+      }),
     ),
   );
+  expect(await screen.findByText("回答[1]")).toBeInTheDocument();
+  expect(screen.getByText(/指南\.pdf/)).toBeInTheDocument();
+  expect(screen.getByText(/第一章/)).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "下一页会话" }));
   await waitFor(() =>
     expect(calls).toContain("/conversations?limit=20&offset=20"),
   );
   fireEvent.click(screen.getByRole("button", { name: "上一页会话" }));
   expect(window.location.href).not.toContain(item.id);
+});
+it("creates a conversation from the first question using only its title and CSRF", async () => {
+  const original = handler;
+  let asked = false;
+  handler = (url, init) =>
+    init.method === "POST" && url === "/chat"
+      ? ((asked = true), chatReply("我的第一个问题", "回答"))
+      : asked
+        ? url.startsWith("/conversations?")
+          ? {
+              items: [{ ...item, title: "我的第一个问题" }],
+              limit: 20,
+              offset: 0,
+            }
+          : {
+              items: [
+                {
+                  id: item.id,
+                  content: "我的第一个问题",
+                  role: "user",
+                  citations: [],
+                  created_at: item.created_at,
+                },
+                answerRow("回答"),
+              ],
+              limit: 20,
+              offset: 0,
+            }
+        : original(url, init);
+  render(<PatientApp />);
+  fireEvent.change(await screen.findByLabelText("输入消息"), {
+    target: { value: "我的第一个问题" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      "/chat",
+      expect.objectContaining({
+        body: JSON.stringify({ conversation_id: null, question: "我的第一个问题" }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": "csrf-memory",
+        },
+      }),
+    ),
+  );
+  expect(
+    await screen.findAllByText("我的第一个问题"),
+  ).not.toHaveLength(0);
+});
+it("keeps the conversation and offers retry when answering is unavailable", async () => {
+  const original = handler;
+  handler = (url, init) =>
+    init.method === "POST" && url === "/chat"
+      ? new Response("upstream-private", { status: 503 })
+      : original(url, init);
+  render(<PatientApp />);
+  await open("私密标题");
+  expect(await screen.findByText("私密记录")).toBeInTheDocument();
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "我的问题" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent(
+    "问答服务暂不可用",
+  );
+  expect(screen.getByText("私密记录")).toBeInTheDocument();
+  expect(screen.getByDisplayValue("我的问题")).toBeInTheDocument();
+  expect(
+    screen.queryByText("正在检索公开资料并生成回答…"),
+  ).not.toBeInTheDocument();
+  expect(document.body.textContent).not.toContain("upstream-private");
+});
+it("records only when the answer service is not configured", async () => {
+  const original = handler;
+  const noChat = {
+    ...identity,
+    permissions: { ...identity.permissions, chat: false },
+  };
+  let recorded = false;
+  handler = (url, init) =>
+    url === "/auth/session"
+      ? { ...noChat, csrf_token: "csrf-memory" }
+      : url === "/me"
+        ? noChat
+        : init.method === "POST"
+          ? url === "/conversations"
+            ? ((recorded = true), { ...item, title: "记录" })
+            : {
+                id: "00000000-0000-0000-0000-000000000005",
+                content: "记录",
+                role: "user",
+                citations: [],
+                created_at: item.created_at,
+              }
+          : original(url, init);
+  render(<PatientApp />);
+  expect(
+    await screen.findAllByText(/当前未配置问答服务/),
+  ).not.toHaveLength(0);
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "记录" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  await waitFor(() => expect(recorded).toBe(true));
+  expect(fetch).not.toHaveBeenCalledWith("/chat", expect.anything());
 });
 it("logout clears sensitive state synchronously and rejects delayed old replies", async () => {
   let resolve!: (value: unknown) => void;
@@ -378,7 +565,7 @@ it("blur clears drafts/content; focus reauthenticates before content", async () 
   render(<PatientApp />);
   await open("会话记录");
   await screen.findByText("私密标题");
-  fireEvent.change(screen.getByLabelText("会话标题"), {
+  fireEvent.change(screen.getByLabelText("输入消息"), {
     target: { value: "私密草稿" },
   });
   fireEvent.blur(window);
@@ -398,34 +585,24 @@ it("network unavailable offers safe retry and never persists patient data", asyn
   expect(storage).not.toHaveBeenCalled();
   expect(screen.getByRole("button", { name: "重试" })).toBeInTheDocument();
 });
-it("locks selection during mutation and reloads real server pages after create/append", async () => {
+it("locks the thread during send and renders the canonical server page", async () => {
   let release!: (data: unknown) => void;
   const original = handler;
-  let created = false,
-    appended = false;
+  let answered = false;
   handler = (url, init) => {
-    if (init.method === "POST")
+    if (init.method === "POST" && url === "/chat")
       return new Promise((resolve) => {
         release = resolve;
       });
-    if (url.startsWith("/conversations?") && created)
+    if (url.includes("turns") && answered)
       return {
-        items: [{ ...item, title: "服务器第一页" }],
-        limit: 20,
-        offset: 0,
-      };
-    if (url.includes("turns") && appended)
-      return {
-        items: [
-          { id: item.id, content: "服务器记录页", created_at: item.created_at },
-        ],
+        items: [answerRow("服务器记录页", [])],
         limit: 20,
         offset: 0,
       };
     return original(url, init);
   };
   render(<PatientApp />);
-  await open("会话记录");
   await open("私密标题");
   await screen.findByText("私密记录");
   fireEvent.click(screen.getByRole("button", { name: "下一页记录" }));
@@ -434,33 +611,21 @@ it("locks selection during mutation and reloads real server pages after create/a
       `/conversations/${item.id}/turns?limit=20&offset=20`,
     ),
   );
-  fireEvent.change(screen.getByLabelText("记录内容"), {
+  fireEvent.change(screen.getByLabelText("输入消息"), {
     target: { value: "new" },
   });
-  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  expect(
+    screen.getByText("正在检索公开资料并生成回答…"),
+  ).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "私密标题" })).toBeDisabled();
   expect(screen.getByRole("button", { name: "会话记录" })).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "保存记录" }));
-  expect(calls.filter((x) => x.endsWith("/turns"))).toHaveLength(1);
-  appended = true;
-  await act(async () =>
-    release({ id: item.id, content: "new", created_at: item.created_at }),
-  );
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+  expect(calls.filter((x) => x === "/chat")).toHaveLength(1);
+  answered = true;
+  await act(async () => release(chatReply("私密标题", "新回答")));
   await screen.findByText("服务器记录页");
   expect(screen.getByRole("button", { name: "上一页记录" })).toBeDisabled();
-  fireEvent.click(screen.getByRole("button", { name: "下一页会话" }));
-  await waitFor(() =>
-    expect(calls).toContain("/conversations?limit=20&offset=20"),
-  );
-  fireEvent.change(screen.getByLabelText("会话标题"), {
-    target: { value: "new" },
-  });
-  fireEvent.click(screen.getByRole("button", { name: "创建会话" }));
-  created = true;
-  await act(async () => release({ ...item, title: "new" }));
-  await screen.findByRole("button", { name: "服务器第一页" });
-  expect(screen.getByRole("button", { name: "上一页会话" })).toBeDisabled();
-  expect(screen.queryByText("new")).not.toBeInTheDocument();
 });
 it.each(["session", "identity", "notice", "page", "row"])(
   "rejects malformed %s data without echo",
@@ -486,7 +651,8 @@ it.each(["session", "identity", "notice", "page", "row"])(
                 : original(url, init);
     render(<PatientApp />);
     if (kind === "notice") await open("健康信息授权");
-    if (kind === "page" || kind === "row") await open("会话记录");
+    // The conversation list is the landing surface, so malformed page/row
+    // data fails closed before any navigation is available.
     await screen.findByText("服务暂不可用，请重试。");
     expect(document.body.textContent).not.toContain("secret");
   },
@@ -505,6 +671,7 @@ it("successful withdrawal reauthenticates and no longer offers conversations", a
         permissions: {
           identity: true,
           health_consent: true,
+          chat: true,
           conversations: false,
           audit: false,
           support_self: true,
@@ -522,7 +689,7 @@ it("successful withdrawal reauthenticates and no longer offers conversations", a
     screen.queryByRole("button", { name: "会话记录" }),
   ).not.toBeInTheDocument();
   await open("我的身份");
-  expect(await screen.findByText("account-own")).toBeInTheDocument();
+  expect(await screen.findAllByText("account-own")).not.toHaveLength(0);
 });
 it("visibility hiding rejects late old page responses and rechecks on return", async () => {
   const original = handler;
@@ -575,6 +742,7 @@ it.each(["logout", "withdraw"] as const)(
           permissions: {
             identity: true,
             health_consent: true,
+            chat: true,
             conversations: false,
             audit: false,
             support_self: true,
@@ -713,6 +881,7 @@ it.each(["logout", "withdraw"] as const)(
           permissions: {
             identity: true,
             health_consent: true,
+            chat: true,
             conversations: false,
             audit: false,
             support_self: true,
@@ -754,19 +923,18 @@ it.each(["logout", "withdraw"] as const)(
 );
 
 it.each(["initial-turns", "page-turns", "initial-list", "page-list"])(
-  "old %s cannot overwrite post-mutation page",
+  "old %s cannot overwrite the post-send page",
   async (kind) => {
     const original = handler;
     let release!: (value: unknown) => void;
     let saved = false,
-      initialHeld = false;
+      held = false,
+      eligible = false;
     const turn = kind.includes("turns");
     handler = (url, init) => {
-      if (init.method === "POST") {
+      if (init.method === "POST" && url === "/chat") {
         saved = true;
-        return turn
-          ? { id: item.id, content: "新保存记录", created_at: item.created_at }
-          : { ...item, title: "新保存标题" };
+        return chatReply("新保存标题", "新保存记录");
       }
       const relevant = turn
         ? url.includes("turns?")
@@ -775,42 +943,44 @@ it.each(["initial-turns", "page-turns", "initial-list", "page-list"])(
         return {
           items: [
             turn
-              ? {
-                  id: item.id,
-                  content: "新保存记录",
-                  created_at: item.created_at,
-                }
+              ? answerRow("新保存记录", [])
               : { ...item, title: "新保存标题" },
           ],
           limit: 20,
           offset: 0,
         };
-      if (
-        relevant &&
-        ((kind.startsWith("initial") && !initialHeld) ||
-          url.endsWith("offset=20"))
-      ) {
-        initialHeld = true;
-        return new Promise((r) => (release = r));
+      if (relevant && !held) {
+        const shouldHold =
+          url.endsWith("offset=20") ||
+          (turn && kind === "initial-turns") ||
+          (!turn && kind === "initial-list" && eligible);
+        if (shouldHold) {
+          held = true;
+          return new Promise((r) => (release = r));
+        }
       }
       return original(url, init);
     };
     render(<PatientApp />);
-    await open("会话记录");
-    if (turn) await open("私密标题");
-    if (kind === "page-turns") {
-      await screen.findByText("私密记录");
-      await open("下一页记录");
-    }
-    if (kind === "page-list") {
+    if (turn) {
+      await open("私密标题");
+      if (kind === "page-turns") {
+        await screen.findByText("私密记录");
+        await open("下一页记录");
+      }
+    } else if (kind === "initial-list") {
+      await screen.findByText("私密标题");
+      eligible = true;
+      await open("会话记录");
+    } else {
       await screen.findByText("私密标题");
       await open("下一页会话");
     }
-    fireEvent.change(screen.getByLabelText(turn ? "记录内容" : "会话标题"), {
+    fireEvent.change(screen.getByLabelText("输入消息"), {
       target: { value: "new" },
     });
-    await open(turn ? "保存记录" : "创建会话");
-    await screen.findByText(turn ? "新保存记录" : "新保存标题");
+    fireEvent.click(screen.getByRole("button", { name: "发送" }));
+    await screen.findAllByText(turn ? "新保存记录" : "新保存标题");
     await act(async () =>
       release({
         items: [
@@ -823,8 +993,8 @@ it.each(["initial-turns", "page-turns", "initial-list", "page-list"])(
       }),
     );
     expect(
-      screen.getByText(turn ? "新保存记录" : "新保存标题"),
-    ).toBeInTheDocument();
+      screen.getAllByText(turn ? "新保存记录" : "新保存标题"),
+    ).not.toHaveLength(0);
     expect(screen.queryByText("旧响应")).not.toBeInTheDocument();
   },
 );
@@ -849,4 +1019,119 @@ it("initially unfocused window waits for actual focus", async () => {
   expect(screen.getByText(/页面已锁定/)).toBeInTheDocument();
   fireEvent.focus(window);
   await screen.findByText("account-own");
+});
+
+it("renders a clarification as a plain answer and keeps the composer usable", async () => {
+  const original = handler;
+  let asked = false;
+  handler = (url, init) => {
+    if (init.method === "POST" && url === "/chat") {
+      asked = true;
+      return {
+        conversation: { ...item, title: "私密标题" },
+        answer: {
+          ...answerRow("你指的是 高血压，还是 糖尿病？", []),
+          answer_type: "clarification",
+        },
+        abstained: false,
+        answer_type: "clarification",
+      };
+    }
+    if (url.includes("turns") && asked)
+      return {
+        items: [
+          {
+            id: item.id,
+            content: "它是什么引起的？",
+            role: "user",
+            citations: [],
+            answer_type: "answer",
+            created_at: item.created_at,
+          },
+          {
+            ...answerRow("你指的是 高血压，还是 糖尿病？", []),
+            answer_type: "clarification",
+          },
+        ],
+        limit: 20,
+        offset: 0,
+      };
+    return original(url, init);
+  };
+  render(<PatientApp />);
+  await open("会话记录");
+  await open("私密标题");
+  await screen.findByText("私密记录");
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "它是什么引起的？" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(
+    await screen.findByText("你指的是 高血压，还是 糖尿病？"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("证据不足")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("输入消息")).toBeEnabled();
+  expect(screen.getByRole("button", { name: /私密标题/ })).toBeInTheDocument();
+});
+
+it("keeps the question and conversation after a stale-context conflict", async () => {
+  const original = handler;
+  handler = (url, init) =>
+    init.method === "POST" && url === "/chat"
+      ? new Response(
+          JSON.stringify({
+            success: false,
+            data: null,
+            error: {
+              code: "CONVERSATION_CONTEXT_CHANGED",
+              message: "会话已更新，请重新发送问题。",
+            },
+          }),
+          { status: 409 },
+        )
+      : original(url, init);
+  render(<PatientApp />);
+  await open("会话记录");
+  await open("私密标题");
+  await screen.findByText("私密记录");
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "新问题" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  expect(
+    await screen.findByText("会话已更新，请重新发送问题。"),
+  ).toBeInTheDocument();
+  // 冲突只能提示重新发送，不能自动重放旧答案。
+  expect(calls.filter((url) => url === "/chat")).toHaveLength(1);
+  expect(screen.getByRole("button", { name: /私密标题/ })).toBeInTheDocument();
+});
+
+it("keeps the clarification kind after reloading the turn list", async () => {
+  const original = handler;
+  handler = (url, init) => {
+    if (url.includes("turns"))
+      return {
+        items: [
+          {
+            id: item.id,
+            content: "请补充具体讨论对象。",
+            role: "assistant",
+            citations: [],
+            answer_type: "clarification",
+            created_at: item.created_at,
+          },
+        ],
+        limit: 20,
+        offset: 0,
+      };
+    return original(url, init);
+  };
+  render(<PatientApp />);
+  await open("会话记录");
+  await open("私密标题");
+
+  expect(await screen.findByText("请补充具体讨论对象。")).toBeInTheDocument();
+  expect(screen.queryByText("证据不足")).not.toBeInTheDocument();
 });

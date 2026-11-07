@@ -9,7 +9,7 @@ from hashlib import sha256
 from threading import Event as ThreadEvent
 from uuid import UUID, uuid4
 
-import httpx
+import httpx2 as httpx
 import jwt
 import psycopg
 import pytest

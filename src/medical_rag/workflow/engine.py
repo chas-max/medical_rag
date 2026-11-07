@@ -55,6 +55,9 @@ class WorkflowEngine:
         emit: StreamEmitter | None = None,
         memory_context: str = "",
         run_id: str | None = None,
+        short_term: object | None = None,
+        conversation_id: str = "",
+        dialogue: object | None = None,
     ) -> WorkflowRunResult:
         run_id = run_id or uuid4().hex
         context = ExecutionContext(
@@ -64,6 +67,9 @@ class WorkflowEngine:
             capabilities=dict(self.capabilities),
             emit=emit,
             memory_context=memory_context,
+            short_term=short_term,
+            conversation_id=conversation_id,
+            dialogue=dialogue,
         )
         runtime = context.variables.get("_agent_runtime")
         if isinstance(runtime, AgentRuntime):

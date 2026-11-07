@@ -36,6 +36,8 @@ medical-rag-resume/
 src/medical_rag/
 ├─ 应用入口与聊天
 │  ├─ api.py, chat_api.py, service.py, chat_runtime.py, chat_history.py
+│  ├─ short_term.py, summarize.py, conversation_index.py
+│  ├─ dialogue_models.py, dialogue_state.py, dialogue_flags.py, dialogue_evaluation.py
 │  └─ streaming.py, types.py
 ├─ 检索与 RAG
 │  ├─ retrieval.py, generation.py, embeddings.py, lexical.py
@@ -54,6 +56,7 @@ src/medical_rag/
 │  ├─ provider_tls.py, provider_logout.py
 │  ├─ access_policy.py, consent_policy.py
 │  ├─ patient_api.py, patient_service.py, patient_repository.py
+│  ├─ patient_chat.py, patient_dialogue.py
 │  ├─ patient_gateway.py
 │  └─ support_service.py
 ├─ 配置与设置
@@ -108,7 +111,7 @@ frontend/
 
 ```text
 database/
-├─ migrations/0001…0007_*.sql   患者隔离/身份/MFA/撤权/支持请求迁移
+├─ migrations/0001…0008_*.sql   患者隔离/身份/MFA/撤权/支持/问答迁移
 └─ patient_runtime_grants.sql   非所有者运行角色的最小授权配方
 
 deploy/

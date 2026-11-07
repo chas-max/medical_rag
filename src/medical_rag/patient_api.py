@@ -17,7 +17,10 @@ from pydantic import (
 from starlette.concurrency import run_in_threadpool
 
 from .oidc_login import OIDCLogin, _cookie, create_auth_app
+from .patient_chat import ChatUnavailable
+from .patient_dialogue import ConversationContextChanged
 from .patient_service import (
+    ChatAnswerer,
     HealthNotice,
     JsonObject,
     PatientDenied,
@@ -51,6 +54,11 @@ class _Conversation(_Body):
 
 class _Turn(_Body):
     content: StrictStr = Field(min_length=1, max_length=16000)
+
+
+class _Ask(_Body):
+    question: StrictStr = Field(min_length=1, max_length=16000)
+    conversation_id: StrictStr | None = None
 
 
 class _SupportCreate(_Body):
@@ -102,11 +110,23 @@ async def _body(request: Request, model: type[BodyT], *, allow_empty: bool = Fal
         raise ValueError("Invalid request") from None
 
 
-def create_patient_app(login: OIDCLogin, notice: HealthNotice, *, patient_html: bool = False) -> FastAPI:
+def create_patient_app(login: OIDCLogin, notice: HealthNotice, *,
+                       patient_html: bool = False,
+                       chat: ChatAnswerer | None = None,
+                       dialogue_state_enabled: bool = False) -> FastAPI:
     """Reuse all headless OIDC cookie, origin and no-store protections."""
-    service = PatientService(login.sessions, notice)
+    service = PatientService(login.sessions, notice, chat,
+                             dialogue_state_enabled=dialogue_state_enabled)
     support = SupportService(login.sessions)
     app = create_auth_app(login, patient_html=patient_html, audit=service.audit)
+
+    @app.exception_handler(ChatUnavailable)
+    async def chat_unavailable(request: Request, error: ChatUnavailable) -> JSONResponse:
+        return _error(503, "CHAT_UNAVAILABLE", "Question answering is unavailable")
+
+    @app.exception_handler(ConversationContextChanged)
+    async def context_changed(request: Request, error: ConversationContextChanged) -> JSONResponse:
+        return _error(409, "CONVERSATION_CONTEXT_CHANGED", "Conversation changed, please resend the question")
 
     @app.exception_handler(SupportDenied)
     async def support_denied(request: Request, error: SupportDenied) -> JSONResponse:
@@ -209,6 +229,16 @@ def create_patient_app(login: OIDCLogin, notice: HealthNotice, *, patient_html: 
         body = await _body(request, _Turn)
         return _ok(await run_in_threadpool(service.append_turn, token, identifier,
                                            csrf_token=csrf, content=body.content))
+
+    @app.post("/chat")
+    async def ask(request: Request) -> JsonObject:
+        token, csrf = await credentials(request, mutation=True)
+        if chat is None:
+            raise ChatUnavailable()
+        body = await _body(request, _Ask)
+        return _ok(await run_in_threadpool(service.ask, token, csrf_token=csrf,
+                                           conversation_id=body.conversation_id,
+                                           question=body.question))
 
     @app.post("/support/cases")
     async def support_create(request: Request) -> JsonObject:

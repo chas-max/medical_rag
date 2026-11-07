@@ -7,13 +7,16 @@ holding shared locks are in flight: withdrawal waits, not stream cancellation.
 This is not institutional identity proofing, clinical or legal acceptance.
 """
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Protocol
 from uuid import UUID, uuid4
 
 from psycopg import Connection
+from psycopg.types.json import Jsonb
 
 from .access_policy import Action, Resource, is_allowed
 from .consent_policy import (
@@ -23,11 +26,28 @@ from .consent_policy import (
     SubjectAge,
     has_current_consent,
 )
+from .dialogue_models import DialogueRun, DialogueSnapshot, Resolution
+from .dialogue_state import can_commit_semantics
 from .identity_sessions import AuthorizedTransaction, SessionStore
+from .patient_chat import ChatUnavailable
+from .patient_dialogue import (
+    ConversationContextChanged,
+    bump_context,
+    commit_state,
+    invalidate_context,
+    read_snapshot,
+)
 from .security_audit import AuditAction, AuditStore
 
 JsonObject = dict[str, object]
 ContentRow = tuple[UUID, str, datetime]
+
+
+class ChatAnswerer(Protocol):
+    """Trusted local answer source; failures are static and carry no text."""
+
+    def answer(self, question: str, *,
+               dialogue: DialogueSnapshot | None = None) -> dict[str, object]: ...
 
 
 class PatientDenied(Exception):
@@ -76,14 +96,76 @@ def _item(row: ContentRow, field: str) -> JsonObject:
     return {"id": str(row[0]), field: row[1], "created_at": row[2].isoformat()}
 
 
+TurnRow = tuple[UUID, str, str, object, str, datetime]
+
+
+def _turn(row: TurnRow) -> JsonObject:
+    turn_id, content, role, citations, answer_type, created = row
+    if not isinstance(citations, list):
+        citations = []
+    return {
+        "id": str(turn_id),
+        "content": content,
+        "role": role,
+        "citations": citations,
+        # Only the answer kind is exposed; internal dialogue state never leaves
+        # the backend.
+        "answer_type": answer_type,
+        "created_at": created.isoformat(),
+    }
+
+
+def _title(question: str) -> str:
+    return " ".join(question.split())[:30] or "新对话"
+
+
+def _citation(value: object) -> JsonObject | None:
+    """Keep only the bounded citation fields the patient UI can render.
+
+    The answerer contract is trusted, but a faulty implementation must not be
+    able to poison stored rows with shapes that make the whole turn page
+    unreadable.
+    """
+    if type(value) is not dict:
+        return None
+    chunk_id, filename = value.get("chunk_id"), value.get("filename")
+    if not isinstance(chunk_id, str) or not 0 < len(chunk_id) <= 256:
+        return None
+    if not isinstance(filename, str) or not 0 < len(filename) <= 512:
+        return None
+    section = value.get("section")
+    citation: JsonObject = {
+        "chunk_id": chunk_id,
+        "filename": filename,
+        "section": section if isinstance(section, str) and len(section) <= 512 else "",
+    }
+    page = value.get("page")
+    if type(page) is int and 0 <= page <= 100000:
+        citation["page"] = page
+    origin = value.get("origin")
+    if isinstance(origin, str) and 0 < len(origin) <= 32:
+        citation["origin"] = origin
+    excerpt = value.get("excerpt")
+    if isinstance(excerpt, str) and 0 < len(excerpt) <= 2000:
+        citation["excerpt"] = excerpt
+    return citation
+
+
 class PatientService:
     """No disconnected repository/snapshot principal may authorize these calls."""
 
-    def __init__(self, sessions: SessionStore, notice: HealthNotice) -> None:
+    def __init__(self, sessions: SessionStore, notice: HealthNotice,
+                 chat: ChatAnswerer | None = None, *,
+                 dialogue_state_enabled: bool = False) -> None:
         if not isinstance(sessions, SessionStore) or type(notice) is not HealthNotice:
             raise ValueError("Trusted session store and health notice required")
+        if chat is not None and not callable(getattr(chat, "answer", None)):
+            raise ValueError("Trusted chat answerer required")
         self.sessions = sessions
         self.notice = notice
+        self.chat = chat
+        # Injected from trusted process configuration only, never a request body.
+        self.dialogue_state_enabled = dialogue_state_enabled
         self.audit = AuditStore(sessions)
 
     def _subject(self, authorized: AuthorizedTransaction, *, exclusive: bool = False,
@@ -155,6 +237,7 @@ class PatientService:
             return {"user_id": principal.user_id, "tenant_id": principal.tenant_id,
                     "roles": sorted(principal.roles), "binding": {"verified": principal.patient_id is not None},
                     "permissions": {"identity": True, "health_consent": eligible, "conversations": current,
+                                    "chat": self.chat is not None,
                                     "support_self": True,
                                     "support_queue": is_allowed(principal, Action.SUPPORT_CASE_MANAGE,
                                                                 Resource(principal.tenant_id)),
@@ -211,6 +294,23 @@ class PatientService:
             raise ResourceMissing()
         return row
 
+    @staticmethod
+    def _locked_conversation(db: Connection, subject: PatientIdentity,
+                             identifier: UUID) -> tuple[ContentRow, int]:
+        """Lock the owned row and return its fresh content version.
+
+        Every content write locks in the same order (identity/consent, then
+        conversation), so an append and an answer cannot interleave versions.
+        """
+        row = db.execute(
+            "SELECT conversation_id,title,created_at,context_version "
+            "FROM medical_rag.conversations "
+            "WHERE tenant_id=%s AND patient_id=%s AND conversation_id=%s FOR UPDATE",
+            (subject.tenant_id, subject.patient_id, identifier)).fetchone()
+        if row is None:
+            raise ResourceMissing()
+        return tuple(row[:3]), int(row[3])
+
     def get_conversation(self, token: str, identifier: str) -> JsonObject:
         conversation_id = _identifier(identifier)
         with self._operation(token, audit_action=AuditAction.CONVERSATION_READ) as (db, subject, _, _):
@@ -221,20 +321,139 @@ class PatientService:
         _text(content, 16000)
         with self._operation(token, audit_action=AuditAction.TURN_APPEND,
                              csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
-            self._conversation(db, subject, conversation_id)
+            self._locked_conversation(db, subject, conversation_id)
             row = db.execute("INSERT INTO medical_rag.conversation_turns "
-                             "(tenant_id,patient_id,conversation_id,turn_id,content) VALUES (%s,%s,%s,%s,%s) "
-                             "RETURNING turn_id,content,created_at",
+                             "(tenant_id,patient_id,conversation_id,turn_id,content,role) "
+                             "VALUES (%s,%s,%s,%s,%s,'user') "
+                             "RETURNING turn_id,content,role,citations,answer_type,created_at",
                              (subject.tenant_id, subject.patient_id, conversation_id, uuid4(), content)).fetchone()
-            return _item(row, "content")
+            # A lone append is a content change, not a completed turn: the version
+            # moves so an in-flight answer is refused instead of landing stale.
+            bump_context(db, subject, conversation_id)
+            return _turn(row)
+
+    def ask(self, token: str, *, csrf_token: str, conversation_id: str | None,
+            question: str) -> JsonObject:
+        """Precheck, answer outside any lock, then persist under fresh consent.
+
+        A short write-permission transaction authorizes and verifies conversation
+        ownership before the question leaves the process. The model call must not
+        hold the patient row lock, so a concurrent withdrawal can complete while
+        the answer is generated. Persistence then re-authorizes in one short
+        transaction: if consent, role, binding, the session or the conversation's
+        content version changed meanwhile, the generated answer is discarded and
+        no turn or state is stored.
+        """
+        if self.chat is None:
+            raise ChatUnavailable()
+        _text(question, 16000)
+        target = None if conversation_id is None else _identifier(conversation_id)
+        snapshot = DialogueSnapshot()
+        # Authorize and check ownership BEFORE any question leaves the process:
+        # an unconsented or foreign request must not reach the model at all.
+        with self._operation(token, audit_action=AuditAction.CHAT_ASK,
+                             csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
+            if target is not None:
+                self._conversation(db, subject, target)
+                if self.dialogue_state_enabled:
+                    snapshot = read_snapshot(db, subject, target)
+        answer = (self.chat.answer(question, dialogue=snapshot)
+                  if self.dialogue_state_enabled else self.chat.answer(question))
+        if type(answer) is not dict:
+            raise ChatUnavailable()
+        content = answer.get("answer")
+        if not isinstance(content, str) or not content.strip() or len(content) > 20000:
+            raise ChatUnavailable()
+        citations = answer.get("citations")
+        safe_citations = []
+        if type(citations) is list:
+            for item in citations[:50]:
+                citation = _citation(item)
+                if citation is not None:
+                    safe_citations.append(citation)
+        citations = safe_citations
+        abstained = answer.get("abstained") is True
+        answer_type = answer.get("answer_type", "answer")
+        if answer_type not in {"answer", "clarification"}:
+            raise ChatUnavailable()
+        with self._operation(token, audit_action=AuditAction.TURN_APPEND,
+                             csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
+            if target is None:
+                conversation = _item(
+                    db.execute("INSERT INTO medical_rag.conversations"
+                               "(tenant_id,patient_id,conversation_id,title) "
+                               "VALUES (%s,%s,%s,%s) RETURNING conversation_id,title,created_at",
+                               (subject.tenant_id, subject.patient_id, uuid4(), _title(question))).fetchone(),
+                    "title")
+                expected = 0
+            else:
+                locked, expected = self._locked_conversation(db, subject, target)
+                conversation = _item(locked, "title")
+                # The version fence only applies to the context-carrying path: with
+                # the switch off there is no snapshot to be stale, and the counter
+                # still advances so a later re-enable notices the gap.
+                if self.dialogue_state_enabled and expected != snapshot.context_version:
+                    raise ConversationContextChanged()
+            target = UUID(str(conversation["id"]))
+            asked = db.execute("INSERT INTO medical_rag.conversation_turns "
+                               "(tenant_id,patient_id,conversation_id,turn_id,content,role) "
+                               "VALUES (%s,%s,%s,%s,%s,'user') "
+                               "RETURNING turn_id,content,role,citations,answer_type,created_at",
+                               (subject.tenant_id, subject.patient_id, target, uuid4(), question)).fetchone()
+            answered = db.execute("INSERT INTO medical_rag.conversation_turns "
+                                  "(tenant_id,patient_id,conversation_id,turn_id,content,role,citations,"
+                                  "answer_type) "
+                                  "VALUES (%s,%s,%s,%s,%s,'assistant',%s,%s) "
+                                  "RETURNING turn_id,content,role,citations,answer_type,created_at",
+                                  (subject.tenant_id, subject.patient_id, target, uuid4(), content,
+                                   Jsonb(citations), answer_type)).fetchone()
+            self._commit_semantics(db, subject, target, snapshot, answer, expected,
+                                   answer_type=answer_type, content=content,
+                                   abstained=abstained, turn_id=asked[0])
+            response: JsonObject = {"conversation": conversation, "question": _turn(asked),
+                                    "answer": _turn(answered), "abstained": abstained,
+                                    "answer_type": answer_type}
+            if isinstance(answer.get("abstain_reason"), str):
+                response["abstain_reason"] = answer["abstain_reason"][:64]
+            return response
+
+    def _commit_semantics(self, db: Connection, subject: PatientIdentity,
+                          conversation_id: UUID, snapshot: DialogueSnapshot, answer: JsonObject,
+                          expected: int, *, answer_type: str, content: str,
+                          abstained: bool, turn_id: UUID) -> None:
+        """Commit the state when this turn really established semantics.
+
+        A clarification stores its candidates; a real answer or a meaningful
+        abstention moves the topic; a technical failure, a cut-off answer or the
+        switch being off only advances the content version.
+        """
+        resolution = answer.get("dialogue_resolution")
+        output = {"answer": content, "abstained": abstained, "answer_type": answer_type,
+                  "abstain_reason": answer.get("abstain_reason")}
+        if not self.dialogue_state_enabled:
+            # No one computed this turn's semantics: keep the content version
+            # moving and mark the derived state for rebuild.
+            invalidate_context(db, subject, conversation_id)
+            return
+        if resolution is not None and can_commit_semantics("success", output):
+            try:
+                validated = Resolution.model_validate_json(
+                    json.dumps(resolution, ensure_ascii=False))
+            except ValueError:
+                raise ChatUnavailable() from None
+            commit_state(db, subject, conversation_id,
+                         DialogueRun(snapshot, validated), turn_id=str(turn_id))
+            return
+        bump_context(db, subject, conversation_id)
 
     def list_turns(self, token: str, identifier: str, *, limit: int = 20, offset: int = 0) -> JsonObject:
         conversation_id = _identifier(identifier)
         _page(limit, offset)
         with self._operation(token, audit_action=AuditAction.TURN_LIST) as (db, subject, _, _):
             self._conversation(db, subject, conversation_id)
-            rows = db.execute("SELECT turn_id,content,created_at FROM medical_rag.conversation_turns "
+            rows = db.execute("SELECT turn_id,content,role,citations,answer_type,created_at "
+                              "FROM medical_rag.conversation_turns "
                               "WHERE tenant_id=%s AND patient_id=%s AND conversation_id=%s "
-                              "ORDER BY created_at,turn_id LIMIT %s OFFSET %s",
+                              "ORDER BY ordinal LIMIT %s OFFSET %s",
                               (subject.tenant_id, subject.patient_id, conversation_id, limit, offset)).fetchall()
-            return {"items": [_item(row, "content") for row in rows], "limit": limit, "offset": offset}
+            return {"items": [_turn(row) for row in rows], "limit": limit, "offset": offset}

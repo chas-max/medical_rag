@@ -201,7 +201,9 @@ async def test_nonagent_workflow_has_unavailable_not_total_model_call_count(tmp_
     service, _ = setup(tmp_path)
     function = getattr(evaluation, "evaluate_workflow_cases", None)
     assert callable(function)
-    report = await function(cases(), service, Judge(), 5, "qwen", "judge", "medical-answer")
+    # Pin v6: the evaluator's subject is the row shape, and v7 needs the dialogue
+    # switch (off by default) plus a structured resolver transport.
+    report = await function(cases(), service, Judge(), 5, "qwen", "judge", "medical-answer", 6)
     row = report["cases"][0]
     assert row["agent_model_calls"] is None and row["retrieval_rounds"] is None
     assert row["agentic"] == [] and row["error"] is None

@@ -9,7 +9,9 @@ from uuid import UUID
 
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
+from .dialogue_flags import dialogue_enabled
 from .oidc_login import LoginConfiguration
+from .patient_chat import ChatClient
 from .patient_service import HealthNotice
 from .signing_keys import validate_key_names
 
@@ -33,6 +35,10 @@ class PatientConfiguration:
     tls_key_file: Path = field(repr=False)
     login: LoginConfiguration = field(repr=False)
     notice: HealthNotice = field(repr=False)
+    chat: ChatClient | None = field(default=None, repr=False)
+    # Read from the operator process environment, never from TOML or the legacy
+    # demo .env file this service deliberately does not load.
+    dialogue_state_enabled: bool = False
 
 
 def _read(path: Path, limit: int) -> bytes:
@@ -69,6 +75,7 @@ def load_configuration(path: Path) -> PatientConfiguration:
             tomllib.loads(_read(path, 65536).decode("utf-8")),
             "tenant_id database_dsn_file transaction_key_file frontend_dist listen_host listen_port "
             "tls_cert_file tls_key_file oidc health_notice",
+            "chat",
         )
         oidc = _keys(
             data["oidc"],
@@ -81,6 +88,17 @@ def load_configuration(path: Path) -> PatientConfiguration:
         if "verification_key_files" in oidc:
             validate_key_names(oidc["verification_key_files"])
         notice = _keys(data["health_notice"], "version text_file validity_seconds")
+        chat = None
+        if "chat" in data:
+            settings = _keys(data["chat"], "base_url timeout_seconds top_k")
+            timeout, top_k = settings["timeout_seconds"], settings["top_k"]
+            if (type(timeout) is not int or not 1 <= timeout <= 300
+                    or type(top_k) is not int or not 1 <= top_k <= 20):
+                raise StartupError()
+            try:
+                chat = ChatClient(_string(settings["base_url"]), timeout, top_k)
+            except ValueError:
+                raise StartupError() from None
 
         def file(value: object) -> Path:
             return (path.parent / _string(value)).resolve(strict=True)
@@ -145,6 +163,8 @@ def load_configuration(path: Path) -> PatientConfiguration:
                 text(notice["text_file"], 65536),
                 notice["validity_seconds"],
             ),
+            chat,
+            dialogue_enabled(),
         )
     except Exception:  # noqa: BLE001 -- secret-bearing parser/crypto errors stay private
         raise StartupError() from None

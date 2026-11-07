@@ -35,7 +35,21 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
     provider = inputs.get("provider") or default_provider
     # 回答规划是可选连线：没接规划节点时 plan 为空，生成提示词保持原样。
     plan = inputs.get("plan", "")
-    memory_options = {"memory_context": context.memory_context} if context.memory_context else {}
+    context_options = {"memory_context": context.memory_context} if context.memory_context else {}
+    short_term = getattr(context, "short_term", None)
+    if short_term:
+        context_options["short_term"] = short_term
+    # Recalled conversation blocks arrive only when rule 2 fired; they stay a
+    # separate field so citation validation keeps seeing retrieved evidence only.
+    history = inputs.get("history")
+    if isinstance(history, list) and history:
+        context_options["history"] = [item for item in history if isinstance(item, dict)]
+    # The raw user words travel beside the resolved question for intent checking
+    # only; every node still executes the complete semantic question.
+    dialogue = getattr(context, "dialogue", None)
+    resolution = getattr(dialogue, "resolution", None) if dialogue is not None else None
+    if resolution is not None and getattr(resolution, "original_question", ""):
+        context_options["original_question"] = resolution.original_question
     emit = context.emit
     if emit is not None:
         # 生成一段带证据的回答要十几到几十秒，先把检索结果数量推给前端，
@@ -55,10 +69,10 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
         # draft() 只有本仓库的生成器提供；缺失时退回旧的 generate_stream 契约，后者只推结论。
         streamer = getattr(generator, "draft", None) or generator.generate_stream
         result = streamer(inputs["question"], inputs["evidence"], provider,
-                          web_search=web_search, on_claim=publish, plan=plan, **memory_options)
+                          web_search=web_search, on_claim=publish, plan=plan, **context_options)
     else:
         result = generator.generate(inputs["question"], inputs["evidence"], provider,
-                                    web_search=web_search, plan=plan, **memory_options)
+                                    web_search=web_search, plan=plan, **context_options)
     # 截断是生成侧的运行状态，不是端口数据：写进 run 变量，供引用校验节点区分
     # “模型被截断”与“资料不足”，同时不改变 draft/evidence 的既有接线契约。
     if result.get("truncated"):

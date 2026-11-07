@@ -13,7 +13,6 @@ from .workflow.repository import WorkflowRepository
 from .workflow.run_schema import run_inputs_schema
 from .workflow.validator import validate_workflow
 
-
 DEFAULT_WORKFLOWS = Path(__file__).resolve().parents[2] / "workflows"
 
 # 运行入参不合法时由输入节点抛出这些码，HTTP 层据此回 422。字段本身不再按
@@ -27,6 +26,27 @@ def failed_error(result: WorkflowRunResult) -> dict[str, str]:
     return next((item.error for item in result.trace if item.status == "failed"), None) or {}
 
 
+def selected_answer_version(enabled: bool, requested: int | None) -> int:
+    """Pick the answer workflow version for the dialogue feature switch.
+
+    Only the ``medical-answer`` workflow uses this; every other workflow keeps the
+    repository's own published-version semantics.
+
+    Args:
+        enabled: Whether ``DIALOGUE_STATE_ENABLED`` is on for this process.
+        requested: An explicit version requested by the caller, if any.
+
+    Returns:
+        The version to load.
+
+    Raises:
+        ApiError: ``DIALOGUE_FEATURE_DISABLED`` when v7 is requested while off.
+    """
+    if not enabled and requested is not None and requested >= 7:
+        raise ApiError("DIALOGUE_FEATURE_DISABLED", "连续追问功能未启用", 409)
+    return requested if requested is not None else (7 if enabled else 6)
+
+
 def global_capabilities(generator: object) -> dict[str, bool]:
     """Capabilities every workflow gets by construction, independent of its graph."""
     # 生成器只有在 Tavily 已配置时才持有工具；没有钥匙就没有联网能力，与不联网时行为一致。
@@ -36,14 +56,18 @@ def global_capabilities(generator: object) -> dict[str, bool]:
 class RagService:
     def __init__(self, settings: Settings, store: object, embedder: object,
                  reranker: object, generator: object,
-                 workflow_root: Path | None = None) -> None:
+                 workflow_root: Path | None = None,
+                 conversation_history: object | None = None) -> None:
         self.settings = settings
         self.store = store
+        self.embedder = embedder
         self.reranker = reranker
+        self.conversation_history = conversation_history
         self.repository = WorkflowRepository(workflow_root or DEFAULT_WORKFLOWS,
                                              DEFAULT_WORKFLOWS if workflow_root else None)
         self.registry = build_registry(store, embedder, reranker, generator, settings,
-                                       repository=self.repository)
+                                       repository=self.repository,
+                                       conversation_history=conversation_history)
         self.capabilities = global_capabilities(generator)
         self.engine = WorkflowEngine(self.registry, self.capabilities)
         self.runs: dict[str, WorkflowRunResult] = {}
@@ -79,7 +103,16 @@ class RagService:
     async def run_workflow(self, workflow_id: str, inputs: dict[str, object],
                            emit: StreamEmitter | None = None,
                            version: int | None = None, memory_context: str = "",
-                           run_id: str | None = None) -> WorkflowRunResult:
+                           run_id: str | None = None,
+                           short_term: object | None = None,
+                           conversation_id: str = "",
+                           dialogue: object | None = None,
+                           retain_run: bool = True) -> WorkflowRunResult:
+        if workflow_id == "medical-answer":
+            # The flag decides between v7 and the explicit compatibility version;
+            # an explicit v7 request while disabled is refused, never downgraded.
+            version = selected_answer_version(
+                bool(getattr(self.settings, "dialogue_state_enabled", False)), version)
         try:
             definition = (self.repository.get_published(workflow_id) if version is None
                           else self.repository.get(workflow_id, version))
@@ -94,16 +127,22 @@ class RagService:
         if validate_workflow(definition, self.registry):
             raise ApiError("INVALID_WORKFLOW", "工作流校验未通过", 422)
         self.last_workflow_id = workflow_id
-        result = await self.engine.run(definition, inputs, emit=emit, memory_context=memory_context, run_id=run_id)
-        self.runs[result.run_id] = result
+        result = await self.engine.run(definition, inputs, emit=emit, memory_context=memory_context,
+                                       run_id=run_id, short_term=short_term,
+                                       conversation_id=conversation_id, dialogue=dialogue)
+        if retain_run:
+            self.runs[result.run_id] = result
         if result.status == "failed":
             error = failed_error(result)
             if error.get("code") in REQUEST_ERROR_CODES:
                 raise ApiError(error["code"], error.get("message", "请求参数不符合要求"), 422)
         return result
 
-    def run(self, workflow_id: str, inputs: dict[str, object], memory_context: str = "") -> dict:
-        result = asyncio.run(self.run_workflow(workflow_id, inputs, memory_context=memory_context))
+    def run(self, workflow_id: str, inputs: dict[str, object], memory_context: str = "",
+            *, dialogue: object | None = None, retain_run: bool = True) -> dict:
+        result = asyncio.run(self.run_workflow(workflow_id, inputs,
+                                               memory_context=memory_context,
+                                               dialogue=dialogue, retain_run=retain_run))
         if result.status == "failed":
             error = failed_error(result)
             code = error.get("code", "DEPENDENCY_ERROR")
@@ -123,6 +162,11 @@ class RagService:
             return self.runs[run_id]
         except KeyError as exc:
             raise ApiError("RUN_NOT_FOUND", "运行记录不存在", 404) from exc
+
+    def forget_runs(self, run_ids: list[str]) -> None:
+        """Drop cached results after their conversation was deleted."""
+        for run_id in run_ids:
+            self.runs.pop(run_id, None)
 
     def ingest(self, filename: str, content: bytes, source_id: str | None = None) -> dict:
         return self.run("document-ingestion", {"filename": filename, "content": content,
@@ -146,9 +190,11 @@ class RagService:
     def search(self, question: str, top_k: int) -> list:
         return self.run("medical-search", {"question": question, "top_k": top_k})["evidence"]
 
-    def answer(self, question: str, provider: str, top_k: int, memory_context: str = "") -> dict:
+    def answer(self, question: str, provider: str, top_k: int, memory_context: str = "",
+               *, dialogue: object | None = None, retain_run: bool = True) -> dict:
         return self.run("medical-answer", {"question": question, "provider": provider,
-                                           "top_k": top_k}, memory_context=memory_context)
+                                           "top_k": top_k}, memory_context=memory_context,
+                        dialogue=dialogue, retain_run=retain_run)
 
     def health(self) -> dict:
         result: dict[str, object] = {"milvus": self.store.ping()}

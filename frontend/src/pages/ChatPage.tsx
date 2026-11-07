@@ -539,6 +539,7 @@ export default function ChatPage() {
         analysis: result.output.analysis as AnalysisPayload | undefined,
         abstained: result.output.abstained,
         abstainReason: result.output.abstain_reason,
+        answerType: result.output.answer_type ?? "answer",
         runId: result.run_id,
         trace: safeRunTrace(result.trace),
         kind: result.kind,
@@ -682,6 +683,9 @@ export default function ChatPage() {
                   <div className="message-body">
                     <div className="message-author">
                       {message.role === "user" ? "你" : "知源助手"}
+                      {message.answerType === "clarification" && (
+                        <span className="clarify">需要补充对象</span>
+                      )}
                       {message.abstained && (
                         <span className="abstain">
                           {abstainLabel(message.abstainReason)}

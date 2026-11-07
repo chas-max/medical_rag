@@ -41,5 +41,6 @@ def test_fixed_chat_stream_generates_verified_claims_from_real_evidence():
     assert result["status"] == "success"
     assert result["output"]["citations"][0]["chunk_id"] == "chunk-1"
     assert "假设内容" not in result["output"]["answer"]
-    assert model.completes == 2 and model.streams == 1
+    # HyDE、纠错重写（单块证据低于反馈阈值后回退原问题）、规划各一次 complete。
+    assert model.completes == 3 and model.streams == 1
     assert client.get("/conversations/c1").json()["data"]["messages"][-1]["content"] == result["output"]["answer"]

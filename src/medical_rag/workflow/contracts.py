@@ -2,7 +2,11 @@
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal, Protocol, Union
+from typing import TYPE_CHECKING, Literal, Protocol, Union
+
+if TYPE_CHECKING:
+    from ..dialogue_models import DialogueRun
+    from ..short_term import ShortTerm
 
 NodeTraceStatus = Literal["pending", "running", "success", "skipped", "inactive", "halt",
                           "failed"]
@@ -132,6 +136,15 @@ class ExecutionContext:
     node_metadata: dict[str, object] = field(default_factory=dict)
     # Explicit immutable per-run snapshot, never a workflow port or shared generator field.
     memory_context: str = ""
+    # Same contract for the current conversation: recent turns plus a rolling digest.
+    # Kept separate from memory_context so long-term recall and this session's own
+    # words never get conflated in the prompt or in the trust boundary text.
+    short_term: "ShortTerm | None" = None
+    # Only the owning session's turn index may be searched, never a global corpus.
+    conversation_id: str = ""
+    # Request-scoped resolution slot owned by the caller. It is never a port and
+    # never enters the public result, trace or SSE frames.
+    dialogue: "DialogueRun | None" = None
 
 
 @dataclass(frozen=True)

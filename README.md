@@ -24,13 +24,39 @@ HyDE 由模型生成一段未经验证的假设性回答，仅用于向量检索
 
 登录交易中的 nonce 与 PKCE 验证值由机构提供的 AES-GCM 密钥加密；会话和 CSRF 令牌只保存摘要。浏览器使用 `__Host-`、Secure、HttpOnly、SameSite=Lax Cookie，写操作还要求固定 Origin 与 CSRF 证明。每次患者操作在独立的主库事务内获取当前身份及患者行锁，等待后重新读取核验状态和权限，再检查最新用途授权。管理员、客服和平台角色不会因此获得患者正文；本入口暂不开放未成年人、监护人或年龄未知路径。
 
-健康信息授权记录按患者串行追加，保存版本、签署者和有效期；撤回停止后续相应用途访问，但不会自动删除历史记录。已获准且持有锁的操作属于在途操作，撤回等待其事务结束，不等于取消已开始的流或后台任务。角色、绑定、账号或机构变化使既有会话失效。签名 `POST /auth/backchannel-logout` 已连接机构身份提供方撤权、重复事件保护及待完成旧登录的持久阻断；严格支持的令牌格式和机构注册要求见 [接入说明](docs/security/provider-logout-setup.md)。撤权阻止下一次受保护请求，不会推送清空闲置页面或取消在途操作。机构批准的公钥环已支持人工部署的重叠与退役，登录和退出通知共用同一信任集；[操作说明](docs/security/signing-keyring-runbook.md)不等于自动发现或密钥泄露应急方案。客户端密钥、登录加密密钥轮换及待完成登录期间账号停用再启用的处理仍待实现。
+健康信息授权记录按患者串行追加，保存版本、签署者和有效期；撤回停止后续相应用途访问，但不会自动删除历史记录。已获准且持有锁的操作属于在途操作，撤回等待其事务结束，不等于取消已开始的流或后台任务。问答生成不持有患者行锁：撤回后持久化前会重新校验，撤回期间生成的回答直接丢弃、不写库。角色、绑定、账号或机构变化使既有会话失效。签名 `POST /auth/backchannel-logout` 已连接机构身份提供方撤权、重复事件保护及待完成旧登录的持久阻断；严格支持的令牌格式和机构注册要求见 [接入说明](docs/security/provider-logout-setup.md)。撤权阻止下一次受保护请求，不会推送清空闲置页面或取消在途操作。机构批准的公钥环已支持人工部署的重叠与退役，登录和退出通知共用同一信任集；[操作说明](docs/security/signing-keyring-runbook.md)不等于自动发现或密钥泄露应急方案。客户端密钥、登录加密密钥轮换及待完成登录期间账号停用再启用的处理仍待实现。
 
-患者功能仅有新建会话、查看本人记录和追加文字记录，**没有接通 RAG 医疗回答、患者记忆、病历、外部模型、向量和任务系统**。另有需当前 MFA 的机构审计元数据视图，以及不含医疗正文的账户支持功能。数据库迁移 `0001`—`0007` 只用于新的隔离库，不自动迁移或分配旧 SQLite 数据。数据库角色仍是受信的 SQL 执行边界；RLS 和启动诊断不能代替完整权限、密钥、备份、审计和运维评估。
+患者功能包括新建会话、查看本人记录、追加文字记录，以及在机构显式配置 `[chat]` 且当前授权有效时，把问题发送给本机公开资料 RAG 答案服务并保存带引用的问答。患者入口仍不接通患者记忆、病历、医院内网或旧后台任务系统；问答只基于公开医疗资料，不替代医生诊断，也不能用于处理真实患者资料。另有需当前 MFA 的机构审计元数据视图，以及不含医疗正文的账户支持功能。数据库迁移 `0001`—`0008` 只用于新的隔离库，不自动迁移或分配旧 SQLite 数据。数据库角色仍是受信的 SQL 执行边界；RLS 和启动诊断不能代替完整权限、密钥、备份、审计和运维评估。
 
 有效登录账号可在“账户支持”创建、查看和取消本人的固定类别请求，无需健康信息授权；这不授予患者资料访问权。只有当前本地客服角色可查看本机构队列、受理及记录固定处理结果，仍遵循组合角色的 MFA 规则。首期没有医疗文字、附件、账号解锁、角色修改或患者绑定修改；完全无法登录时不能使用这个渠道。开发限额为每账号滚动 24 小时 20 次、最多 5 个未结束请求，取消不重置每日计数；不是生产网关限流或机构批准的支持政策。
 
 开发验证使用虚构账号、签名测试身份提供方和临时 PostgreSQL；另已用官方 Keycloak 26.8.1 验证实际 HTTPS 登录、令牌签名和退出通知。后者的应用路由使用 TestClient，不是完整浏览器或全链路网络验收。**尚未与真实医院身份服务联调，也未通过生产安全、医学或法律验收**。所有代理和服务器必须关闭回调查询及请求/响应正文日志，不记录授权码、令牌或患者内容。旧业务和工作进程不能因为新入口存在而解除锁定。
+
+## 一键启动：RAG + 患者问答门户（推荐）
+
+本机演示只需要一个入口脚本：`start.ps1`。它会启动检索依赖（Milvus/RabbitMQ）、本机 RAG 答案服务（8001）、患者演示环境（PostgreSQL + Keycloak，首次或容器未运行时自动重建）和需要登录的患者门户（8443），完成后打开 `https://localhost:8443/`。
+
+```powershell
+.\start.ps1                 # PowerShell 中启动并打开浏览器
+.\start.cmd                 # cmd 或双击入口（内部调用 pwsh/powershell）
+.\start.ps1 -NoBrowser      # 只启动，不打开浏览器
+.\start.ps1 -WithWorkers    # 额外启动 relay/ingest/memory（文档入库/记忆）
+.\start.ps1 -ResetPatient   # 强制重建患者 PostgreSQL/Keycloak
+.\start.ps1 -Stop           # 停止进程，保留容器与数据
+.\start.ps1 -StopAll        # 停止进程并删除患者容器/关闭 compose
+```
+
+Windows 的 `.ps1` 没有默认文件关联；在 **cmd** 里直接输入 `.\start.ps1` 会用记事本打开文件而不是执行。请改用 `.\start.cmd`，或在 PowerShell 中运行 `.\start.ps1`；也可以在 cmd 中显式调用解释器：
+
+```powershell
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+# 或
+powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
+```
+
+演示账号在 `outputs\patient-demo\credentials.txt`。登录后直接进入问答界面；个人信息在左下角头像菜单。首次访问浏览器会提示演示自签证书，仅在本机演示中继续。旧的 `http://127.0.0.1:8001/ui/chat` **不再是一键启动的入口**：它仍可访问，但那是无登录的单用户 `unsafe-local-demo`，只能用于本机虚构数据，不能转发或接入代理。
+
+脚本依赖 `outputs/patient-demo/` 下的演示装配脚本和自签证书；这是本机一次性演示环境，不是生产部署方式。首次启动或容器停止后需要重建（约 1–2 分钟），患者数据库使用 tmpfs，不持久。
 
 ## 患者开发入口启动（PowerShell，与旧演示隔离）
 
@@ -42,7 +68,7 @@ npm --prefix frontend run build:patient
 .\.venv\Scripts\python.exe -c "import medical_rag; print(medical_rag.__file__)"
 ```
 
-由机构运维在**新的隔离 PostgreSQL 库**中依次执行 `database/migrations/0001_patient_scope.sql` 至 `0007_support_cases.sql`，审查并通过 `database/patient_runtime_grants.sql` 给非所有者运行角色授权。新患者入口要求审计、撤权事件表、支持请求表及最小权限，缺失时拒绝启动，不能通过关闭审计或跳过撤权阻断继续运行。脚本不创建生产账号、不自动授予核验状态，也不覆盖既有数据库；真实账号、角色、患者映射与核验来源须通过可信机构流程配置。
+由机构运维在**新的隔离 PostgreSQL 库**中依次执行 `database/migrations/0001_patient_scope.sql` 至 `0008_conversation_answers.sql`，审查并通过 `database/patient_runtime_grants.sql` 给非所有者运行角色授权。新患者入口要求审计、撤权事件表、支持请求表、问答 turn 角色/引用列及最小权限，缺失时拒绝启动，不能通过关闭审计或跳过撤权阻断继续运行。脚本不创建生产账号、不自动授予核验状态，也不覆盖既有数据库；真实账号、角色、患者映射与核验来源须通过可信机构流程配置。
 
 以 `deploy/patient/config.example.toml` 为参考，在机构控制的私密目录配置实际 TOML、单独的 DSN/客户端密钥文件、32 字节登录加密密钥、IdP 公钥、TLS 证书/私钥及经审核的告知文本。相对路径按 TOML 所在目录解析；该入口不读取旧 `.env`。不要提交密钥、复制占位值假装已接入身份服务，或把测试核验记录当作真实核验。
 
@@ -54,7 +80,11 @@ npm --prefix frontend run build:patient
 
 入口直接使用 HTTPS，默认示例绑定回环地址；外部来源和 Host 必须匹配固定回调来源。服务器不信任转发身份/协议头，不记录访问查询、正文和令牌。远程数据库要求 `sslmode=verify-full`；明文回环连接只用于隔离的虚构数据开发。配置、密钥、必要权限、主库状态或强制 RLS 检查失败时拒绝启动。仅挂载独立 `patient.html` 与 `/assets`，不会回退到旧 `/ui`。
 
-另行提供的独立患者网关（`docker-compose.patient-gateway.yml` 与 `deploy/patient-gateway/`）只连接上述患者入口，使用校验上游证书链和主机名的 HTTPS、精确 Host、请求头白名单和只读根文件系统；它不读取旧 `.env`，也不解除旧接口锁定。旧的 `deploy/gateway/nginx.conf` 明文 HTTP 实验仍是独立未完成配置，**不能接到此入口**。完整审计、数据库日志参数脱敏、网络边界、备份/存储加密、密钥轮换、机构管理业务及医院/模型接入仍见 [生产准入清单](docs/security/production-readiness.md)。独立页面提供身份、健康信息授权、文字记录及受限的审计与账户支持，不生成医疗回答。
+另行提供的独立患者网关（`docker-compose.patient-gateway.yml` 与 `deploy/patient-gateway/`）只连接上述患者入口，使用校验上游证书链和主机名的 HTTPS、精确 Host、请求头白名单和只读根文件系统；它不读取旧 `.env`，也不解除旧接口锁定。旧的 `deploy/gateway/nginx.conf` 明文 HTTP 实验仍是独立未完成配置，**不能接到此入口**。完整审计、数据库日志参数脱敏、网络边界、备份/存储加密、密钥轮换、机构管理业务及医院/模型接入仍见 [生产准入清单](docs/security/production-readiness.md)。独立页面提供身份、健康信息授权、带引用的公开资料问答、文字记录及受限的审计与账户支持；回答不构成医疗建议。
+
+患者入口登录成功后直接进入 ChatGPT 式界面：左侧是「新对话」、最近会话与分页，中间是消息区和底部输入框，左下角头像菜单显示本系统账户、所属机构、系统角色与核验状态，并提供退出登录；身份、健康信息授权、安全审计与账户支持从侧栏进入。配置 `[chat]` 后，发送问题会走患者鉴权的 `POST /chat`：先校验会话、角色、绑定和当前健康信息授权，再调用本机 RAG 答案服务，最后在持久化前重新校验并以 `user`/`assistant` 角色保存问答与引用；撤回期间生成的回答会被丢弃。未配置 `[chat]` 时退化为只保存文字记录。回答只基于公开医疗资料，不替代医生诊断；界面和告知都要求不要输入患者隐私。
+
+`[chat]` 是可选配置段：`base_url` 必须是回环 `http(s)` 来源，另有 `timeout_seconds`（1–300）与 `top_k`（1–20）。当前演示在 `outputs/patient-demo/config.toml` 中指向本机 8001 的 `unsafe-local-demo` `/answers`；这是**演示桥接**，不是生产部署方式。生产环境必须换成内部认证的 RAG 服务，并补齐账号级限流、流式输出和机构模型审批。
 
 ## 旧单用户本机演示启动（PowerShell）
 
@@ -80,6 +110,17 @@ python -m medical_rag.worker relay
 python -m medical_rag.worker ingest
 python -m medical_rag.worker memory
 ```
+
+## HTTP 客户端依赖（httpx / httpx2）
+
+本项目有意同时使用两个 HTTP 客户端，这不是重复依赖：
+
+- `httpx`（`>=0.27,<0.29`）：OpenAI 1.x SDK、联网检索 `web_search.py` 和患者问答客户端 `patient_chat.py` 使用；
+- `httpx2`（`>=2.16,<3`）：OIDC 登录（Authlib ≥1.9 的 HTTP 集成内部使用 `httpx2`）以及 Starlette ≥1.10 的 `TestClient` 使用。
+
+两者模块名不同、可以共存，但**不能把 `httpx` 的 transport 传给 Authlib**：`oidc_login.py` 已整体使用 `httpx2`，因为 Authlib 1.9 会把 transport 交给 `httpx2.AsyncClient`，遇到 v1 的响应流会在 `httpx2` 内部触发 `isinstance(response.stream, AsyncByteStream)` 断言失败。对应测试的 mock transport 也已改成 `httpx2`。
+
+`pyproject.toml` 已显式钉住范围，并把 `openai` 限制在 `<2`；否则全新安装可能解析到 OpenAI 3.x（改用 `httpx2`、不再提供 `httpx`）或 `httpx` 0.29+，造成新旧客户端混用。升级 Starlette、Authlib 或 OpenAI 主版本时，需要同时核对这两条约束，并至少重跑 `python -m pytest tests/test_frontend_hosting.py tests/test_oidc_login.py tests/test_patient_chat.py tests/test_web_search.py -q` 与 `uv pip check`。
 
 ## 网关实验配置
 

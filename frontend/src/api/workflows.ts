@@ -120,6 +120,8 @@ export interface RunResult {
     abstained?: boolean;
     /** 拒答原因码：区分“资料不足”与解析失败/截断/引用校验失败。 */
     abstain_reason?: string;
+    /** 澄清轮次不是医学结论：界面按补充问题展示，不显示“证据不足”。 */
+    answer_type?: "answer" | "clarification";
     evidence?: Citation[];
     [key: string]: unknown;
   };

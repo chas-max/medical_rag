@@ -20,7 +20,8 @@ from .workflow.contracts import StreamEmitter
 if TYPE_CHECKING:
     from .chat_runtime import ChatRuntime
 
-_STREAM_BUSINESS_ERRORS = frozenset({"REQUEST_ID_CONFLICT", "REQUEST_IN_PROGRESS"})
+_STREAM_BUSINESS_ERRORS = frozenset({"REQUEST_ID_CONFLICT", "REQUEST_IN_PROGRESS",
+                                    "CONVERSATION_CONTEXT_CHANGED"})
 _UPSTREAM_EVENTS = frozenset({"chat.progress", "node.progress", "status", "claim", "analysis"})
 _DEFAULT_PUBLIC_ERROR = public_error(None)
 _STREAM_DEPENDENCY_ERROR = {**_DEFAULT_PUBLIC_ERROR.data(), "status": _DEFAULT_PUBLIC_ERROR.status}

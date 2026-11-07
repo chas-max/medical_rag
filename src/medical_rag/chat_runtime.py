@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Protocol
 from fastapi.encoders import jsonable_encoder
 
 from .chat_history import ChatHistoryStore
+from .dialogue_models import DialogueRun, DialogueSnapshot
 from .memory import MemoryStore
 from .profile_models import (
     IntentDecision,
@@ -25,6 +26,7 @@ from .profile_models import (
 from .profile_policy import build_profile_plan
 from .profile_store import LABELS, ProfileStore, fingerprint
 from .public_errors import public_error
+from .short_term import ShortTerm, ShortTermMemory
 from .types import ApiError
 from .workflow.contracts import StreamEmitter
 
@@ -64,10 +66,20 @@ class ChatRuntime:
     """Persist routing, profile transactions, and final results with stable IDs."""
 
     def __init__(self, history: ChatHistoryStore, memory: MemoryStore,
-                 analyzer: IntentAnalyzer, service_factory: Callable[[], RagService]) -> None:
+                 analyzer: IntentAnalyzer, service_factory: Callable[[], RagService],
+                 short_term: object | None = None,
+                 summarizer: object | None = None,
+                 indexer: object | None = None,
+                 *, dialogue_state_enabled: bool = False) -> None:
         self.history, self.memory = history, memory
         self.profiles = ProfileStore(memory)
         self.analyzer, self.service_factory = analyzer, service_factory
+        self.short_term = short_term or ShortTermMemory(history)
+        self.summarizer = summarizer
+        self.indexer = indexer
+        # Trusted process configuration only: a browser-supplied input must never be
+        # able to turn the structured-state path on for one request.
+        self.dialogue_state_enabled = dialogue_state_enabled
 
     @contextmanager
     def _lease(self, request_id: str, owner: str) -> Iterator[None]:
@@ -102,9 +114,10 @@ class ChatRuntime:
                 "episode": {"status": "skipped"}, "memory": {"status": "skipped"}}
 
     def _finish(self, payload: ChatRunRequest, request: dict, record: dict, revision: int | None,
-                answer_ran: bool) -> dict:
+                answer_ran: bool, dialogue: DialogueRun | None = None) -> dict:
+        clarification = record["output"].get("answer_type") == "clarification"
         callback = None
-        if answer_ran and record["status"] == "success" and (
+        if answer_ran and record["status"] == "success" and not clarification and (
                 record["output"].get("answer") or record["output"].get("abstained")):
             record["episode"] = record["memory"] = {"status": "failed" if revision is None else "pending"}
             if revision is not None:
@@ -119,8 +132,46 @@ class ChatRuntime:
                 callback = enqueue
         self.history.finish_turn(payload.conversation_id, request["turn_id"], record,
                                  on_saved=callback, request_id=payload.request_id,
-                                 owner_token=request["owner_token"])
+                                 owner_token=request["owner_token"], dialogue=dialogue,
+                                 invalidate_state=answer_ran and not self.dialogue_state_enabled)
+        if self.indexer is not None and record.get("kind") != "memory" and not clarification:
+            try:
+                self.indexer.maybe_schedule(payload.conversation_id, request["turn_id"],
+                                            payload.inputs["question"],
+                                            record["output"].get("answer"))
+            except Exception:  # noqa: BLE001 - the turn index is an optional read model
+                logger.warning("Conversation index unavailable")
+        if self.summarizer is not None:
+            try:
+                self.summarizer.maybe_schedule(payload.conversation_id)
+            except Exception:  # noqa: BLE001 - digest maintenance never fails a turn
+                logger.warning("Conversation digest unavailable")
         return record
+
+    def delete_conversation(self, conversation_id: str) -> dict:
+        """Delete one conversation and every derived copy of it.
+
+        Order matters: history rows are the source of truth and are deleted first,
+        so a failure afterwards can only leave an orphaned read model, never a turn
+        whose vectors or episodes claim content the user already removed.
+        """
+        run_ids = self.history.delete_conversation(conversation_id)
+        if run_ids is None:
+            raise ApiError("CONVERSATION_NOT_FOUND", "对话记录不存在", 404)
+        memory = {"jobs": 0, "episodes": 0, "confirmations": 0}
+        try:
+            memory = self.memory.delete_conversation(conversation_id, run_ids)
+        except Exception:  # noqa: BLE001 - optional store, conversation is already gone
+            logger.warning("Conversation memory cleanup unavailable")
+        try:
+            self.service_factory().forget_runs(run_ids)
+        except Exception:  # noqa: BLE001 - the in-memory cache is not authoritative
+            logger.warning("Conversation run cache cleanup unavailable")
+        vectors = "disabled"
+        if self.indexer is not None:
+            vectors = "deleted" if self.indexer.delete(conversation_id) else "unavailable"
+        return {"conversation_id": conversation_id, "deleted": True,
+                "memory": memory, "vectors": vectors}
 
     def run(self, payload: ChatRunRequest, emit: StreamEmitter | None = None) -> dict:
         """Apply grounded profile changes before the unchanged evidence question."""
@@ -188,6 +239,9 @@ class ChatRuntime:
                 revision, context = self.memory.snapshot(question)
             except Exception:  # noqa: BLE001 - evidence QA remains independent of optional memory
                 logger.warning("Memory recall unavailable")
+            # One consistent read serves both the legacy generation context and the
+            # request-scoped resolution slot; two separate reads could disagree.
+            dialogue, short_term = self._dialogue_snapshot(payload.conversation_id)
             if decision.needs_answer:
                 self._progress(emit, "answer")
                 try:
@@ -195,7 +249,10 @@ class ChatRuntime:
                         raise ApiError("WORKFLOW_REQUIRED", "请先选择已发布的问答工作流；画像处理结果已保留", 422)
                     result = asyncio.run(self.service_factory().run_workflow(
                         payload.workflow_id, payload.inputs, emit=emit, memory_context=context,
-                        run_id=request["run_id"]))
+                        run_id=request["run_id"],
+                        short_term=short_term,
+                        conversation_id=payload.conversation_id,
+                        dialogue=dialogue))
                     answer = jsonable_encoder(result)
                     record.update(answer)
                     # Workflow outputs cannot override the application-level result envelope.
@@ -218,7 +275,28 @@ class ChatRuntime:
                 if profile.status == "disabled":
                     lines.append("长期记忆已关闭，本次未写入")
                 record["output"]["answer"] = "\n".join(lines) or "未发现可维护的画像信息，请补充说明"
-            return self._finish(payload, request, record, revision, decision.needs_answer)
+            return self._finish(payload, request, record, revision, decision.needs_answer,
+                                dialogue if decision.needs_answer else None)
+
+    def _dialogue_snapshot(self, conversation_id: str) -> tuple[DialogueRun | None, ShortTerm]:
+        """Load the one snapshot this request may use, degrading to empty context.
+
+        With the feature enabled the structured snapshot is authoritative and the
+        legacy window is built from it, so the generator and the reducer cannot see
+        two different histories. With it disabled the old reader stays untouched.
+        """
+        if not self.dialogue_state_enabled:
+            return None, self.short_term.load(conversation_id)
+        try:
+            snapshot = self.history.dialogue_snapshot(conversation_id)
+        except Exception:  # noqa: BLE001 - optional context never blocks an answer
+            logger.warning("Dialogue snapshot unavailable")
+            return DialogueRun(DialogueSnapshot()), ShortTerm()
+        short_term = ShortTerm(
+            recent=tuple({"turn": turn.turn_id, "user": turn.user, "assistant": turn.assistant}
+                         for turn in snapshot.recent),
+            summary=snapshot.summary)
+        return DialogueRun(snapshot), short_term
 
     def confirm(self, payload: ConfirmationRequest) -> dict:
         """Consume a server-owned plan without reanalysis or repeating the question."""

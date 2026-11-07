@@ -92,6 +92,7 @@ class AgenticNode:
                             "_agent_runtime": runtime,
                         },
                         memory_context=context.memory_context,
+                        short_term=context.short_term,
                     ),
                     max(0.000001, runtime.deadline - monotonic()),
                 )

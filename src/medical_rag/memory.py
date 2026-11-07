@@ -313,6 +313,30 @@ class MemoryStore:
             # Clear pending raw extraction material too; original chat history is separate.
             connection.execute("UPDATE memory_jobs SET question='',output='{}' WHERE user_id=?", (USER,))
 
+    def delete_conversation(self, conversation_id: str, run_ids: list[str]) -> dict[str, int]:
+        """Drop raw jobs, derived episodes and pending confirmations of one chat.
+
+        Long-term profile entries are deliberately untouched: they are explicit user
+        statements with their own lifecycle, not a copy of this conversation.
+        """
+        removed = {"jobs": 0, "episodes": 0, "confirmations": 0}
+        with self._connect(True) as connection:
+            removed["jobs"] = connection.execute(
+                "DELETE FROM memory_jobs WHERE conversation_id=?", (conversation_id,)).rowcount
+            removed["confirmations"] = connection.execute(
+                "DELETE FROM profile_confirmations WHERE conversation_id=?",
+                (conversation_id,)).rowcount
+            if run_ids:
+                placeholders = ",".join("?" for _ in run_ids)
+                rows = connection.execute(
+                    f"SELECT id,path FROM memory_episodes WHERE source_run_id IN ({placeholders})",
+                    run_ids).fetchall()
+                for row in rows:
+                    self._remove_files(row["path"])
+                    connection.execute("DELETE FROM memory_episodes WHERE id=?", (row["id"],))
+                removed["episodes"] = len(rows)
+        return removed
+
     def snapshot(self, question: str) -> tuple[int, str]:
         """Return one bounded immutable context, relevant episodes only."""
         with self._connect() as connection:

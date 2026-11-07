@@ -90,8 +90,8 @@ def test_qwen_answer_routes_disable_default_thinking_before_waiting_for_json(tmp
     assert data["abstained"] is False
     assert data["answer"].startswith("应规律随访 [")
     assert data["citations"][0]["excerpt"] == "规律随访"
-    # medical-answer v3：HyDE、回答规划与生成本体各一次，均关闭思维链。
-    assert len(requests) == 3
+    # medical-answer v5：HyDE、纠错重写、回答规划与生成本体各一次，均关闭思维链。
+    assert len(requests) == 4
     assert all(item["enable_thinking"] is False for item in requests)
 
 

@@ -2,12 +2,15 @@
 # ruff: noqa: F401,F811 -- imported pytest fixtures are used by injection
 
 import importlib.util
+import json
 import secrets
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from threading import Event
 from uuid import uuid4
 
+import httpx
 import psycopg
 import pytest
 from fastapi.testclient import TestClient
@@ -29,6 +32,7 @@ from test_oidc_login import (
 
 from medical_rag.identity_sessions import AuthenticationDenied
 from medical_rag.oidc_identity import VerifiedIdentity
+from medical_rag.patient_chat import ChatClient
 
 PATIENT = "00000000-0000-0000-0000-000000000301"
 OTHER = "00000000-0000-0000-0000-000000000302"
@@ -58,6 +62,10 @@ def database(oidc_database):
         db.execute("GRANT UPDATE (patient_id) ON medical_rag.patient_subjects TO login_test")
         db.execute("GRANT SELECT,INSERT ON medical_rag.patient_consent_events, "
                    "medical_rag.conversations,medical_rag.conversation_turns TO login_test")
+        # 0009: the runtime role may only write the dialogue columns of a
+        # conversation row, mirroring the owner-run recipe.
+        db.execute("GRANT UPDATE (dialogue_state,dialogue_revision,context_version) "
+                   "ON medical_rag.conversations TO login_test")
         db.execute("GRANT SELECT (tenant_id,case_id,requester_account_id,category,status,assigned_account_id,"
                    "resolution_code,created_at,updated_at) ON medical_rag.support_cases TO login_test")
         db.execute("GRANT INSERT (tenant_id,case_id,requester_account_id,category), "
@@ -65,9 +73,8 @@ def database(oidc_database):
     return runtime, admin
 
 
-@pytest.fixture
-def system(auth_system):
-    from medical_rag.patient_api import create_patient_app
+def provision(auth_system):
+    """Create the fictional patient rows and return the trusted app inputs."""
     from medical_rag.patient_service import HealthNotice
 
     _, login, provider, admin = auth_system
@@ -82,16 +89,42 @@ def system(auth_system):
         db.execute("INSERT INTO medical_rag.tenants(tenant_id) VALUES (%s)", (OTHER_TENANT,))
         db.execute("INSERT INTO medical_rag.patient_subjects(tenant_id,patient_id,age_classification,identity_verified) "
                    "VALUES (%s,%s,'adult',true)", (OTHER_TENANT, PATIENT))
-    notice = HealthNotice("fictional-v1", "Fictional development notice: health information only.", 3600)
-    with TestClient(create_patient_app(login, notice), base_url=APP_ORIGIN, headers={}) as client:
+    return (login, provider, admin,
+            HealthNotice("fictional-v1", "Fictional development notice: health information only.", 3600))
+
+
+@pytest.fixture
+def system(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice),
+                    base_url=APP_ORIGIN, headers={}) as client:
         yield client, login, provider, admin
+
+
+class FakeChat:
+    """Deterministic answer source; records calls and can run a side effect first."""
+
+    def __init__(self, text="基于公开资料的虚构回答。", citations=(), error=None, before=None):
+        self.text, self.citations, self.error, self.before = text, list(citations), error, before
+        self.questions: list[str] = []
+
+    def answer(self, question):
+        self.questions.append(question)
+        if self.before is not None:
+            self.before()
+        if self.error is not None:
+            raise self.error
+        return {"answer": self.text, "citations": self.citations, "abstained": False}
 
 
 def logged_in(system):
     client, _, _, _ = system
     _, query = start(system)
-    assert client.get("/auth/callback", params={"state": query["state"][0], "code": "fictional-code"},
-                      follow_redirects=False).status_code == 303
+    response = client.get("/auth/callback", params={"state": query["state"][0], "code": "fictional-code"},
+                          follow_redirects=False)
+    assert response.status_code == 303, response.text
     csrf = client.get("/auth/session").json()["data"]["csrf_token"]
     return {"Origin": APP_ORIGIN, "X-CSRF-Token": csrf}
 
@@ -124,8 +157,8 @@ def test_full_oidc_patient_consent_conversation_and_turn_flow(system):
     me = client.get("/me").json()["data"]
     assert me["user_id"] == ACCOUNT and me["tenant_id"] == TENANT
     assert me["binding"] == {"verified": True}
-    assert me["permissions"] == {"identity": True, "health_consent": True, "conversations": False, "audit": False,
-                                 "support_self": True, "support_queue": False}
+    assert me["permissions"] == {"identity": True, "health_consent": True, "conversations": False, "chat": False,
+                                 "audit": False, "support_self": True, "support_queue": False}
     assert client.get("/conversations").status_code == 403
     notice = client.get("/me/consents/health").json()["data"]
     assert notice["notice"]["text"].startswith("Fictional development") and notice["granted"] is False
@@ -302,7 +335,7 @@ def test_staff_and_guardians_have_no_implicit_patient_permissions(system, role):
     mutate(admin, "INSERT INTO medical_rag.identity_roles VALUES (%s,%s,%s)", (TENANT, ACCOUNT, role))
     headers = logged_in(system)
     assert client.get("/me").json()["data"]["permissions"] == {
-        "identity": True, "health_consent": False, "conversations": False, "audit": False,
+        "identity": True, "health_consent": False, "conversations": False, "chat": False, "audit": False,
         "support_self": True, "support_queue": role == "support"}
     assert client.get("/me/consents/health").status_code == 403
     assert client.post("/me/consents/health", headers=headers,
@@ -491,8 +524,183 @@ def test_patient_lock_wait_rechecks_consent_verification_and_authority(system, d
 @pytest.mark.integration
 def test_legacy_business_routes_absent(system):
     client, _, _, _ = system
-    for path in ["/chat", "/memory", "/documents", "/settings", "/jobs", "/api/chat"]:
+    for path in ["/memory", "/documents", "/settings", "/jobs", "/api/chat"]:
         assert client.get(path).status_code == 404
+    # /chat is this app's own POST-only answer route, not the legacy chat API.
+    assert client.get("/chat").status_code == 405
+
+
+CHAT_CITATIONS = [{"chunk_id": "c1", "filename": "指南.pdf", "section": "第1章",
+                   "page": 3, "origin": "knowledge_base"}]
+
+
+@pytest.mark.integration
+def test_ask_persists_cited_answer_and_orders_turns(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = FakeChat(text="结论[c1]", citations=CHAT_CITATIONS)
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        system = (client, login, provider, admin)
+        headers = logged_in(system)
+        grant(client, headers)
+        response = client.post("/chat", headers=headers, json={"question": "高血压如何自测？"})
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        cid = data["conversation"]["id"]
+        assert data["conversation"]["title"] == "高血压如何自测？"
+        assert data["question"]["role"] == "user" and data["question"]["content"] == "高血压如何自测？"
+        assert data["answer"]["role"] == "assistant" and data["answer"]["content"] == "结论[c1]"
+        assert data["answer"]["citations"] == CHAT_CITATIONS
+        items = client.get(f"/conversations/{cid}/turns").json()["data"]["items"]
+        assert [(item["role"], item["content"]) for item in items] == [
+            ("user", "高血压如何自测？"), ("assistant", "结论[c1]")]
+        with psycopg.connect(**admin) as db:
+            actions = dict(db.execute(
+                "SELECT action,count(*) FROM medical_rag.security_audit_events "
+                "WHERE action IN ('chat.ask','turn.append') GROUP BY action").fetchall())
+        assert actions == {"chat.ask": 1, "turn.append": 1}
+        second = client.post("/chat", headers=headers,
+                             json={"question": "继续", "conversation_id": cid})
+        assert second.status_code == 200
+        assert second.json()["data"]["conversation"]["id"] == cid
+        assert len(client.get(f"/conversations/{cid}/turns").json()["data"]["items"]) == 4
+        assert chat.questions == ["高血压如何自测？", "继续"]
+
+
+@pytest.mark.integration
+def test_ask_drops_malformed_citations_before_persisting(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = FakeChat(text="答案", citations=[
+        {"chunk_id": "c1", "filename": "指南.pdf", "section": 7, "page": -1},
+        {"chunk_id": "", "filename": "x.pdf"},
+        "junk",
+    ])
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+        response = client.post("/chat", headers=headers, json={"question": "q"})
+        assert response.status_code == 200
+        assert response.json()["data"]["answer"]["citations"] == [
+            {"chunk_id": "c1", "filename": "指南.pdf", "section": ""}]
+        cid = response.json()["data"]["conversation"]["id"]
+        items = client.get(f"/conversations/{cid}/turns").json()["data"]["items"]
+        assert items[1]["citations"] == [
+            {"chunk_id": "c1", "filename": "指南.pdf", "section": ""}]
+
+
+@pytest.mark.integration
+def test_ask_denies_before_calling_answerer_without_consent(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = FakeChat(error=AssertionError("answerer must not run"))
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        assert client.post("/chat", headers=headers, json={"question": "x"}).status_code == 403
+        assert chat.questions == []
+        assert client.get("/conversations").status_code == 403
+
+
+@pytest.mark.integration
+def test_ask_is_static_503_when_upstream_fails(auth_system):
+    from medical_rag.patient_api import create_patient_app
+    from medical_rag.patient_chat import ChatUnavailable
+
+    chat = FakeChat(error=ChatUnavailable())
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+        response = client.post("/chat", headers=headers, json={"question": "x"})
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "CHAT_UNAVAILABLE"
+        assert client.get("/conversations").json()["data"]["items"] == []
+        with psycopg.connect(**admin) as db:
+            assert db.execute("SELECT count(*) FROM medical_rag.conversation_turns").fetchone() == (0,)
+
+
+@pytest.mark.integration
+def test_ask_is_static_503_when_not_configured(system):
+    client, _, _, _ = system
+    headers = logged_in(system)
+    grant(client, headers)
+    assert client.get("/me").json()["data"]["permissions"]["chat"] is False
+    assert client.post("/chat", headers=headers, json={"question": "x"}).status_code == 503
+
+
+@pytest.mark.integration
+def test_ask_discards_answer_when_consent_lapses_during_generation(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    login, provider, admin, notice = provision(auth_system)
+
+    def withdraw():
+        with psycopg.connect(**admin) as db:
+            db.execute("INSERT INTO medical_rag.patient_consent_events "
+                       "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,granted,expires_at) "
+                       "VALUES (%s,%s,%s,%s,'health_information','fictional-v1',false,clock_timestamp())",
+                       (uuid4(), TENANT, PATIENT, ACCOUNT))
+
+    chat = FakeChat(before=withdraw)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+        assert client.post("/chat", headers=headers, json={"question": "x"}).status_code == 403
+        assert chat.questions == ["x"]
+        assert client.get("/conversations").status_code == 403
+        with psycopg.connect(**admin) as db:
+            assert db.execute("SELECT count(*) FROM medical_rag.conversation_turns").fetchone() == (0,)
+            assert db.execute("SELECT count(*) FROM medical_rag.conversations").fetchone() == (0,)
+
+
+@pytest.mark.integration
+def test_ask_requires_csrf_and_bounded_body(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = FakeChat()
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+        assert client.post("/chat", headers={"Origin": APP_ORIGIN},
+                           json={"question": "x"}).status_code == 403
+        for body in [{"question": ""}, {"question": "x" * 16001}, {"question": "x", "extra": 1},
+                     {"question": 1}, {"question": "  "}]:
+            assert client.post("/chat", headers=headers, json=body).status_code in {400, 422}
+        assert chat.questions == []
+
+
+@pytest.mark.integration
+def test_ask_rejects_another_patients_conversation_before_calling_answerer(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = FakeChat(error=AssertionError("answerer must not run for a foreign conversation"))
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+        foreign = client.post("/conversations", headers=headers,
+                              json={"title": "first patient"}).json()["data"]["id"]
+        second = login.sessions.issue(VerifiedIdentity(ISSUER, "subject-2", True))
+        client.cookies.clear()
+        client.cookies.set("__Host-medical-session", second.token)
+        client.cookies.set("__Host-medical-csrf", second.csrf_token)
+        headers = {"Origin": APP_ORIGIN, "X-CSRF-Token": second.csrf_token}
+        grant(client, headers)
+        response = client.post("/chat", headers=headers,
+                               json={"question": "x", "conversation_id": foreign})
+        assert response.status_code == 404
+        assert chat.questions == []
 
 
 @pytest.mark.integration
@@ -523,3 +731,134 @@ def test_notice_configuration_requires_actual_bounded_trusted_text(args):
     from medical_rag.patient_service import HealthNotice
     with pytest.raises(ValueError):
         HealthNotice(*args)
+
+# -- structured dialogue state ----------------------------------------------
+
+@dataclass
+class DialogueSystem:
+    client: object
+    admin: dict
+    entered: Event
+    release: Event
+    auth: tuple
+    requests: list = field(default_factory=list)
+    block_on_first: bool = False
+
+
+def _dialogue_handler(container):
+    """Synthetic upstream that resolves from the context the backend sent."""
+
+    def handler(request):
+        current = container[0]
+        payload = json.loads(request.read())
+        current.requests.append(payload)
+        if current.block_on_first and len(current.requests) == 1:
+            current.entered.set()
+            assert current.release.wait(5)
+        question = payload["question"]
+        previous = (payload.get("dialogue_context") or {}).get("state") or {}
+        old_topic = previous.get("active_topic") or {}
+        topic = ("糖尿病" if "糖尿病" in question
+                 else "高血压" if "高血压" in question else old_topic.get("name", "糖尿病"))
+        source = "current" if topic in question else old_topic["source_turn_id"]
+        cause = "引起" in question
+        resolution = {
+            "original_question": question, "status": "resolved",
+            "relation": ("standalone" if not previous else
+                         "topic_switch" if source == "current" else "follow_up"),
+            "resolved_question": topic + ("是由什么引起的？" if cause
+                                          else "在日常生活中需要注意什么？"),
+            "topic": {"name": topic, "type": "disease", "source_turn_id": source,
+                      "source_role": "user"},
+            "intent": "etiology" if cause else "daily_precautions",
+            "intent_text": "由什么引起" if cause else "日常注意事项",
+            "references": [], "clarification": None,
+        }
+        return httpx.Response(200, json={"success": True, "error": None, "data": {
+            "answer": "合成回答", "abstained": False, "citations": [],
+            "answer_type": "answer", "dialogue_resolution": resolution,
+        }})
+
+    return handler
+
+
+@pytest.fixture
+def dialogue_system(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    login, provider, admin, notice = provision(auth_system)
+    container = []
+    chat = ChatClient("http://127.0.0.1:8001",
+                      transport=httpx.MockTransport(_dialogue_handler(container)))
+    with TestClient(create_patient_app(login, notice, chat=chat,
+                                      dialogue_state_enabled=True),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        result = DialogueSystem(client, admin, Event(), Event(),
+                                (client, login, provider, admin))
+        container.append(result)
+        try:
+            yield result
+        finally:
+            result.release.set()
+
+
+@pytest.mark.integration
+def test_patient_three_turns_keep_the_subject_and_intent(dialogue_system):
+    client = dialogue_system.client
+    headers = logged_in(dialogue_system.auth)
+    grant(client, headers)
+
+    first = client.post("/chat", headers=headers,
+                        json={"question": "高血压在日常生活中需要注意什么？"})
+    assert first.status_code == 200, first.text
+    identifier = first.json()["data"]["conversation"]["id"]
+    second = client.post("/chat", headers=headers,
+                         json={"question": "糖尿病呢？", "conversation_id": identifier})
+    assert second.status_code == 200, second.text
+    third = client.post("/chat", headers=headers,
+                        json={"question": "那它是由什么引起的？", "conversation_id": identifier})
+    assert third.status_code == 200, third.text
+
+    requests = dialogue_system.requests
+    assert requests[0]["dialogue_context"]["state"] is None
+    assert requests[1]["dialogue_context"]["state"]["active_topic"]["name"] == "高血压"
+    assert requests[2]["dialogue_context"]["state"]["active_topic"]["name"] == "糖尿病"
+    assert requests[2]["dialogue_context"]["state"]["active_intent"] == "daily_precautions"
+
+    items = client.get(f"/conversations/{identifier}/turns").json()["data"]["items"]
+    assert items[1]["answer_type"] == "answer"
+    assert "dialogue_state" not in items[0]
+
+    fourth = client.post("/chat", headers=headers,
+                         json={"question": "它有什么症状？", "conversation_id": identifier})
+    assert fourth.status_code == 200, fourth.text
+    assert requests[3]["dialogue_context"]["state"]["active_intent"] == "etiology"
+    assert requests[3]["dialogue_context"]["state"]["active_topic"]["name"] == "糖尿病"
+
+
+@pytest.mark.integration
+def test_append_during_generation_rejects_stale_answer(dialogue_system):
+    client = dialogue_system.client
+    dialogue_system.block_on_first = True
+    headers = logged_in(dialogue_system.auth)
+    grant(client, headers)
+    identifier = client.post("/conversations", headers=headers,
+                             json={"title": "并发合成会话"}).json()["data"]["id"]
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        future = executor.submit(client.post, "/chat", headers=headers,
+                                 json={"conversation_id": identifier,
+                                       "question": "高血压日常需要注意什么？"})
+        try:
+            assert dialogue_system.entered.wait(5)
+            appended = client.post(f"/conversations/{identifier}/turns", headers=headers,
+                                   json={"content": "另一条合成消息"})
+            assert appended.status_code == 200, appended.text
+        finally:
+            dialogue_system.release.set()
+        response = future.result(timeout=10)
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "CONVERSATION_CONTEXT_CHANGED"
+    turns = client.get(f"/conversations/{identifier}/turns").json()["data"]["items"]
+    assert len(turns) == 1
+    assert turns[0]["content"] == "另一条合成消息"

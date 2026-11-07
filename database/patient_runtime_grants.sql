@@ -1,4 +1,4 @@
--- Owner-run psql only, after migrations 0001-0007 and external role audit:
+-- Owner-run psql only, after migrations 0001-0009 and external role audit:
 -- psql ... -v runtime_role=patient_runtime -f database/patient_runtime_grants.sql
 -- runtime_role must already be a dedicated NOSUPERUSER NOBYPASSRLS,
 -- NOCREATEDB NOCREATEROLE NOREPLICATION role, with no privileged memberships,
@@ -31,8 +31,16 @@ GRANT UPDATE (state_hash) ON medical_rag.oidc_login_transactions TO :"runtime_ro
 GRANT SELECT (tenant_id, patient_id, conversation_id, title, created_at),
     INSERT (tenant_id, patient_id, conversation_id, title)
     ON medical_rag.conversations TO :"runtime_role";
-GRANT SELECT (tenant_id, patient_id, conversation_id, turn_id, content, created_at),
-    INSERT (tenant_id, patient_id, conversation_id, turn_id, content)
+-- 0009: the structured state is the only mutable part of a conversation row.
+-- No UPDATE(title) and no table-level UPDATE is granted; the identity trigger
+-- and conversation_scope RLS still bound every write.
+GRANT SELECT (dialogue_state, dialogue_revision, context_version),
+    UPDATE (dialogue_state, dialogue_revision, context_version)
+    ON medical_rag.conversations TO :"runtime_role";
+GRANT SELECT (tenant_id, patient_id, conversation_id, turn_id, content, role, citations, ordinal, created_at),
+    INSERT (tenant_id, patient_id, conversation_id, turn_id, content, role, citations)
+    ON medical_rag.conversation_turns TO :"runtime_role";
+GRANT SELECT (answer_type), INSERT (answer_type)
     ON medical_rag.conversation_turns TO :"runtime_role";
 GRANT SELECT (event_id, tenant_id, patient_id, grantor_account_id, purpose,
     notice_version, granted, recorded_at, expires_at, event_order),

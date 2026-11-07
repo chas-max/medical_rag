@@ -64,6 +64,8 @@ _ERRORS = {
     "WEB_SEARCH_RATE_LIMITED": ("联网搜索请求过于频繁，请稍后重试", 429),
     "WEB_SEARCH_INVALID_REQUEST": ("联网搜索请求不被接受", 422),
     "WORKFLOW_REQUIRED": ("请先选择已发布的问答工作流", 422),
+    "DIALOGUE_FEATURE_DISABLED": ("连续追问功能未启用", 409),
+    "CONVERSATION_CONTEXT_CHANGED": ("会话已更新，请重新发送问题", 409),
     "WORKFLOW_NOT_FOUND": ("工作流不存在", 404),
     "WORKFLOW_NOT_PUBLISHED": ("仅可运行已发布的工作流", 409),
     "WORKFLOW_CONFLICT": ("工作流状态冲突，请刷新后重试", 409),

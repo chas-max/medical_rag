@@ -18,6 +18,7 @@ const me = {
   permissions: {
     identity: true,
     health_consent: false,
+    chat: true,
     conversations: false,
     audit: false,
     support_self: true,
@@ -179,7 +180,8 @@ it("failed logout barrier prevents hash or focus from restoring support", async 
           resolvePending = resolve;
         })
       : original(url, init);
-  fireEvent.click(screen.getByRole("button", { name: "退出登录" }));
+  fireEvent.click(screen.getByRole("button", { name: "账户菜单" }));
+  fireEvent.click(await screen.findByRole("button", { name: "退出登录" }));
   act(() => {
     window.dispatchEvent(new Event("blur"));
     window.dispatchEvent(new Event("focus"));

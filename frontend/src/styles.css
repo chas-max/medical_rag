@@ -545,6 +545,15 @@ a {
   font-size: 10px;
   animation: streaming-pulse 1.4s ease-in-out infinite;
 }
+/* 澄清轮次只是请用户补充对象，不是医学结论，因此没有拒答样式。 */
+.clarify {
+  margin-left: 10px;
+  padding: 3px 8px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent-text);
+  font-size: 10px;
+}
 @keyframes streaming-pulse {
   50% {
     opacity: 0.55;

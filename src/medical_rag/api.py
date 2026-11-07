@@ -17,7 +17,7 @@ from fastapi.responses import (
     RedirectResponse,
 )
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import RequestResponseEndpoint
@@ -28,6 +28,7 @@ from .chat_api import chat_router
 from .chat_history import ChatHistoryStore, HistoryImport
 from .chat_runtime import ChatRuntime
 from .config import Settings
+from .dialogue_models import DialogueRun, DialogueSnapshot
 from .jobs import DocumentJobStore
 from .memory import MemoryStore
 from .memory_api import memory_router
@@ -36,6 +37,10 @@ from .settings_store import ModelSettings, SettingsStore
 from .types import ApiError
 
 logger = logging.getLogger(__name__)
+
+# The bounded snapshot is already small by construction; this is the hard stop for
+# any caller that sends a hand-built body instead.
+MAX_DIALOGUE_CONTEXT_BYTES = 64 * 1024
 
 
 class _RejectWebSockets:
@@ -81,6 +86,27 @@ class SearchRequest(BaseModel):
 class AnswerRequest(SearchRequest):
     # A record label only: one endpoint is configured at a time, so any name is accepted.
     provider: str = "qwen"
+    # The patient portal must not receive the single-user legacy memory/profile.
+    memory: bool = True
+    # Internal backend extension: a trusted caller may forward this conversation's
+    # bounded snapshot. The browser never needs to send it and cannot grant access
+    # with it; the payload carries no credentials.
+    dialogue_context: DialogueSnapshot | None = None
+
+    @field_validator("dialogue_context", mode="before")
+    @classmethod
+    def parse_context(cls, value: object) -> object:
+        """Validate a JSON body through the strict JSON path, not Python tuples.
+
+        FastAPI hands the parsed body to ``model_validate``, and a strict model's
+        tuple fields would then reject the arrays a real JSON request contains.
+        """
+        if value is None or isinstance(value, DialogueSnapshot):
+            return value
+        try:
+            return DialogueSnapshot.model_validate_json(json.dumps(value, ensure_ascii=False))
+        except (TypeError, ValueError) as error:
+            raise ValueError("Invalid dialogue context") from error
 
 
 class ModelConfigRequest(BaseModel):
@@ -137,8 +163,24 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
             client = MilvusClient(uri=settings.milvus_uri, token=settings.milvus_token or None)
             store = MilvusStore(client, settings.collection_name)
             store.ensure_schema()
-            active_service = RagService(settings, store, BgeEmbedder(), BgeReranker(),
-                                        build_generator(settings))
+            embedder = BgeEmbedder()
+            history = None
+            if settings.chat_recall_enabled:
+                from .conversation_index import ConversationHistory
+
+                history = ConversationHistory(client, settings.chat_turn_collection,
+                                              embed=embedder.encode,
+                                              top_k=settings.chat_recall_top_k,
+                                              scope=settings.chat_recall_scope,
+                                              half_life_days=settings.chat_recall_half_life_days)
+                try:
+                    history.ensure_schema()
+                except Exception:  # noqa: BLE001 - recall is optional, answering is not
+                    logger.warning("会话向量集合不可用，历史召回已关闭")
+                    history = None
+            active_service = RagService(settings, store, embedder, BgeReranker(),
+                                        build_generator(settings),
+                                        conversation_history=history)
         return active_service
 
     app = FastAPI(title="公开医疗资料检索问答", version="0.1.0")
@@ -179,7 +221,27 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
         from .profile_intent import ProfileIntentAnalyzer
 
         profile_analyzer = ProfileIntentAnalyzer(OpenAITransport(settings))
-    runtime = ChatRuntime(history, memory, profile_analyzer, _service)
+    # The rolling digest rides the configured endpoint; with no key there is nothing to call.
+    from .generation import OpenAITransport
+    from .summarize import ConversationSummarizer
+
+    summarizer = ConversationSummarizer(
+        history, OpenAITransport(settings) if settings.qwen_api_key else None)
+
+    def _conversation_history():
+        """Resolve the per-session turn index lazily; None keeps recall disabled."""
+        try:
+            return getattr(_service(), "conversation_history", None)
+        except Exception:  # noqa: BLE001 - optional index, never a request failure
+            return None
+
+    from .conversation_index import ConversationIndexer
+
+    indexer = (ConversationIndexer(_conversation_history)
+               if settings.chat_recall_enabled else None)
+    runtime = ChatRuntime(history, memory, profile_analyzer, _service,
+                          summarizer=summarizer, indexer=indexer,
+                          dialogue_state_enabled=settings.dialogue_state_enabled)
     app.state.chat_runtime = runtime
     app.include_router(chat_router(runtime, _success, _event_frame))
 
@@ -230,6 +292,11 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
     @app.get("/conversations/{conversation_id}")
     def conversation(conversation_id: str):
         return _success(history.get_conversation(conversation_id))
+
+    @app.delete("/conversations/{conversation_id}")
+    def delete_conversation(conversation_id: str):
+        """Remove one chat together with its digest, vectors and episode copies."""
+        return _success(runtime.delete_conversation(conversation_id))
 
     @app.get("/settings/model")
     def model_config():
@@ -290,9 +357,31 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
 
     @app.post("/answers")
     def answer(payload: AnswerRequest):
-        _, context = memory_snapshot(payload.question)
-        options = {"memory_context": context} if context else {}
-        return _success(_service().answer(payload.question, payload.provider, payload.top_k or settings.top_k, **options))
+        if payload.dialogue_context is not None and payload.memory:
+            raise ApiError("INVALID_QUERY", "上下文参数组合无效", 422)
+        run = (DialogueRun(payload.dialogue_context or DialogueSnapshot())
+               if settings.dialogue_state_enabled else None)
+        if payload.dialogue_context is not None and not settings.dialogue_state_enabled:
+            # Never silently drop the context and answer as if the follow-up were
+            # standalone: the caller would commit a state the server never used.
+            raise ApiError("DIALOGUE_FEATURE_DISABLED", "连续追问功能未启用", 409)
+        if run is not None and payload.dialogue_context is not None:
+            size = len(payload.dialogue_context.model_dump_json().encode("utf-8"))
+            if size > MAX_DIALOGUE_CONTEXT_BYTES:
+                raise ApiError("INVALID_QUERY", "上下文参数组合无效", 422)
+        # Memory reads stay exactly as before; a context call never touches them.
+        options: dict[str, object] = {"dialogue": run, "retain_run": payload.memory}
+        if payload.memory:
+            _, context = memory_snapshot(payload.question)
+            if context:
+                options["memory_context"] = context
+        answer = _service().answer(payload.question, payload.provider,
+                                   payload.top_k or settings.top_k, **options)
+        if payload.dialogue_context is not None and run is not None and run.resolution is not None:
+            # Only the internal patient backend reads this field; the public patient
+            # response is built from an explicit allowlist.
+            answer = {**answer, "dialogue_resolution": run.resolution.model_dump(mode="json")}
+        return _success(answer)
 
 
     @app.get("/runs/{run_id}")

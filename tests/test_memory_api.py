@@ -72,7 +72,7 @@ def test_each_run_receives_memory_without_changing_question(tmp_path, monkeypatc
     assert response.status_code == 200, response.text
     result = read_events(response.text)[-1][1] if stream else response.json()["data"]
     assert result["status"] == "success"
-    assert len(transport.payloads) == 3
+    assert len(transport.payloads) == 4
     assert all(p["question"] == "如何随访？" for p in transport.payloads)
     assert all("简短中文" in p["memory_context"] for p in transport.payloads if "memory_context" in p)
     assert sum("memory_context" in p for p in transport.payloads) == 2

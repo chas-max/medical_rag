@@ -4,6 +4,7 @@ from functools import partial
 from pathlib import Path
 from threading import RLock
 
+from ..question_resolver import QuestionResolver
 from ..tokenization import (
     DEFAULT_CHUNK_TOKENS,
     DEFAULT_OVERLAP_TOKENS,
@@ -29,7 +30,8 @@ from .registry import NodeRegistry
 
 def build_registry(store: object, embedder: object, reranker: object,
                    generator: object, settings: object = None,
-                   repository: object = None) -> NodeRegistry:
+                   repository: object = None,
+                   conversation_history: object = None) -> NodeRegistry:
     registry = NodeRegistry()
     resource_lock = RLock()
     candidate_k = getattr(settings, "candidate_k", 20)
@@ -43,6 +45,9 @@ def build_registry(store: object, embedder: object, reranker: object,
     token_counter = default_token_counter()
     default_provider = getattr(settings, "provider", "qwen")
     transport = getattr(generator, "transport", None)
+    # One bounded resolver per registry: the resolve node never builds a client and
+    # never keeps per-request state on itself.
+    resolver = QuestionResolver(transport, default_provider)
     # provider 是这次调用的配置而不是必须连线的数据：所有会用模型的节点都能
     # 在不接 provider 的情况下运行，缺省用运行时的默认厂商。
     provider_port = PortSpec("provider", "string", optional=True)
@@ -81,12 +86,21 @@ def build_registry(store: object, embedder: object, reranker: object,
                     {"top_k": {"type": "integer", "default": top_k, "minimum": 1, "maximum": 20},
                      "threshold": {"type": "number", "default": threshold, "minimum": 0, "maximum": 1},
                      "rerank_k": {"type": "integer", "default": rerank_k, "minimum": 1}}),
+        BuiltinNode("question.resolve", "结构化问题消解", "question",
+                    {"question": "string", "provider": provider_port},
+                    {"query": "string"},
+                    partial(question.resolve_question, resolver=resolver)),
         BuiltinNode("question.router", "问题路由", "question",
                     {"question": "string", "provider": provider_port}, {"route": "selector"},
                     partial(question.route_question, transport=transport,
                             default_provider=default_provider)),
+        BuiltinNode("question.pre_route", "问题前置路由", "question",
+                    {"question": "string"}, {"route": "selector", "reason": "string"},
+                    question.pre_route,
+                    {"require_context": {"type": "boolean", "default": True}}),
         BuiltinNode("question.rewrite", "问题重写", "question",
-                    {"question": "string", "provider": provider_port, "route": route_port},
+                    {"question": "string", "provider": provider_port, "route": route_port,
+                     "history": PortSpec("history", "history_context", optional=True)},
                     {"query": "string"},
                     partial(question.rewrite, transport=transport,
                             default_provider=default_provider)),
@@ -132,6 +146,7 @@ def build_registry(store: object, embedder: object, reranker: object,
         BuiltinNode("generation.llm", "模型回答", "generation",
                     {"question": "string", "provider": provider_port,
                      "plan": PortSpec("plan", "string", optional=True),
+                     "history": PortSpec("history", "history_context", optional=True),
                      "evidence": PortSpec("evidence", "evidence_list",
                                           requires_tag="evidence.gated")},
                     {"draft": "string", "evidence": "evidence_list"},
@@ -183,11 +198,17 @@ def build_registry(store: object, embedder: object, reranker: object,
             node.worker_lock = resource_lock
         registry.register(node)
     from .agentic import AgenticNode
+    from .corrective import CorrectiveNode
     from .nodes.agent import child_nodes
     from .repository import WorkflowRepository
     if repository is None:
         repository = WorkflowRepository(Path(__file__).resolve().parents[3] / "workflows")
     for node in child_nodes(transport, default_provider):
         registry.register(node)
+    # The corrective node composes the retrieval handlers above, so it is created
+    # after they exist in the registry.
+    registry.register(CorrectiveNode(registry, transport, default_provider,
+                                     threshold=threshold, top_k=top_k,
+                                     history=conversation_history))
     registry.register(AgenticNode(repository, registry))
     return registry

@@ -551,3 +551,16 @@ and must not be silently represented as fixed. No source change after the
 reviewed freeze; accepted only for fictional-data development, not production.
 
 
+
+2026-11-05 患者入口 ChatGPT 式问答改造（本轮未走独立复审流程）：
+登录即会话界面 + 左下账户菜单；可选 `[chat]` 患者鉴权 `POST /chat`，
+预检后调用本机公开资料 RAG 答案服务，持久化前二次校验，按 user/assistant
+保存 turn 与引用；撤回期间的回答丢弃。迁移 0008 新增 role/citations/ordinal
+与 chat.ask 审计 action，授权脚本/启动预检同步。HTTP 冲突真实根因是 Authlib
+1.9 内部使用 httpx2，而 `oidc_login.py` 传入 httpx v1 transport 触发断言；
+已把 OIDC 及其 mock transport 测试迁移到 httpx2，并钉住 httpx/httpx2/openai
+版本。验证：后端非集成 1622 passed/5 skipped；患者实际 PostgreSQL 57 passed；
+认证/患者/支持组合 284 passed；前端 215 passed，lint 与两个构建通过；
+演示 verify.py 14/14，verify_chat.py 真实回答 1 条引用。仍是虚构演示：
+`[chat]` 指向本机 unsafe-local-demo `/answers`，无流式、账号级限流、医院 IdP/
+模型审批、临床或生产验收；旧应用保持独立和默认锁定。

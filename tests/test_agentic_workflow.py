@@ -296,7 +296,8 @@ def test_default_and_new_graphs_validate(tmp_path):
     service, _, _, _ = setup(tmp_path)
     for graph in service.repository.list_published():
         assert not validate_workflow(graph, service.registry), graph.id
-    assert service.repository.get("medical-answer").version == 3
+    # v7 已发布，默认版本选择跟随发布；开关关闭时仍显式回落到 v6（见 test_service）。
+    assert service.repository.get_published("medical-answer").version == 7
 
 
 @pytest.mark.parametrize(

@@ -18,6 +18,7 @@ from .config import Settings
 from .model_json import parse_model_json
 from .numeric_validation import numbers_supported
 from .selfcheck import Decision, SelfCheckPolicy, assess
+from .short_term import history_boundary, short_term_boundary
 from .streaming import ClaimStreamParser
 from .tools import TAVILY_TOOL, ToolCall, ToolRegistry, build_tools
 from .types import ApiError, Evidence
@@ -162,6 +163,18 @@ def plan_section(plan: object) -> str:
     if not text:
         return ""
     return PLAN_DIRECTIVE + "\n" + text
+
+
+ORIGINAL_QUESTION_NOTICE = (
+    "\n本轮主问题 question 已结合会话完成消解。original_question 是用户本轮原话，"
+    "只用于核对用户原意和约束是否被保留；不得据此把讨论对象改回旧主题，"
+    "也不得在回答里照抄原话中的代词。"
+)
+
+
+def original_question_notice(original_question: object) -> str:
+    """System-prompt appendix for the raw user words; empty when absent."""
+    return ORIGINAL_QUESTION_NOTICE if isinstance(original_question, str) and original_question else ""
 
 SEARCH_SYSTEM = ("本次自检判定检索证据不足或缺失：先调用 tavily_search 工具联网补充资料再输出最终 JSON，"
                  "需要不同侧面时可以再次调用。工具返回的网页摘录与本地证据适用相同的锚定规则："
@@ -461,14 +474,19 @@ class GroundedGenerator:
         self.max_tool_calls = max_tool_calls
 
     def answer(self, question: str, evidence: list[Evidence], provider: str,
-               web_search: bool = False, memory_context: str = "") -> dict:
-        result = self.generate(question, evidence, provider, web_search, memory_context=memory_context)
+               web_search: bool = False, memory_context: str = "",
+               original_question: str = "") -> dict:
+        result = self.generate(question, evidence, provider, web_search,
+                               memory_context=memory_context,
+                               original_question=original_question)
         return self.validate(result["draft"], result["evidence"],
                              truncated=result.get("truncated", False))
 
     def draft(self, question: str, evidence: list[Evidence], provider: str,
               web_search: bool = False, on_claim: Callable[[dict], None] | None = None,
-              plan: str = "", memory_context: str = "") -> dict:
+              plan: str = "", memory_context: str = "",
+              short_term: object | None = None, history: list[dict] | None = None,
+              original_question: str = "") -> dict:
         """Workflow drafting step: stream anchored claims, then the interpretive section.
 
         Keeps the return shape this step already had. Self-check, the web-search
@@ -476,25 +494,37 @@ class GroundedGenerator:
         for :meth:`generate_stream`; only the extra ``analysis`` event is new, and
         it is pushed after every claim so the interface can render two sections.
         ``plan`` carries the 回答规划 node's structure; empty keeps the plain prompt.
+        ``short_term`` is this conversation's bounded window plus digest: context for
+        reading the question, never a source of medical facts. ``history`` is the
+        subset rule 2 recalled from the turn index, kept in its own payload field.
         """
         return self._generate(question, evidence, provider, web_search, on_claim, plan=plan,
-                              memory_context=memory_context)
+                              memory_context=memory_context, short_term=short_term,
+                              history=history, original_question=original_question)
 
     def generate_stream(self, question: str, evidence: list[Evidence], provider: str,
                         web_search: bool = False,
                         on_claim: Callable[[dict], None] | None = None, plan: str = "",
-                        memory_context: str = "") -> dict:
+                        memory_context: str = "",
+                        short_term: object | None = None,
+                        history: list[dict] | None = None,
+                        original_question: str = "") -> dict:
         """Stream claims without publishing the analysis event.
 
         Callers that render the analysis themselves (the workflow draft step) use
         :meth:`draft`; this keeps the plain claim-only contract of the streaming API.
         """
         return self._generate(question, evidence, provider, web_search, on_claim,
-                              publish_analysis=False, plan=plan, memory_context=memory_context)
+                              publish_analysis=False, plan=plan, memory_context=memory_context,
+                              short_term=short_term, history=history,
+                              original_question=original_question)
 
     def _generate(self, question: str, evidence: list[Evidence], provider: str,
                   web_search: bool, on_claim: Callable[[dict], None] | None,
-                  publish_analysis: bool = True, plan: str = "", memory_context: str = "") -> dict:
+                  publish_analysis: bool = True, plan: str = "", memory_context: str = "",
+                  short_term: object | None = None,
+                  history: list[dict] | None = None,
+                  original_question: str = "") -> dict:
         from .memory_context import memory_boundary
 
         available = bool(web_search and self.tools)
@@ -509,9 +539,13 @@ class GroundedGenerator:
         if not merged:
             return {"draft": "", "evidence": merged, "mode": decision.mode, "queries": queries,
                     "truncated": False}
-        user = self._user(question, merged, memory_context=memory_context)
+        user = self._user(question, merged, memory_context=memory_context,
+                          short_term=short_term, history=history,
+                          original_question=original_question)
         if not available or decision.mode == "clear":
-            system = BASE_SYSTEM + plan_section(plan) + memory_boundary(memory_context)
+            system = (BASE_SYSTEM + plan_section(plan) + memory_boundary(memory_context)
+                      + short_term_boundary(short_term) + history_boundary(history)
+                      + original_question_notice(original_question))
             if on_claim is None:
                 completion = self._complete(provider, system, user)
                 draft, truncated = completion.text, completion.truncated
@@ -523,7 +557,8 @@ class GroundedGenerator:
                     "truncated": truncated}
         draft, merged, agent_queries, truncated = self._agent(
             question, merged, provider, decision, on_claim, plan=plan,
-            memory_context=memory_context)
+            memory_context=memory_context, short_term=short_term, history=history,
+            original_question=original_question)
         self._publish_analysis(draft, merged, on_claim, publish_analysis)
         return {"draft": draft, "evidence": merged, "mode": decision.mode,
                 "queries": queries + agent_queries, "truncated": truncated}
@@ -560,20 +595,33 @@ class GroundedGenerator:
             raise ApiError("MODEL_UNAVAILABLE", "生成模型服务不可用", 503) from error
 
     def generate(self, question: str, evidence: list[Evidence], provider: str,
-                 web_search: bool = False, plan: str = "", memory_context: str = "") -> dict:
+                 web_search: bool = False, plan: str = "", memory_context: str = "",
+                 short_term: object | None = None,
+                 history: list[dict] | None = None,
+                 original_question: str = "") -> dict:
         """Self-check the retrieval, search the web when it is not enough, then draft."""
         return self._generate(question, evidence, provider, web_search, None, plan=plan,
-                              memory_context=memory_context)
+                              memory_context=memory_context, short_term=short_term,
+                              history=history, original_question=original_question)
 
     def _agent(self, question: str, evidence: list[Evidence], provider: str,
                decision: Decision,
                on_claim: Callable[[dict], None] | None = None, plan: str = "",
-               memory_context: str = "") -> tuple[str, list[Evidence], list[str], bool]:
+               memory_context: str = "",
+               short_term: object | None = None,
+               history: list[dict] | None = None,
+               original_question: str = "") -> tuple[str, list[Evidence], list[str], bool]:
         from .memory_context import memory_boundary
 
         messages = [{"role": "system",
-                     "content": BASE_SYSTEM + SEARCH_SYSTEM + plan_section(plan) + memory_boundary(memory_context)},
-                    {"role": "user", "content": self._user(question, evidence, decision, memory_context)}]
+                     "content": (BASE_SYSTEM + SEARCH_SYSTEM + plan_section(plan)
+                                 + memory_boundary(memory_context)
+                                 + short_term_boundary(short_term)
+                                 + history_boundary(history)
+                                 + original_question_notice(original_question))},
+                    {"role": "user", "content": self._user(question, evidence, decision,
+                                                           memory_context, short_term, history,
+                                                           original_question)}]
         merged = list(evidence)
         queries: list[str] = []
         budget = self.max_tool_calls
@@ -621,12 +669,25 @@ class GroundedGenerator:
             raise ApiError("MODEL_UNAVAILABLE", "生成模型服务不可用", 503) from error
 
     def _user(self, question: str, evidence: list[Evidence], decision: Decision | None = None,
-              memory_context: str = "") -> str:
-        payload = {"question": question, "evidence": self._evidence_payload(evidence)}
+              memory_context: str = "", short_term: object | None = None,
+              history: list[dict] | None = None,
+              original_question: str = "") -> str:
+        payload: dict[str, object] = {"question": question,
+                                      "evidence": self._evidence_payload(evidence)}
         if decision is not None:
             payload["self_check"] = {"mode": decision.mode, "reason": decision.reason}
         if memory_context:
             payload["memory_context"] = memory_context
+        if short_term:
+            # A separate key, never merged into evidence: the conversation is context,
+            # and citation validation must keep seeing only retrieved blocks.
+            payload["short_term"] = short_term.payload()
+        if history:
+            payload["history"] = [dict(item) for item in history]
+        if original_question:
+            # The raw words stay beside the resolved question, never in its place:
+            # retrieval and grounding already used the complete question.
+            payload["original_question"] = original_question
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod

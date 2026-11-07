@@ -16,6 +16,8 @@ export type Message = {
   abstained?: boolean;
   /** 拒答原因码，决定界面徽标写“证据不足”还是“生成异常/输出截断”。 */
   abstainReason?: string;
+  /** 服务端权威回答类型；旧记录缺失时按普通回答解释。 */
+  answerType?: "answer" | "clarification";
   runId?: string;
   trace?: SafeNodeTrace[];
   pending?: boolean;
