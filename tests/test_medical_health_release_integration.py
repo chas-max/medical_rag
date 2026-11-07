@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from medical_rag.evaluation_tools import remap_release, validate_release
 from medical_rag.ingest import chunk_document, parse_document
 
@@ -16,6 +18,7 @@ class ConstantEmbedder:
         return [[1.0, 0.0] for _ in texts]
 
 
+@pytest.mark.pinned_release
 def test_pinned_sources_remap_all_500_questions_with_default_chunking(tmp_path):
     dataset = RELEASE / "questions.jsonl"
     registry = RELEASE / "source-registry.json"
