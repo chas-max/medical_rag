@@ -72,7 +72,15 @@ def chunk(
 
 
 def embed(inputs: dict, config: dict, context: ExecutionContext, embedder: object) -> dict:
-    return {"vectors": embedder.encode([item.text for item in inputs["chunks"]])}
+    from ...pdf_sections import format_chunk_for_index
+
+    include_metadata = bool(config.get("include_metadata", False))
+    texts = [
+        format_chunk_for_index(item.filename, item.section, item.text)
+        if include_metadata else item.text
+        for item in inputs["chunks"]
+    ]
+    return {"vectors": embedder.encode(texts)}
 
 
 def store(inputs: dict, config: dict, context: ExecutionContext, database: object) -> dict:

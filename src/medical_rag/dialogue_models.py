@@ -72,11 +72,19 @@ class Topic(StrictModel):
 
 
 class Reference(StrictModel):
-    """One anaphor resolved to an entity plus the turn that backs it."""
+    """One anaphor resolved to an entity plus the turn that backs it.
+
+    ``source_role`` records whether the backing text is the user's words or the
+    assistant's reply; like Topic, an assistant mention is context, never a fact
+    about the user. The field is optional: a reply that omits it is checked
+    against every text of the cited turn, while a reply that claims it is pinned
+    to that one text.
+    """
 
     expression: str = Field(min_length=1, max_length=MAX_TOPIC_CHARS)
     entity: str = Field(min_length=1, max_length=MAX_TOPIC_CHARS)
     source_turn_id: str = Field(min_length=1, max_length=MAX_SOURCE_CHARS)
+    source_role: SourceRole | None = None
 
 
 class PendingClarification(StrictModel):

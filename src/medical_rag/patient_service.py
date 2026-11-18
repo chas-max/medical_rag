@@ -59,6 +59,19 @@ class ResourceMissing(Exception):
 
 
 @dataclass(frozen=True, slots=True)
+class StreamPlan:
+    """What an authorized streaming turn may act on.
+
+    It carries no identity, role, consent or session snapshot: the persisting
+    transaction re-reads all of those instead of trusting this plan.
+    """
+
+    target: UUID | None
+    snapshot: DialogueSnapshot
+    question: str
+
+
+@dataclass(frozen=True, slots=True)
 class HealthNotice:
     """Institution-supplied immutable actual notice; no pre-approved default."""
 
@@ -156,16 +169,20 @@ class PatientService:
 
     def __init__(self, sessions: SessionStore, notice: HealthNotice,
                  chat: ChatAnswerer | None = None, *,
-                 dialogue_state_enabled: bool = False) -> None:
+                 dialogue_state_enabled: bool = False,
+                 chat_streaming: bool = False) -> None:
         if not isinstance(sessions, SessionStore) or type(notice) is not HealthNotice:
             raise ValueError("Trusted session store and health notice required")
         if chat is not None and not callable(getattr(chat, "answer", None)):
             raise ValueError("Trusted chat answerer required")
+        if chat_streaming and not callable(getattr(chat, "stream", None)):
+            raise ValueError("Streaming requires a trusted streaming answerer")
         self.sessions = sessions
         self.notice = notice
         self.chat = chat
         # Injected from trusted process configuration only, never a request body.
         self.dialogue_state_enabled = dialogue_state_enabled
+        self.chat_streaming = chat_streaming
         self.audit = AuditStore(sessions)
 
     def _subject(self, authorized: AuthorizedTransaction, *, exclusive: bool = False,
@@ -238,6 +255,7 @@ class PatientService:
                     "roles": sorted(principal.roles), "binding": {"verified": principal.patient_id is not None},
                     "permissions": {"identity": True, "health_consent": eligible, "conversations": current,
                                     "chat": self.chat is not None,
+                                    "chat_stream": self.chat is not None and self.chat_streaming,
                                     "support_self": True,
                                     "support_queue": is_allowed(principal, Action.SUPPORT_CASE_MANAGE,
                                                                 Resource(principal.tenant_id)),
@@ -343,6 +361,24 @@ class PatientService:
         transaction: if consent, role, binding, the session or the conversation's
         content version changed meanwhile, the generated answer is discarded and
         no turn or state is stored.
+
+        The streaming path calls the same three steps, so both modes can only
+        differ in how the answer travels, never in what gets stored.
+        """
+        plan = self.prepare_stream(token, csrf_token=csrf_token,
+                                   conversation_id=conversation_id, question=question)
+        answer = (self.chat.answer(question, dialogue=plan.snapshot)
+                  if self.dialogue_state_enabled else self.chat.answer(question))
+        return self.finish_stream(token, csrf_token=csrf_token, plan=plan, answer=answer)
+
+    def prepare_stream(self, token: str, *, csrf_token: str,
+                       conversation_id: str | None, question: str) -> "StreamPlan":
+        """Authorize and snapshot before one byte of answer may leave the process.
+
+        Raises:
+            ChatUnavailable: The answer source is not configured.
+            PatientDenied: No current verified adult self-patient authority.
+            ResourceMissing: The conversation is not this patient's.
         """
         if self.chat is None:
             raise ChatUnavailable()
@@ -357,8 +393,57 @@ class PatientService:
                 self._conversation(db, subject, target)
                 if self.dialogue_state_enabled:
                     snapshot = read_snapshot(db, subject, target)
-        answer = (self.chat.answer(question, dialogue=snapshot)
-                  if self.dialogue_state_enabled else self.chat.answer(question))
+        return StreamPlan(target, snapshot, question)
+
+    def open_stream(self, token: str, *, csrf_token: str,
+                    conversation_id: str | None, question: str) -> Iterator[JsonObject]:
+        """Authorize now, then return the frame generator.
+
+        Deliberately a plain method returning a generator rather than a generator
+        function: authorization must run, and be able to fail, before the HTTP
+        layer commits to a 200 stream. Only failures after this point become
+        ``error`` frames.
+        """
+        plan = self.prepare_stream(token, csrf_token=csrf_token,
+                                   conversation_id=conversation_id, question=question)
+        return self._frames(token, csrf_token=csrf_token, plan=plan)
+
+    def _frames(self, token: str, *, csrf_token: str,
+                plan: "StreamPlan") -> Iterator[JsonObject]:
+        """Relay provisional frames, then the persisted answer as the last frame."""
+        stream = getattr(self.chat, "stream", None)
+        if not callable(stream):
+            raise ChatUnavailable()
+        yield {"event": "status", "data": {"stage": "accepted"}}
+        answer: object = None
+        frames = (stream(plan.question, dialogue=plan.snapshot)
+                  if self.dialogue_state_enabled else stream(plan.question))
+        for frame in frames:
+            if type(frame) is not dict:
+                raise ChatUnavailable()
+            name = frame.get("event")
+            if name == "done":
+                answer = frame.get("data")
+                break
+            if name in {"status", "claim"}:
+                yield frame
+            # ``analysis`` and any other name is dropped: the non-streaming
+            # response never carried them to a patient either.
+        if answer is None:
+            raise ChatUnavailable()
+        yield {"event": "done",
+               "data": self.finish_stream(token, csrf_token=csrf_token,
+                                          plan=plan, answer=answer)}
+
+    def finish_stream(self, token: str, *, csrf_token: str, plan: "StreamPlan",
+                      answer: object) -> JsonObject:
+        """Persist one generated answer under fresh authority; never partial.
+
+        Raises:
+            ChatUnavailable: The answer is not a complete, well-shaped result.
+            ConversationContextChanged: Another write moved the conversation.
+            PatientDenied: Consent, role, binding or the session changed meanwhile.
+        """
         if type(answer) is not dict:
             raise ChatUnavailable()
         content = answer.get("answer")
@@ -376,6 +461,7 @@ class PatientService:
         answer_type = answer.get("answer_type", "answer")
         if answer_type not in {"answer", "clarification"}:
             raise ChatUnavailable()
+        target = plan.target
         with self._operation(token, audit_action=AuditAction.TURN_APPEND,
                              csrf_token=csrf_token, mutation=True) as (db, subject, _, _):
             if target is None:
@@ -383,7 +469,8 @@ class PatientService:
                     db.execute("INSERT INTO medical_rag.conversations"
                                "(tenant_id,patient_id,conversation_id,title) "
                                "VALUES (%s,%s,%s,%s) RETURNING conversation_id,title,created_at",
-                               (subject.tenant_id, subject.patient_id, uuid4(), _title(question))).fetchone(),
+                               (subject.tenant_id, subject.patient_id, uuid4(),
+                                _title(plan.question))).fetchone(),
                     "title")
                 expected = 0
             else:
@@ -392,14 +479,15 @@ class PatientService:
                 # The version fence only applies to the context-carrying path: with
                 # the switch off there is no snapshot to be stale, and the counter
                 # still advances so a later re-enable notices the gap.
-                if self.dialogue_state_enabled and expected != snapshot.context_version:
+                if self.dialogue_state_enabled and expected != plan.snapshot.context_version:
                     raise ConversationContextChanged()
             target = UUID(str(conversation["id"]))
             asked = db.execute("INSERT INTO medical_rag.conversation_turns "
                                "(tenant_id,patient_id,conversation_id,turn_id,content,role) "
                                "VALUES (%s,%s,%s,%s,%s,'user') "
                                "RETURNING turn_id,content,role,citations,answer_type,created_at",
-                               (subject.tenant_id, subject.patient_id, target, uuid4(), question)).fetchone()
+                               (subject.tenant_id, subject.patient_id, target, uuid4(),
+                                plan.question)).fetchone()
             answered = db.execute("INSERT INTO medical_rag.conversation_turns "
                                   "(tenant_id,patient_id,conversation_id,turn_id,content,role,citations,"
                                   "answer_type) "
@@ -407,7 +495,7 @@ class PatientService:
                                   "RETURNING turn_id,content,role,citations,answer_type,created_at",
                                   (subject.tenant_id, subject.patient_id, target, uuid4(), content,
                                    Jsonb(citations), answer_type)).fetchone()
-            self._commit_semantics(db, subject, target, snapshot, answer, expected,
+            self._commit_semantics(db, subject, target, plan.snapshot, answer, expected,
                                    answer_type=answer_type, content=content,
                                    abstained=abstained, turn_id=asked[0])
             response: JsonObject = {"conversation": conversation, "question": _turn(asked),

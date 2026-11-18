@@ -7,6 +7,10 @@ import math
 CRITERIA = {
     "faithfulness": "评估回答中的事实性内容是否全部由上下文支持；0=完全无支持，1=全部有支持。",
     "context_relevance": "评估这段上下文对回答问题的帮助；0=无关，1=直接且充分相关。",
+    "subquery_context_relevance": (
+        "评估这段上下文对回答主问题或其任一子问题的帮助；即使只直接支撑其中一个子问题或关键侧面，"
+        "也按其对该子问题的支持程度评分；0=对所有方面均无关，1=直接且充分支持至少一个核心问题或子问题。"
+    ),
     "answer_relevance": "评估回答是否直接且充分回应问题；0=完全无关，1=直接且充分。",
 }
 
@@ -41,6 +45,12 @@ class EvaluationJudge:
 
     def score_context(self, question: str, context: str) -> dict:
         return self._score("context_relevance", {"question": question, "context": context})
+
+    def score_context_subquery(self, question: str, subqueries: list[str], context: str) -> dict:
+        return self._score(
+            "subquery_context_relevance",
+            {"question": question, "subqueries": list(subqueries), "context": context},
+        )
 
     def score_answer(self, question: str, answer: str) -> dict:
         return self._score("answer_relevance", {"question": question, "answer": answer})

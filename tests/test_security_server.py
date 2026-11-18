@@ -813,3 +813,75 @@ def test_real_direct_tls_process_serves_only_dedicated_build(
         process.terminate()
         stdout, stderr = process.communicate(timeout=10)
     assert stdout == b"" and stderr == b""
+
+def _with_logging(config_file, body):
+    config_file.write_text(
+        config_file.read_text(encoding="utf-8") + "\n[logging]\n" + body + "\n",
+        encoding="utf-8",
+    )
+    return config_file
+
+
+def test_portal_logging_is_off_unless_configured(config_file):
+    loaded = load_configuration(config_file)
+    assert loaded.logging_config.enabled is False
+    assert loaded.logging_config.directory is None
+
+
+def test_portal_logging_disabled_section_is_honoured(config_file):
+    loaded = load_configuration(_with_logging(config_file, "enabled = false"))
+    assert loaded.logging_config.enabled is False
+    assert loaded.logging_config.directory is None
+
+
+def test_portal_logging_enabled_resolves_bounded_options(config_file):
+    loaded = load_configuration(
+        _with_logging(
+            config_file,
+            "\n".join(
+                (
+                    "enabled = true",
+                    'directory = "portal-logs"',
+                    'level = "debug"',
+                    'rotation = "5 MB"',
+                    'retention = "3 days"',
+                    'compression = "gz"',
+                    "json = true",
+                )
+            ),
+        )
+    )
+    logging_config = loaded.logging_config
+    assert logging_config.enabled is True
+    assert logging_config.directory == config_file.parent / "portal-logs"
+    assert logging_config.level == "DEBUG"
+    assert logging_config.rotation == "5 MB"
+    assert logging_config.retention == "3 days"
+    assert logging_config.compression == "gz"
+    assert logging_config.json_output is True
+
+
+def test_portal_logging_can_disable_compression(config_file):
+    loaded = load_configuration(
+        _with_logging(config_file, 'enabled = true\ndirectory = "logs"\ncompression = ""')
+    )
+    assert loaded.logging_config.compression == ""
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'enabled = "true"\ndirectory = "logs"',
+        "enabled = true",
+        'enabled = true\ndirectory = ""',
+        'enabled = true\ndirectory = "logs"\nlevel = "verbose"',
+        'enabled = true\ndirectory = "logs"\nrotation = "20 XB"',
+        'enabled = true\ndirectory = "logs"\nretention = "forever"',
+        'enabled = true\ndirectory = "logs"\ncompression = "rar"',
+        'enabled = true\ndirectory = "logs"\njson = "yes"',
+        'enabled = true\ndirectory = "logs"\nunexpected = 1',
+    ],
+)
+def test_invalid_portal_logging_is_rejected_statically(config_file, body):
+    with pytest.raises(StartupError):
+        load_configuration(_with_logging(config_file, body))

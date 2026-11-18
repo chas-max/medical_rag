@@ -153,7 +153,7 @@ http {{
         location @body_limit {{ return 413 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_BODY_LIMIT","message":"Request too large"}}}}'; }}
         location @rate_limit {{ return 429 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_RATE_LIMIT","message":"Development admission limit"}}}}'; }}
         location @unavailable {{ return 502 '{{"success":false,"data":null,"error":{{"code":"GATEWAY_UNAVAILABLE","message":"Service unavailable"}}}}'; }}
-        location ~ ^/(auth/(login|callback|session|logout|backchannel-logout)|me(/consents/health)?|conversations(/[0-9a-fA-F-]+(/turns)?)?|audit|support/(cases(/[0-9a-fA-F-]+)?|queue(/[0-9a-fA-F-]+/(take|resolve))?)|patient\\.html|assets/.+)?$ {{
+        location ~ ^/(auth/(login|callback|session|logout|backchannel-logout)|me(/consents/health)?|conversations(/[0-9a-fA-F-]+(/turns)?)?|chat(/stream)?|audit|support/(cases(/[0-9a-fA-F-]+)?|queue(/[0-9a-fA-F-]+/(take|resolve))?)|patient\\.html|assets/.+)?$ {{
             proxy_pass {c.upstream_url};
             proxy_ssl_verify on;
             proxy_ssl_verify_depth 3;

@@ -269,3 +269,73 @@ def test_history_recall_failure_does_not_break_the_correction():
     assert result.outputs["report"]["stop_reason"] == "retried"
     assert "history" not in result.outputs
     assert len(result.outputs["evidence"]) == 2
+
+
+
+def test_corrective_rewrite_on_other_preserves_topic():
+    from medical_rag.dialogue_models import DialogueRun, DialogueSnapshot, Resolution, Topic
+
+    class RewriteTransport:
+        def complete(self, provider, system, user):
+            payload = json.loads(user)
+            if "question" in payload and "输出" in system:
+                return json.dumps({"question": "降压药物联合原则与注意事项"}, ensure_ascii=False)
+            return json.dumps({"hypothetical": "高血压治疗注意事项"}, ensure_ascii=False)
+
+    chunks = [
+        Chunk("c1", "d1", "guide.md", "高血压 降压药物联合原则", "guide.md", "治疗", 1, 0),
+        Chunk("c2", "d1", "guide.md", "高血压 注意事项", "guide.md", "治疗", 1, 1),
+    ]
+    node, store = _node(chunks, RewriteTransport())
+    run = DialogueRun(DialogueSnapshot())
+    run.resolution = Resolution(
+        original_question="复杂血压方案怎么选？",
+        status="resolved",
+        relation="standalone",
+        resolved_question="复杂血压方案怎么选？",
+        topic=Topic(name="高血压", type="disease", source_turn_id="current", source_role="user"),
+        intent="other",
+        intent_text="怎么选",
+    )
+    ctx = ExecutionContext("run", "medical-answer", {}, dialogue=run)
+    res = asyncio.run(
+        node.execute(
+            {"question": "复杂血压方案怎么选？", "evidence": []},
+            {"rewrite_on_other": True, "max_per_parent": 2},
+            ctx,
+        )
+    )
+    assert res.outputs["report"]["stop_reason"] == "retried"
+    assert res.outputs["report"]["queries"] == ["高血压 降压药物联合原则与注意事项"]
+    assert "高血压 降压药物联合原则与注意事项" in store.bm25_queries
+
+
+def test_corrective_subquery_gap_recovers_missing_guideline_facet():
+    from medical_rag.types import SCORE_RERANK
+
+    c_htn = Chunk("c_htn", "d1", "中国高血压防治指南(2024年修订版).pdf", "高血压血压目标小于140/90mmHg", "高血压指南.pdf", "治疗", 1, 0, parent_id="p_htn")
+    c_ckd = Chunk("c_ckd", "d2", "慢性肾脏病管理指南.pdf", "慢性肾脏病患者推荐使用ACEI或ARB", "肾脏病指南.pdf", "降压", 1, 0, parent_id="p_ckd")
+    node, store = _node([c_htn, c_ckd], Transport())
+
+    res = asyncio.run(
+        node.execute(
+            {
+                "question": "对比《中国高血压防治指南》和《慢性肾脏病管理指南》的推荐意见",
+                "evidence": [Evidence(c_htn, 0.88, score_kind=SCORE_RERANK)],
+                "subqueries": ["《中国高血压防治指南》 推荐意见", "《慢性肾脏病管理指南》 推荐意见"],
+                "top_k": 5,
+            },
+            {
+                "max_rounds": 1,
+                "min_evidence": 1,
+                "max_per_parent": 1,
+                "check_subquery_gaps": True,
+                "subquery_blend_weight": 0.35,
+                "subquery_quota": 1,
+            },
+            ExecutionContext("run", "medical-answer", {}),
+        )
+    )
+    assert res.outputs["report"]["stop_reason"] == "gap_retried"
+    assert any("《慢性肾脏病管理指南》" in q for q in res.outputs["report"]["queries"])
+    assert any(item.chunk.id == "c_ckd" for item in res.outputs["evidence"])

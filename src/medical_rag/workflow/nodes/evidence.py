@@ -39,6 +39,16 @@ def gate(inputs: dict, config: dict, context: ExecutionContext,
             if not fail_closed and item.score >= LEXICAL_MIN_COVERAGE:
                 evidence.append(item)
         # bm25 / web / unknown 的分数量纲与阈值不可比，一律不进入答案门控。
+    relative_floor_ratio = float(config.get("relative_floor_ratio", 0.0))
+    hard_floor = float(config.get("hard_floor", 0.0))
+    min_keep = max(1, int(config.get("min_keep", 1)))
+    if not degraded and (relative_floor_ratio > 0 or hard_floor > 0) and len(evidence) > min_keep:
+        top_score = max(item.score for item in evidence)
+        relative_floor = max(cutoff, hard_floor, top_score * relative_floor_ratio)
+        # 仅在高分主块领先明显时修剪排名靠后且分值断崖下跌的尾部块，至少保留 min_keep 条。
+        kept = list(evidence[:min_keep])
+        kept.extend(item for item in evidence[min_keep:] if item.score >= relative_floor)
+        evidence = kept
     # 联网是全局内置能力，不是本节点的开关：运行时能触网时，检索落空交给生成阶段兜底而不是过早拒答。
     fallback = supports(context.capabilities, CAPABILITY_WEB_SEARCH) and not evidence
     if evidence or fallback:

@@ -7,14 +7,19 @@
 import json
 import re
 
-from ...dialogue_models import DialogueRun, DialogueSnapshot
-from ...question_resolver import QuestionResolver, clarification_answer
+from ...dialogue_models import DialogueRun, DialogueSnapshot, Resolution
+from ...model_json import parse_model_json
+from ...question_resolver import QuestionResolver, clarification_answer, is_self_contained_question
 from ..contracts import ExecutionContext, Halt
 
 ROUTES = frozenset({"direct", "rewrite", "decompose", "hyde", "stepback"})
 PROMPTS = {
     "rewrite": "保留原意，把用户问题改写为一个清晰的检索问题；不编造医学事实。仅输出 JSON：{\"question\":\"...\"}。",
-    "decompose": "将多目标问题拆为至多三个可独立检索的问题；不要补充医学事实。仅输出 JSON：{\"questions\":[\"...\"]}。",
+    "decompose": (
+        "将多目标、多疾病或对比类问题按独立疾病/主题拆分为至多三个可独立检索的完整子问题"
+        "（每个子问题必须显式保留完整疾病或指南主体名称，严禁使用“两类慢病/两种疾病/上述疾病/该病”等代词）；"
+        "不要补充医学事实。仅输出 JSON：{\"questions\":[\"...\"]}。"
+    ),
     "hyde": "生成一段简短的、未经验证的模拟答案，仅供向量检索，不作为医学依据。仅输出 JSON：{\"hypothetical\":\"...\"}。",
     "stepback": "生成一个与原问题相关、更加抽象的上位问题；不要提供医学建议。仅输出 JSON：{\"question\":\"...\"}。",
 }
@@ -43,11 +48,8 @@ _DRUG_LEADING = ("那曲", "那可", "那他")
 
 
 def _decode(raw: object) -> dict:
-    try:
-        value = json.loads(raw)
-    except (TypeError, ValueError):
-        return {}
-    return value if isinstance(value, dict) else {}
+    payload = parse_model_json(raw).payload
+    return payload if isinstance(payload, dict) else {}
 
 
 def _complete(transport: object, provider: str, system: str, question: str) -> dict:
@@ -88,33 +90,38 @@ def resolve_question(inputs: dict, config: dict, context: ExecutionContext,
 
     The resolution is written into the caller-owned run slot, never into a port or
     the public output. A clarification halts before any retrieval or generation.
-
-    Args:
-        inputs: Node inputs; ``question`` is the exact user text.
-        config: Node config, unused.
-        context: Run context carrying the request-scoped dialogue slot.
-        resolver: Injected bounded resolver; no node builds its own client.
-
-    Returns:
-        ``{"query": resolved_question}`` or a :class:`Halt` carrying the fixed
-        clarification answer.
-
-    Raises:
-        ValueError: If the same run resolves the question twice.
     """
-    del config
     run = context.dialogue
     if run is None:
         run = DialogueRun(DialogueSnapshot())
         context.dialogue = run
     if run.resolution is not None:
         raise ValueError("Question was already resolved")
-    result = resolver.resolve(str(inputs["question"]), run.snapshot)
+    raw_question = str(inputs["question"])
+    clean_question = raw_question.strip()
+    result = resolver.resolve(raw_question, run.snapshot)
+    standalone_fallback = bool(config.get("standalone_fallback", False))
+    preserve_standalone_query = bool(config.get("preserve_standalone_query", False))
+    # 孤立单轮完整提问被模型过度澄清或超时降级时，仅在无上下文且自包含检验通过时放行，
+    # 同步写入 resolved/standalone 的审核结论以维持审计与纠错节点语义一致。
+    if (standalone_fallback and result.status == "clarification"
+            and is_self_contained_question(raw_question, run.snapshot)):
+        result = Resolution(
+            original_question=raw_question,
+            status="resolved",
+            relation="standalone",
+            resolved_question=clean_question,
+        )
     run.resolution = result
     context.node_metadata.update(status=result.status, relation=result.relation)
     if result.status == "clarification":
         return Halt(clarification_answer(result))
-    return {"query": result.resolved_question}
+    query = str(result.resolved_question or clean_question)
+    if (preserve_standalone_query and result.relation == "standalone"
+            and run.snapshot.state is None and not run.snapshot.recent
+            and not run.snapshot.summary and clean_question):
+        query = clean_question
+    return {"query": query}
 
 
 def route_question(inputs: dict, config: dict, context: ExecutionContext, transport: object,
@@ -176,15 +183,193 @@ def rewrite(inputs: dict, config: dict, context: ExecutionContext, transport: ob
     return {"query": _question(value.get("question")) or question.strip()}
 
 
+_NUMBERED_SUBQUERY = re.compile(r"[（(]\s*\d+\s*[）)]\s*")
+_GUIDELINE_TITLE = re.compile(r"《[^》]{2,32}》")
+_DEPENDENT_CLAUSE_HEAD = re.compile(r"^(?:该|此|上述|另外|同时|以及|并|那么|此外|其余|其)")
+_BOILERPLATE_TAIL = re.compile(
+    r"(?:请|结合上述[^，。；：]*|综合[^，。；：]*)[，,：:]*(?:说明|回答|阐述|分析|比较|对比|给出)?[：:]?\s*$"
+)
+_LEAD_PATIENT = re.compile(r"^一位\d+岁(?:男|女)性患者[，,]?")
+_COMPOUND_MARKERS = re.compile(r"同时|并说明|以及|分别|各自|哪些|兼顾|协同|联合|步骤|流程|差异|比较|对比")
+_HYDE_SKIP_PATTERNS = re.compile(
+    r"比较|对比|异同|区别|差异|vs|VS|"
+    r"\d+(?:\.\d+)?\s*(?:mg|mmHg|mmol|ml|mL|μg|ug|IU|U|kg|%|％|岁|周|天|小时|月|年|期|级)|"
+    r"[A-Z]{2,}[0-9\-]*"
+)
+_COMPARE_PAIR = re.compile(
+    r"(?:比较|对比)([^？；。]{3,40}?)(?:与|和|vs|VS|及)([^？；。在的]{2,30})(?:在([^？；。]{2,60})|的([^？；。]{2,40}))?"
+)
+
+
+_LAB_PAREN = re.compile(r"[（(][^）)]{8,}[）)]")
+
+
+def _trim_subquery(text: str, limit: int = 220) -> str:
+    """Normalize whitespace and trailing punctuation for one search facet."""
+    clean = re.sub(r"\s+", " ", text).strip(" ；;。，,：:")
+    return clean[:limit].strip() if len(clean) > limit else clean
+
+
+def _extract_anchor(prefix: str) -> str:
+    """Distill a compact subject/guideline anchor from an introductory clinical clause."""
+    cleaned = _BOILERPLATE_TAIL.sub("", prefix).strip(" ，,。；;：:")
+    cleaned = _LEAD_PATIENT.sub("", cleaned).strip(" ，,")
+    if not cleaned:
+        return ""
+    guides = list(dict.fromkeys(_GUIDELINE_TITLE.findall(cleaned)))
+    if len(cleaned) <= 75:
+        return cleaned
+    # 先剥除长括号里的化验明细，保留完整疾病/共病/指南实体，避免截断后丢失关键共病（如 HFrEF、痛风）。
+    compact = _LAB_PAREN.sub("", cleaned)
+    segments = [seg.strip() for seg in re.split(r"[，,、。；;]+", compact) if seg.strip()]
+    picked: list[str] = list(guides)
+    total = sum(len(item) for item in picked)
+    for seg in segments:
+        if seg in picked:
+            continue
+        if picked and total + len(seg) + 1 > 90:
+            break
+        picked.append(seg)
+        total += len(seg) + 1
+    return _trim_subquery(" ".join(picked), limit=100) if picked else _trim_subquery(compact, limit=100)
+
+
+def _with_anchor(anchor: str, item: str) -> str:
+    """Attach shared subject context only when the sub-question does not already repeat it."""
+    clean_item = _trim_subquery(item)
+    if not anchor or not clean_item or len(clean_item) >= 75:
+        return clean_item
+    if anchor[:6] in clean_item:
+        return clean_item
+    return _trim_subquery(f"{anchor} {clean_item}")
+
+
+def _split_facets(text: str, max_subqueries: int = 3) -> list[str]:
+    """Deterministically decompose multi-part, numbered, or cross-guideline questions."""
+    subqueries: list[str] = []
+    if re.search(r"[（(]\s*1\s*[）)].*?[（(]\s*2\s*[）)]", text):
+        parts = _NUMBERED_SUBQUERY.split(text)
+        anchor = _extract_anchor(parts[0])
+        for item in parts[1:]:
+            candidate = _with_anchor(anchor, item)
+            if len(candidate) >= 8 and candidate not in subqueries:
+                subqueries.append(candidate)
+    if not subqueries:
+        clauses = [_trim_subquery(seg) for seg in re.split(r"[？?；;]+", text)]
+        clauses = [seg for seg in clauses if len(seg) >= 10]
+        if len(clauses) >= 2:
+            anchor = _extract_anchor(clauses[0])
+            for idx, seg in enumerate(clauses):
+                candidate = seg if idx == 0 or not _DEPENDENT_CLAUSE_HEAD.match(seg) else _with_anchor(anchor, seg)
+                if len(candidate) >= 8 and candidate not in subqueries:
+                    subqueries.append(candidate)
+    if not subqueries:
+        guides = list(dict.fromkeys(_GUIDELINE_TITLE.findall(text)))
+        if len(guides) >= 2:
+            focus = _GUIDELINE_TITLE.sub(" ", text)
+            focus = re.sub(r"比较|对比|异同|有哪些|有什么|方面|具体|[与和](?=\s)", " ", focus)
+            focus = _trim_subquery(focus, limit=90)
+            for guide in guides[:max_subqueries]:
+                candidate = _trim_subquery(f"{guide} {focus}")
+                if candidate and candidate not in subqueries:
+                    subqueries.append(candidate)
+    if not subqueries:
+        matched = _COMPARE_PAIR.search(text)
+        if matched:
+            focus = _trim_subquery(matched.group(3) or matched.group(4) or "", limit=60)
+            for entity in (matched.group(1), matched.group(2)):
+                candidate = _trim_subquery(f"{entity.strip()} {focus}")
+                if len(candidate) >= 6 and candidate not in subqueries:
+                    subqueries.append(candidate)
+    return subqueries[:max_subqueries]
+
+
+_SECONDARY_ANAPHORA = re.compile(r"(?:两类|两种|二者|两者|上述|前述|这两种|这几类)")
+
+
+def hybrid_plan(inputs: dict, config: dict, context: ExecutionContext) -> dict:
+    """Generate rule-based search facets and conditional LLM/HyDE routes.
+
+    轻量混合查询的核心分流器：多问句/多指南/编号子问先用零延迟规则切分；
+    仅长且未切分的隐式复合问法激活 LLM 分解；精确数值/比较/多子问关闭 HyDE 防主题漂移。
+    """
+    text = str(inputs.get("question", "")).strip()
+    if not text:
+        return {"queries": [], "subqueries": [], "decompose_route": "direct", "hyde_route": "skip"}
+    from ...query_normalization import expand_clinical_synonyms, strip_query_wrappers
+
+    max_subqueries = int(config.get("max_subqueries", 3))
+    strip_wrappers = bool(config.get("strip_wrappers", False))
+    enable_decompose = bool(config.get("enable_llm_decompose", True))
+    search_text = strip_query_wrappers(text) if strip_wrappers else text
+    subqueries = _split_facets(search_text, max_subqueries=max(1, max_subqueries))
+    has_secondary_anaphora = enable_decompose and any(
+        _SECONDARY_ANAPHORA.search(item) for item in subqueries[1:]
+    )
+    if has_secondary_anaphora:
+        subqueries = []
+    queries = [text]
+    for sub in subqueries:
+        if sub and sub not in queries:
+            queries.append(sub)
+        if len(queries) >= max(1, max_subqueries) + 1:
+            break
+    sub_count = len(queries) - 1
+    enable_hyde = bool(config.get("enable_hyde", True))
+    min_decompose_chars = int(config.get("decompose_min_chars", 45))
+    decompose_route = (
+        "decompose"
+        if (
+            enable_decompose
+            and (
+                has_secondary_anaphora
+                or (
+                    sub_count == 0
+                    and len(text) >= min_decompose_chars
+                    and _COMPOUND_MARKERS.search(text)
+                )
+            )
+        )
+        else "direct"
+    )
+    hyde_route = (
+        "skip"
+        if (not enable_hyde or sub_count >= 2 or "《" in text
+            or _HYDE_SKIP_PATTERNS.search(text))
+        else "hyde"
+    )
+    context.node_metadata.update(
+        subquery_count=sub_count,
+        decompose_route=decompose_route,
+        hyde_route=hyde_route,
+    )
+    if strip_wrappers and search_text != text:
+        queries = list(dict.fromkeys(search_text if item == text else item for item in queries))
+    if bool(config.get("expand_synonyms", False)):
+        queries = expand_clinical_synonyms(queries, max_extra=int(config.get("max_synonym_variants", 2)))
+    return {
+        "queries": queries,
+        "subqueries": subqueries,
+        "decompose_route": decompose_route,
+        "hyde_route": hyde_route,
+    }
+
+
 def decompose(inputs: dict, config: dict, context: ExecutionContext, transport: object,
               default_provider: str) -> dict:
-    value = _complete(transport, _provider(inputs, default_provider), PROMPTS["decompose"],
-                      inputs["question"])
+    fallback = [str(inputs["question"]).strip()]
+    try:
+        value = _complete(transport, _provider(inputs, default_provider), PROMPTS["decompose"],
+                          inputs["question"])
+    except Exception:
+        if config.get("fallback_on_error", False):
+            return {"queries": fallback}
+        raise
     items = value.get("questions")
     questions = ([_question(item) for item in items]
                  if isinstance(items, list) and 1 <= len(items) <= 3 else [])
     if not questions or not all(questions):
-        return {"queries": [inputs["question"].strip()]}
+        return {"queries": fallback}
     return {"queries": questions}
 
 

@@ -158,3 +158,16 @@ def test_actual_isolated_application_through_verified_tls(tmp_path):
     from patient_gateway_runtime import actual_application_proof
 
     actual_application_proof(tmp_path)
+
+
+def test_renderer_routes_patient_chat_and_its_stream_only():
+    module = gateway_module()
+    rendered = module.render_nginx(module.load_configuration(VALID.encode()))
+    location = next(line.strip() for line in rendered.splitlines()
+                    if line.strip().startswith("location ~ "))
+
+    # Both the synchronous and the streaming patient answer must be reachable;
+    # everything the patient portal does not serve stays unroutable.
+    assert "|chat(/stream)?|" in location
+    for closed in ("/ui", "/api", "/settings", "/documents", "/memory"):
+        assert closed not in location

@@ -257,3 +257,64 @@ def test_export_judge_cases_omits_provider_errors_and_secrets(tmp_path):
         "candidate_answer", "answerability", "question_type", "difficulty",
         "rubric_version", "scores",
     }
+
+
+def test_remap_builds_chunk_grades_and_context_chunk_ids(tmp_path):
+    from medical_rag.evaluation_anchors import make_anchor_id
+
+    source = tmp_path / "guide.md"
+    source.write_text("## 章节一\n核心证据A。\n补充证据B。\n干扰背景C。\n", encoding="utf-8")
+    digest = source_sha256(source)
+    registry = tmp_path / "source-registry.json"
+    write_json(registry, {"sources": [{"source_id": "src", "filename": source.name, "sha256": digest}]})
+    manifest = tmp_path / "manifest.json"
+    write_json(manifest, {"question_count": 3})
+
+    dataset = tmp_path / "questions.jsonl"
+    ans_row = valid_row(
+        "MHE2-0001",
+        question="可回答问题",
+        source_refs=[
+            {"source_id": "src", "locator": {"heading": "章节一"}, "quote": "核心证据A。",
+             "anchor_id": make_anchor_id("src", ["章节一"], "核心证据A。"), "relevance": 2},
+            {"source_id": "src", "locator": {"heading": "章节一"}, "quote": "补充证据B。",
+             "anchor_id": make_anchor_id("src", ["章节一"], "补充证据B。"), "relevance": 1},
+        ],
+    )
+    ins_row = valid_row(
+        "MHE2-0002",
+        question="拒答问题带干扰",
+        answerability="insufficient_evidence",
+        source_refs=[
+            {"source_id": "src", "locator": {"heading": "章节一"}, "quote": "干扰背景C。",
+             "anchor_id": make_anchor_id("src", ["章节一"], "干扰背景C。"), "relevance": 0},
+        ],
+    )
+    ins_empty = valid_row(
+        "MHE2-0003",
+        question="纯空引用拒答问题",
+        answerability="insufficient_evidence",
+        source_refs=[],
+    )
+    dataset.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in (ans_row, ins_row, ins_empty)) + "\n",
+        encoding="utf-8",
+    )
+    assert validate_release(dataset, manifest, registry)["question_count"] == 3
+
+    chunks = tmp_path / "chunks.json"
+    write_json(chunks, [
+        {"id": "c1", "source_id": "src", "text": "核心证据A。补充证据B。", "page": 0, "section": "章节一", "sha256": digest},
+        {"id": "c2", "source_id": "src", "text": "补充证据B。", "page": 0, "section": "章节一", "sha256": digest},
+        {"id": "c3", "source_id": "src", "text": "干扰背景C。", "page": 0, "section": "章节一", "sha256": digest},
+    ])
+    output = tmp_path / "runtime.jsonl"
+    remap_release(dataset, chunks, registry, output)
+    runtime_rows = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert runtime_rows[0]["relevant_chunk_ids"] == ["c1", "c2"]
+    assert runtime_rows[0]["chunk_grades"] == {"c1": 2, "c2": 1}
+    assert runtime_rows[1]["relevant_chunk_ids"] == []
+    assert runtime_rows[1]["context_chunk_ids"] == ["c3"]
+    assert runtime_rows[2]["relevant_chunk_ids"] == []
+    sidecar = json.loads(output.with_suffix(".jsonl.mapping.json").read_text(encoding="utf-8"))
+    assert any(item["method"] == "context_only" and item["chunk_id"] == "c3" for item in sidecar)

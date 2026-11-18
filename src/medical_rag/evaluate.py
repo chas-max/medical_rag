@@ -16,6 +16,9 @@ from .service import DEFAULT_WORKFLOWS
 from .workflow.repository import WorkflowRepository
 
 
+_DERIVED_RUNTIME_FIELDS = {"relevant_chunk_ids", "chunk_grades", "context_chunk_ids"}
+
+
 def _live_dependencies(settings: Settings, answer_provider: str, judge_provider: str) -> tuple:
     if not settings.qwen_api_key:
         raise ValueError("模型 API Key 未配置")
@@ -86,8 +89,8 @@ def main(argv: list[str] | None = None, factory: object | None = None) -> int:
             validate_release(release_path, manifest_path, registry_path)
             release_cases = load_dataset(release_path)
             if len(cases) != len(release_cases) or any(
-                {key: value for key, value in runtime.items() if key != "relevant_chunk_ids"}
-                != {key: value for key, value in original.items() if key != "relevant_chunk_ids"}
+                {key: value for key, value in runtime.items() if key not in _DERIVED_RUNTIME_FIELDS}
+                != {key: value for key, value in original.items() if key not in _DERIVED_RUNTIME_FIELDS}
                 for runtime, original in zip(cases, release_cases)
             ):
                 raise ValueError("运行时题集与经校验的发布题库内容不一致")

@@ -105,10 +105,16 @@ class AgentRuntime:
     retrieved: list = field(default_factory=list)
     assessment: dict | None = None
     cancelled: threading.Event = field(default_factory=threading.Event)
+    timed_out: bool = False
 
     def check_active(self) -> None:
         """Reject new heavy suboperations after cancellation or stage expiration."""
-        if not self.active or self.cancelled.is_set() or monotonic() >= self.deadline:
+        if (
+            not self.active
+            or self.timed_out
+            or self.cancelled.is_set()
+            or monotonic() >= self.deadline
+        ):
             raise TimeoutError
 
     def progress(self, stage: str, stop_reason: str | None = None) -> None:

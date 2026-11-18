@@ -80,6 +80,23 @@ def test_reranker_normalizes_logits_to_probability():
     assert 0.8 < scores[1] < 0.9
 
 
+def test_reranker_skips_duplicate_sigmoid_when_model_has_sigmoid_activation():
+    class Sigmoid:
+        pass
+
+    class ProbCrossEncoder:
+        activation_fn = Sigmoid()
+
+        def predict(self, pairs):
+            return [0.9975, 0.0001]
+
+    scores, kind = BgeReranker(model=ProbCrossEncoder()).score_with_kind(
+        "问题", ["强相关证据", "无关文本"]
+    )
+    assert kind == SCORE_RERANK
+    assert scores == [0.9975, 0.0001]
+
+
 def test_reranker_falls_back_when_cross_encoder_is_unavailable():
     class Unavailable:
         def predict(self, pairs):

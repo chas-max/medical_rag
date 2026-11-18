@@ -52,3 +52,10 @@ validity_seconds = 86400
 # base_url = "http://127.0.0.1:8001"
 # timeout_seconds = 120
 # top_k = 6
+# Streaming is opt-in and stays false when the key is omitted. Turning it on
+# requires the answer service to expose POST /answers/stream; the patient UI
+# then renders each verified conclusion as it is produced, and an answer that
+# fails validation or loses its authorization at the end is discarded instead
+# of being stored. The gateway accepts /chat/stream, but the portal behind it
+# must be reachable through a proxy that does not buffer responses.
+# streaming = false

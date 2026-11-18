@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import sqlite3
 import tempfile
@@ -15,12 +14,13 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from uuid import uuid4
 
+from loguru import logger
+
 from .config import Settings
 from .settings_store import resolve_path
 from .types import ApiError
 from .workflow.repository import WorkflowRepository
 
-logger = logging.getLogger(__name__)
 TERMINAL = ("succeeded", "failed")
 SAFE_ERRORS = {
     "INVALID_DOCUMENT": "文档内容或格式无效",

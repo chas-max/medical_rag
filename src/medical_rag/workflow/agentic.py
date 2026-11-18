@@ -80,24 +80,48 @@ class AgenticNode:
             runtime.assessment = None
             before = {item.chunk.id for item in runtime.candidates}
             started = monotonic()
-            try:
-                result = await asyncio.wait_for(
-                    engine.run(
-                        child,
-                        {
-                            **inputs,
-                            "question": runtime.question,
-                            "evidence": list(runtime.evidence),
-                            "feedback": feedback,
-                            "_agent_runtime": runtime,
-                        },
-                        memory_context=context.memory_context,
-                        short_term=context.short_term,
-                    ),
-                    max(0.000001, runtime.deadline - monotonic()),
+            loop = asyncio.get_running_loop()
+            child_task = asyncio.create_task(
+                engine.run(
+                    child,
+                    {
+                        **inputs,
+                        "question": runtime.question,
+                        "evidence": list(runtime.evidence),
+                        "feedback": feedback,
+                        "_agent_runtime": runtime,
+                    },
+                    memory_context=context.memory_context,
+                    short_term=context.short_term,
                 )
-            except TimeoutError:
+            )
+
+            def expire_child() -> None:
+                # asyncio timer granularity (e.g., 15.625ms on Windows) may fire
+                # slightly before monotonic() >= deadline; mark timed_out explicitly
+                # so WorkflowEngine classifies child cancellation as TIMEOUT.
+                runtime.timed_out = True
+                runtime.cancelled.set()
+                if not child_task.done():
+                    child_task.cancel()
+
+            timer = loop.call_later(
+                max(0.000001, runtime.deadline - monotonic()), expire_child
+            )
+            try:
+                result = await child_task
+            except asyncio.CancelledError:
+                if not runtime.timed_out:
+                    runtime.cancelled.set()
+                    child_task.cancel()
+                    await asyncio.gather(child_task, return_exceptions=True)
+                    raise
                 result = None
+            except TimeoutError:
+                runtime.timed_out = True
+                result = None
+            finally:
+                timer.cancel()
             trace = result.trace if result is not None else runtime.child_trace
             if runtime.dispatched:
                 retrieval_rounds += 1
@@ -112,7 +136,7 @@ class AgenticNode:
             )
             if runtime.assessment is not None:
                 iterations[-1]["assessment"] = runtime.assessment
-            if result is None or monotonic() >= runtime.deadline:
+            if result is None or runtime.timed_out or monotonic() >= runtime.deadline:
                 reason = "timeout"
                 break
             if result.status == "failed":

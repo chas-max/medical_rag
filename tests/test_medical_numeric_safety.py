@@ -268,3 +268,107 @@ def test_comma_separated_dose_cannot_bypass_secondary_text_checks(field: str) ->
     else:
         assert result["analysis"]["extensions"] == []
     assert "gaps" not in result
+
+
+
+def test_medical_source_isolation_and_complex_notation_do_not_drop_valid_claims() -> None:
+    chunk = (
+        "静脉点滴期间每 15~20 分钟监测一次。空腹血糖 5.1 mmol/L≤X<7.0 mmol/L "
+        "且 BMI≥32.5 kg/m2 时，血压应低于 130 mmHg。复方厄贝沙坦150mg/氢氯噻嗪12.5mg，"
+        "超过1周及以上观察，儿童可用 30mg/(kg·d)。"
+    )
+    assert numbers_supported("血压低于 130 mmHg，静脉点滴期间监测。", [chunk]) is True
+    assert numbers_supported("每天30mg/(kg·d)。", ["每日 30mg/(kg·d)。"]) is True
+    assert numbers_supported("每日1次。", [chunk]) is False
+    assert numbers_supported("30mg/(kg·d)。", ["每日 30mg/(kg·d)。", chunk]) is True
+    assert numbers_supported("30mg。", ["30mg半。"]) is False
+    assert numbers_supported("30mg/(kg·d)。", ["30mg。"]) is False
+
+
+def test_pdf_spacing_chinese_bmi_units_and_age_order_do_not_drop_claims() -> None:
+    bmi_src = "65 岁以上老年人的适宜BMI建议保持在20～26.9 千克/米2，80 岁以上建议保持在22～26.9 千克/米2。"
+    assert numbers_supported(
+        "65岁以上老年人BMI建议保持在20~26.9 kg/m²，80岁以上建议保持在22~26.9 kg/m²。",
+        [bmi_src],
+    ) is True
+    assert numbers_supported(
+        "65岁以上老年人BMI建议保持在20~26.9 kg/m2,80岁以上建议保持在22~26.9 kg/m2。",
+        [bmi_src],
+    ) is True
+    assert numbers_supported("1,23mg。", ["1,23mg。"]) is False
+
+    elder_src = "辖区内 65 岁及以上常住居民。每年为老年人提供 1 次健康管理服务。"
+    assert numbers_supported("每年为65岁及以上老年人提供1次健康管理服务。", [elder_src]) is True
+
+    peri_src = (
+        "术前或术后可口服10~25 g碳水化合物；不能口服者静脉推注50%葡萄糖注射液20~50 ml，"
+        "持续静脉点滴5%或10%葡萄糖注射液，每 15~20 分 钟 监 测1 次直至血\n糖≥5.6 mmol/L。"
+    )
+    assert numbers_supported(
+        "术前或术后口服10~25 g快速吸收碳水化合物；不能口服者静推50%葡萄糖注射液20~50 ml，"
+        "持续静滴5%或10%葡萄糖注射液，每15~20分钟监测1次直至血糖≥5.6 mmol/L。",
+        [peri_src],
+    ) is True
+
+    wrapped_bmi = "18岁以上正常BMI在18.5～23.9 千\n克/米2，BMI≥28 千\n克/米2为肥胖，65岁以上建议20～26.9 千克/米2。"
+    assert numbers_supported(
+        "18岁以上正常BMI为18.5～23.9 kg/m²，BMI≥28 kg/m²为肥胖；65岁以上建议保持在20～26.9千克/米²。",
+        [wrapped_bmi],
+    ) is True
+
+    gdm_src = "75 g OGTT：5.1 mmol/L≤空腹血糖<7.0 mmol/L，OGTT 1 h 血糖≥10.0 mmol/L，8.5 mmol/L≤OGTT 2 h 血糖<11.1 mmol/L。"
+    assert numbers_supported(
+        "75 g OGTT空腹血糖≥5.1 mmol/L且<7.0 mmol/L，1小时≥10.0 mmol/L，2小时≥8.5 mmol/L且<11.1 mmol/L。",
+        [gdm_src],
+    ) is True
+
+
+def test_compound_slash_drugs_and_table_column_header_units_pass() -> None:
+    compound_src = "单片复方制剂：氯沙坦钾50 mg/氢氯噻嗪12.5 mg（或100/12.5 mg），氨氯地平5 mg/贝那普利10 mg，1片/d。"
+    assert numbers_supported("可选用氯沙坦钾50 mg/氢氯噻嗪12.5 mg（1片/d）。", [compound_src]) is True
+    assert numbers_supported("氯沙坦钾100 mg/氢氯噻嗪12.5 mg。", [compound_src]) is True
+    assert numbers_supported("氯沙坦钾50 mg/氢氯噻嗪25 mg。", [compound_src]) is False
+
+    table_15 = (
+        "表 15  常用 CCB 剂量与药代学\n"
+        "药物 消除半衰期 (h) 剂量(起始剂量~足量)(mg/d) 每日次数\n"
+        "氨氯地平 30~50 2.5~10 1"
+    )
+    assert numbers_supported("氨氯地平消除半衰期为30~50 h，起始剂量2.5~10 mg/d。", [table_15]) is True
+
+    table_diet = (
+        "表 2.6  食物交换份\n"
+        "每份热量90kcal；每份质量（g） 钠含量（mg）\n"
+        "米饭 80～100 面包 32"
+    )
+    assert numbers_supported("每份热量90 kcal，米饭每份80~100 g，面包32 g。", [table_diet]) is True
+
+
+def test_pdf_line_wrap_comma_cadence_reset_table_counts_and_scaled_denominators() -> None:
+    weight_src = (
+        "超重患者每 天 可 减 少\n250～500kcal，一般每周减轻0.5~1kg，每月减轻2~4kg，"
+        "避免能量密度≥400kcal/100g的超加工食品。"
+    )
+    assert numbers_supported(
+        "每天减少250~500 kcal，每周减轻0.5~1 kg，每月减轻2~4 kg，避免≥400 kcal/(100 g)食品。",
+        [weight_src],
+    ) is True
+    assert numbers_supported("每月减轻0.5~1 kg。", [weight_src]) is False
+    assert numbers_supported("能量密度≥400 kcal/1 g。", [weight_src]) is False
+
+    assert numbers_supported(
+        "每日1次，每次30mg。",
+        ["每日1次，每次30 mg。"],
+    ) is True
+    assert numbers_supported("每次30mg。", ["每日1次，每次30 mg。"]) is False
+
+    table_16 = (
+        "表 16 常用 ARB 与 ARNI 药物\n"
+        "药物 消除半衰期(h) 剂量(起始剂量~足量)(mg/d) 每天服药 次数\n"
+        "沙库巴曲缬沙坦钠 11.5/9.9 100~200 2"
+    )
+    assert numbers_supported(
+        "沙库巴曲缬沙坦钠半衰期分别为11.5 h和9.9 h，起始100 mg/d，足量200 mg/d，每天服药2次。",
+        [table_16],
+    ) is True
+    assert numbers_supported("沙库巴曲缬沙坦钠每天服药3次。", [table_16]) is False

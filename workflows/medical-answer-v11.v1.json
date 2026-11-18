@@ -1,0 +1,474 @@
+{
+  "id": "medical-answer-v11",
+  "name": "医疗资料问答（v11 检索预算与父窗口覆盖修复）",
+  "version": 1,
+  "status": "published",
+  "nodes": [
+    {
+      "id": "query",
+      "type": "query.input",
+      "position": {
+        "x": 80,
+        "y": 240
+      },
+      "config": {}
+    },
+    {
+      "id": "resolve",
+      "type": "question.resolve",
+      "position": {
+        "x": 320,
+        "y": 240
+      },
+      "config": {
+        "standalone_fallback": true,
+        "preserve_standalone_query": true
+      }
+    },
+    {
+      "id": "hybrid_plan",
+      "type": "question.hybrid_plan",
+      "position": {
+        "x": 560,
+        "y": 240
+      },
+      "config": {
+        "max_subqueries": 3,
+        "decompose_min_chars": 45,
+        "enable_llm_decompose": true,
+        "enable_hyde": true,
+        "strip_wrappers": true,
+        "expand_synonyms": true,
+        "max_synonym_variants": 2
+      }
+    },
+    {
+      "id": "decompose",
+      "type": "question.decompose",
+      "position": {
+        "x": 800,
+        "y": 120
+      },
+      "config": {
+        "fallback_on_error": true
+      },
+      "activation": {
+        "port": "route",
+        "equals": "decompose"
+      }
+    },
+    {
+      "id": "hyde",
+      "type": "retrieval.hyde",
+      "position": {
+        "x": 800,
+        "y": 400
+      },
+      "config": {
+        "top_k": 15
+      },
+      "activation": {
+        "port": "route",
+        "equals": "hyde"
+      }
+    },
+    {
+      "id": "merge",
+      "type": "merge.collect",
+      "position": {
+        "x": 1040,
+        "y": 180
+      },
+      "config": {}
+    },
+    {
+      "id": "subquery_merge",
+      "type": "merge.collect",
+      "position": {
+        "x": 1040,
+        "y": 310
+      },
+      "config": {}
+    },
+    {
+      "id": "multi",
+      "type": "retrieval.multi",
+      "position": {
+        "x": 1260,
+        "y": 180
+      },
+      "config": {
+        "strategy": "hybrid",
+        "k": 40,
+        "top_k": 45,
+        "primary_boost": 1.5,
+        "filename_boost_weight": 0.45,
+        "qa_dampen_factor": 0.95,
+        "boilerplate_penalty": 0.25
+      }
+    },
+    {
+      "id": "fusion",
+      "type": "retrieval.rrf",
+      "position": {
+        "x": 1480,
+        "y": 240
+      },
+      "config": {
+        "k": 40,
+        "primary_weight": 1.0,
+        "secondary_weight": 0.35
+      }
+    },
+    {
+      "id": "rerank",
+      "type": "retrieval.rerank",
+      "position": {
+        "x": 1700,
+        "y": 240
+      },
+      "config": {
+        "top_k": 16,
+        "rerank_k": 90,
+        "max_per_parent": 0,
+        "backfill_same_parent": true,
+        "include_metadata": true,
+        "subquery_blend_weight": 0.35,
+        "rrf_blend_weight": 0.15,
+        "subquery_quota": 1,
+        "boilerplate_factor": 0.65
+      }
+    },
+    {
+      "id": "corrective",
+      "type": "retrieval.corrective",
+      "position": {
+        "x": 1920,
+        "y": 240
+      },
+      "config": {
+        "top_k": 16,
+        "max_rounds": 1,
+        "min_evidence": 2,
+        "max_per_parent": 0,
+        "rewrite_on_other": true,
+        "check_subquery_gaps": true,
+        "include_metadata": true,
+        "subquery_blend_weight": 0.35,
+        "subquery_quota": 1
+      }
+    },
+    {
+      "id": "gate",
+      "type": "evidence.gate",
+      "position": {
+        "x": 2140,
+        "y": 240
+      },
+      "config": {
+        "relative_floor_ratio": 0.0,
+        "hard_floor": 0.0,
+        "min_keep": 1
+      }
+    },
+    {
+      "id": "plan",
+      "type": "answer.plan",
+      "position": {
+        "x": 2360,
+        "y": 460
+      },
+      "config": {
+        "fallback_on_error": true
+      }
+    },
+    {
+      "id": "llm",
+      "type": "generation.llm",
+      "position": {
+        "x": 2360,
+        "y": 240
+      },
+      "config": {}
+    },
+    {
+      "id": "citation",
+      "type": "citation.validate",
+      "position": {
+        "x": 2580,
+        "y": 240
+      },
+      "config": {}
+    },
+    {
+      "id": "output",
+      "type": "answer.output",
+      "position": {
+        "x": 2800,
+        "y": 240
+      },
+      "config": {}
+    }
+  ],
+  "edges": [
+    {
+      "id": "v10-q-res",
+      "source": "query",
+      "source_port": "question",
+      "target": "resolve",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-p-res",
+      "source": "query",
+      "source_port": "provider",
+      "target": "resolve",
+      "target_port": "provider"
+    },
+    {
+      "id": "v10-res-hp",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "hybrid_plan",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-res-dec",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "decompose",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-p-dec",
+      "source": "query",
+      "source_port": "provider",
+      "target": "decompose",
+      "target_port": "provider"
+    },
+    {
+      "id": "v10-hp-dec",
+      "source": "hybrid_plan",
+      "source_port": "decompose_route",
+      "target": "decompose",
+      "target_port": "route"
+    },
+    {
+      "id": "v10-res-hyde",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "hyde",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-p-hyde",
+      "source": "query",
+      "source_port": "provider",
+      "target": "hyde",
+      "target_port": "provider"
+    },
+    {
+      "id": "v10-hp-hyde",
+      "source": "hybrid_plan",
+      "source_port": "hyde_route",
+      "target": "hyde",
+      "target_port": "route"
+    },
+    {
+      "id": "v10-hp-m",
+      "source": "hybrid_plan",
+      "source_port": "queries",
+      "target": "merge",
+      "target_port": "items"
+    },
+    {
+      "id": "v10-dec-m",
+      "source": "decompose",
+      "source_port": "queries",
+      "target": "merge",
+      "target_port": "items"
+    },
+    {
+      "id": "v10-hp-sqm",
+      "source": "hybrid_plan",
+      "source_port": "subqueries",
+      "target": "subquery_merge",
+      "target_port": "items"
+    },
+    {
+      "id": "v10-dec-sqm",
+      "source": "decompose",
+      "source_port": "queries",
+      "target": "subquery_merge",
+      "target_port": "items"
+    },
+    {
+      "id": "v10-m-mul",
+      "source": "merge",
+      "source_port": "values",
+      "target": "multi",
+      "target_port": "queries"
+    },
+    {
+      "id": "v10-mul-fus",
+      "source": "multi",
+      "source_port": "evidence",
+      "target": "fusion",
+      "target_port": "sources"
+    },
+    {
+      "id": "v10-hy-fus",
+      "source": "hyde",
+      "source_port": "evidence",
+      "target": "fusion",
+      "target_port": "secondary_sources"
+    },
+    {
+      "id": "v10-fus-rr",
+      "source": "fusion",
+      "source_port": "evidence",
+      "target": "rerank",
+      "target_port": "evidence"
+    },
+    {
+      "id": "v10-res-rr",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "rerank",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-k-rr",
+      "source": "query",
+      "source_port": "top_k",
+      "target": "rerank",
+      "target_port": "top_k"
+    },
+    {
+      "id": "v10-sqm-rr-sub",
+      "source": "subquery_merge",
+      "source_port": "values",
+      "target": "rerank",
+      "target_port": "subqueries"
+    },
+    {
+      "id": "v10-rr-cor",
+      "source": "rerank",
+      "source_port": "evidence",
+      "target": "corrective",
+      "target_port": "evidence"
+    },
+    {
+      "id": "v10-res-cor",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "corrective",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-p-cor",
+      "source": "query",
+      "source_port": "provider",
+      "target": "corrective",
+      "target_port": "provider"
+    },
+    {
+      "id": "v10-k-cor",
+      "source": "query",
+      "source_port": "top_k",
+      "target": "corrective",
+      "target_port": "top_k"
+    },
+    {
+      "id": "v10-sqm-cor-sub",
+      "source": "subquery_merge",
+      "source_port": "values",
+      "target": "corrective",
+      "target_port": "subqueries"
+    },
+    {
+      "id": "v10-cor-g",
+      "source": "corrective",
+      "source_port": "evidence",
+      "target": "gate",
+      "target_port": "evidence"
+    },
+    {
+      "id": "v10-cor-h",
+      "source": "corrective",
+      "source_port": "history",
+      "target": "llm",
+      "target_port": "history"
+    },
+    {
+      "id": "v10-res-pl",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "plan",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-p-pl",
+      "source": "query",
+      "source_port": "provider",
+      "target": "plan",
+      "target_port": "provider"
+    },
+    {
+      "id": "v10-g-pl",
+      "source": "gate",
+      "source_port": "evidence",
+      "target": "plan",
+      "target_port": "evidence"
+    },
+    {
+      "id": "v10-g-llm",
+      "source": "gate",
+      "source_port": "evidence",
+      "target": "llm",
+      "target_port": "evidence"
+    },
+    {
+      "id": "v10-pl-llm",
+      "source": "plan",
+      "source_port": "plan",
+      "target": "llm",
+      "target_port": "plan"
+    },
+    {
+      "id": "v10-res-llm",
+      "source": "resolve",
+      "source_port": "query",
+      "target": "llm",
+      "target_port": "question"
+    },
+    {
+      "id": "v10-p-llm",
+      "source": "query",
+      "source_port": "provider",
+      "target": "llm",
+      "target_port": "provider"
+    },
+    {
+      "id": "v10-llm-cit",
+      "source": "llm",
+      "source_port": "draft",
+      "target": "citation",
+      "target_port": "draft"
+    },
+    {
+      "id": "v10-llm-ev",
+      "source": "llm",
+      "source_port": "evidence",
+      "target": "citation",
+      "target_port": "evidence"
+    },
+    {
+      "id": "v10-cit-out",
+      "source": "citation",
+      "source_port": "answer",
+      "target": "output",
+      "target_port": "answer"
+    }
+  ]
+}

@@ -9,12 +9,11 @@ answer wrong.
 from __future__ import annotations
 
 import json
-import logging
 import threading
 
-from .short_term import MAX_SUMMARY_CHARS, WINDOW_TURNS
+from loguru import logger
 
-logger = logging.getLogger(__name__)
+from .short_term import MAX_SUMMARY_CHARS, WINDOW_TURNS
 
 TIMEOUT_SECONDS = 8
 # Re-summarizing on every single new turn would cost one model call per question;

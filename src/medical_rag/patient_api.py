@@ -1,11 +1,12 @@
 """Protected isolated OIDC/patient JSON API; no legacy or inference routes."""
 
 import json
+from contextlib import closing
 from typing import TypeVar
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import (
     BaseModel,
     ConfigDict,
@@ -15,6 +16,8 @@ from pydantic import (
     ValidationError,
 )
 from starlette.concurrency import run_in_threadpool
+
+from .sse import StreamEmitter, bridge, event_frame
 
 from .oidc_login import OIDCLogin, _cookie, create_auth_app
 from .patient_chat import ChatUnavailable
@@ -74,6 +77,33 @@ def _error(status: int, code: str, message: str) -> JSONResponse:
                         status_code=status)
 
 
+# One copy of each public failure, shared by the JSON handler and the stream frame,
+# so the two can never drift into different wording for the same condition.
+_CHAT_UNAVAILABLE = {"code": "CHAT_UNAVAILABLE", "status": 503,
+                     "message": "Question answering is unavailable"}
+_CONTEXT_CHANGED = {"code": "CONVERSATION_CONTEXT_CHANGED", "status": 409,
+                    "message": "Conversation changed, please resend the question"}
+_PATIENT_DENIED = {"code": "PATIENT_ACCESS_DENIED", "status": 403,
+                   "message": "Patient access denied"}
+
+# Only these may come from the answer source. ``done`` and ``error`` belong to the
+# transport, so a faulty answerer cannot forge a terminal frame.
+PATIENT_STREAM_EVENTS = frozenset({"status", "claim"})
+
+
+def _static(entry: dict) -> JSONResponse:
+    return _error(entry["status"], entry["code"], entry["message"])
+
+
+def _stream_failure(error: Exception) -> dict:
+    """Map a failed streaming turn to the same public codes the JSON route uses."""
+    if isinstance(error, PatientDenied):
+        return dict(_PATIENT_DENIED)
+    if isinstance(error, ConversationContextChanged):
+        return dict(_CONTEXT_CHANGED)
+    return dict(_CHAT_UNAVAILABLE)
+
+
 def _ok(data: JsonObject) -> JsonObject:
     return {"success": True, "data": data, "error": None}
 
@@ -113,20 +143,22 @@ async def _body(request: Request, model: type[BodyT], *, allow_empty: bool = Fal
 def create_patient_app(login: OIDCLogin, notice: HealthNotice, *,
                        patient_html: bool = False,
                        chat: ChatAnswerer | None = None,
-                       dialogue_state_enabled: bool = False) -> FastAPI:
+                       dialogue_state_enabled: bool = False,
+                       chat_streaming: bool = False) -> FastAPI:
     """Reuse all headless OIDC cookie, origin and no-store protections."""
     service = PatientService(login.sessions, notice, chat,
-                             dialogue_state_enabled=dialogue_state_enabled)
+                             dialogue_state_enabled=dialogue_state_enabled,
+                             chat_streaming=chat_streaming)
     support = SupportService(login.sessions)
     app = create_auth_app(login, patient_html=patient_html, audit=service.audit)
 
     @app.exception_handler(ChatUnavailable)
     async def chat_unavailable(request: Request, error: ChatUnavailable) -> JSONResponse:
-        return _error(503, "CHAT_UNAVAILABLE", "Question answering is unavailable")
+        return _static(_CHAT_UNAVAILABLE)
 
     @app.exception_handler(ConversationContextChanged)
     async def context_changed(request: Request, error: ConversationContextChanged) -> JSONResponse:
-        return _error(409, "CONVERSATION_CONTEXT_CHANGED", "Conversation changed, please resend the question")
+        return _static(_CONTEXT_CHANGED)
 
     @app.exception_handler(SupportDenied)
     async def support_denied(request: Request, error: SupportDenied) -> JSONResponse:
@@ -146,7 +178,7 @@ def create_patient_app(login: OIDCLogin, notice: HealthNotice, *,
 
     @app.exception_handler(PatientDenied)
     async def denied(request: Request, error: PatientDenied) -> JSONResponse:
-        return _error(403, "PATIENT_ACCESS_DENIED", "Patient access denied")
+        return _static(_PATIENT_DENIED)
 
     @app.exception_handler(ResourceMissing)
     async def missing(request: Request, error: ResourceMissing) -> JSONResponse:
@@ -239,6 +271,44 @@ def create_patient_app(login: OIDCLogin, notice: HealthNotice, *,
         return _ok(await run_in_threadpool(service.ask, token, csrf_token=csrf,
                                            conversation_id=body.conversation_id,
                                            question=body.question))
+
+    # Registered only when the operator enabled streaming: an installed portal
+    # cannot end up with the capability half switched on, and the frontend reads
+    # ``permissions.chat_stream`` instead of probing for the route.
+    if chat_streaming:
+        @app.post("/chat/stream")
+        async def ask_stream(request: Request) -> StreamingResponse:
+            """Answer as Server-Sent Events, with a narrower frame set than upstream.
+
+            Authorization runs here, before the response starts, so an unauthenticated,
+            unconsented or foreign request still gets the normal JSON error and status.
+            Everything after this point can only be an ``error`` frame, because the
+            status line is already on the wire.
+            """
+            token, csrf = await credentials(request, mutation=True)
+            if chat is None:
+                raise ChatUnavailable()
+            body = await _body(request, _Ask)
+            frames = await run_in_threadpool(
+                service.open_stream, token, csrf_token=csrf,
+                conversation_id=body.conversation_id, question=body.question)
+
+            def execute(emit: StreamEmitter) -> JsonObject:
+                # Runs in a worker thread: both the upstream read and the persisting
+                # transaction are blocking, and a browser disconnect must stop only
+                # the consumer, never the write that was already authorized.
+                with closing(frames) as stream:
+                    for frame in stream:
+                        if frame.get("event") == "done":
+                            answer = frame.get("data")
+                            if type(answer) is not dict:
+                                raise ChatUnavailable()
+                            return answer
+                        emit(frame)
+                raise ChatUnavailable()
+
+            return bridge(execute, PATIENT_STREAM_EVENTS, failure=_stream_failure,
+                          frame=event_frame)
 
     @app.post("/support/cases")
     async def support_create(request: Request) -> JsonObject:

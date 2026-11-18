@@ -11,6 +11,7 @@ import psycopg
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import FileResponse
+from loguru import logger
 from starlette.staticfiles import StaticFiles
 
 # Authlib currently emits a known httpx migration notice at import, including
@@ -27,6 +28,7 @@ with warnings.catch_warnings():
         category=AuthlibDeprecationWarning,
     )
     from .oidc_login import OIDCLogin
+from .logging_setup import configure_logging, flush_logging, silence_logging
 from .patient_api import create_patient_app
 from .security_config import PatientConfiguration, StartupError, load_configuration
 
@@ -235,6 +237,9 @@ def preflight(config: PatientConfiguration) -> None:
 
 def _application(config: PatientConfiguration) -> FastAPI:
     try:
+        # Opt-in and additive only: a disabled [logging] section installs nothing,
+        # so the portal keeps its silent stderr and writes no file.
+        configure_logging("patient", patient=config.logging_config)
         html = config.frontend_dist / "patient.html"
         assets = config.frontend_dist / "assets"
         if not html.is_file() or not assets.is_dir() or not any(assets.iterdir()):
@@ -247,7 +252,8 @@ def _application(config: PatientConfiguration) -> FastAPI:
             transaction_encryption_key=config.transaction_key,
         )
         app = create_patient_app(login, config.notice, patient_html=True, chat=config.chat,
-                                 dialogue_state_enabled=config.dialogue_state_enabled)
+                                 dialogue_state_enabled=config.dialogue_state_enabled,
+                                 chat_streaming=config.chat_streaming)
 
         @app.get("/", include_in_schema=False)
         async def index():
@@ -279,9 +285,14 @@ def main(argv: list[str] | None = None) -> int:
         parser = _Parser(description="机构患者门户（直接 TLS）")
         parser.add_argument("--config", required=True, type=Path)
         args = parser.parse_args(argv)
+        # The portal stays silent unless the operator opted in: drop the default
+        # stderr sink before any record can be emitted.
+        silence_logging()
         config = load_configuration(args.config)
+        configure_logging("patient", patient=config.logging_config)
         app = _application(config)
         if not ipaddress.ip_address(config.listen_host).is_loopback:
+            logger.warning("患者服务绑定非回环地址，机构须另行完成网络边界审查")
             print(
                 "警告：患者服务绑定非回环地址；机构须另行完成网络边界审查。",
                 file=sys.stderr,
@@ -289,9 +300,10 @@ def main(argv: list[str] | None = None) -> int:
         # Avoid upstream libraries printing startup paths or ASGI traces. The
         # application converts request failures to static responses as well.
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
-            logger = logging.getLogger(name)
-            logger.handlers = [logging.NullHandler()]
-            logger.propagate = False
+            upstream = logging.getLogger(name)
+            upstream.handlers = [logging.NullHandler()]
+            upstream.propagate = False
+        logger.info("患者服务已启动")
         uvicorn.run(
             app,
             host=config.listen_host,
@@ -310,11 +322,15 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as error:
         if error.code == 0:
             return 0
+        logger.error("患者服务启动失败")
         print(str(StartupError()), file=sys.stderr)
         return 1
     except Exception:  # noqa: BLE001 -- prevent server/path/secret tracebacks
+        logger.error("患者服务启动失败")
         print(str(StartupError()), file=sys.stderr)
         return 1
+    finally:
+        flush_logging()
 
 
 if __name__ == "__main__":

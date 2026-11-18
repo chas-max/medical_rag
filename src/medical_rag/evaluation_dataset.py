@@ -7,10 +7,48 @@ from typing import Any
 ANSWERABILITIES = {"answerable", "insufficient_evidence"}
 QUESTION_TYPES = {"fact", "procedure", "numeric", "scenario", "comparison", "multi_evidence"}
 DIFFICULTIES = {"easy", "medium", "hard"}
+VALID_RELEVANCES = {0, 1, 2}
 
 
 def _nonempty(value: Any) -> bool:
     return isinstance(value, str) and bool(value.strip())
+
+
+def _validate_chunk_list(values: Any, line_number: int, *, allow_empty: bool = True) -> list[str]:
+    if not isinstance(values, list) or (not values and not allow_empty):
+        raise ValueError(f"第 {line_number} 行题目或相关块 ID 无效")
+    if any(not _nonempty(item) for item in values) or len(values) != len(set(values)):
+        raise ValueError(f"第 {line_number} 行题目或相关块 ID 无效")
+    return values
+
+
+def _validate_source_refs(refs: Any, answerability: str, line_number: int) -> None:
+    if not isinstance(refs, list) or (answerability == "answerable" and not refs):
+        raise ValueError(f"第 {line_number} 行来源引用无效")
+    for ref in refs:
+        if not isinstance(ref, dict) or not _nonempty(ref.get("source_id")) or not _nonempty(ref.get("quote")):
+            raise ValueError(f"第 {line_number} 行来源引用无效")
+        locator = ref.get("locator")
+        if not isinstance(locator, dict) or not locator or not any(locator.values()):
+            raise ValueError(f"第 {line_number} 行来源定位无效")
+        if not _nonempty(ref.get("anchor_id")):
+            raise ValueError(f"第 {line_number} 行稳定锚点无效")
+        if "relevance" in ref:
+            rel = ref["relevance"]
+            if type(rel) is not int or rel not in VALID_RELEVANCES:
+                raise ValueError(f"第 {line_number} 行相关度分级无效")
+            if answerability == "insufficient_evidence" and rel != 0:
+                raise ValueError(f"第 {line_number} 行拒答题来源相关度必须为 0")
+    if answerability == "answerable" and not any(ref.get("relevance", 2) == 2 for ref in refs):
+        raise ValueError(f"第 {line_number} 行可回答题至少需 1 条核心来源引用")
+
+
+def _validate_chunk_grades(grades: Any, line_number: int) -> None:
+    if not isinstance(grades, dict):
+        raise ValueError(f"第 {line_number} 行 chunk_grades 无效")
+    for key, value in grades.items():
+        if not _nonempty(key) or type(value) is not int or value not in {1, 2}:
+            raise ValueError(f"第 {line_number} 行 chunk_grades 无效")
 
 
 def validate_evaluation_row(row: dict, line_number: int, *, allow_empty_relevant: bool = True) -> dict:
@@ -23,11 +61,7 @@ def validate_evaluation_row(row: dict, line_number: int, *, allow_empty_relevant
     identifier = row.get("id", str(line_number))
     if not _nonempty(identifier) or not _nonempty(row.get("question")):
         raise ValueError(f"第 {line_number} 行题目或相关块 ID 无效")
-    relevant = row["relevant_chunk_ids"]
-    if not isinstance(relevant, list) or (not relevant and not allow_empty_relevant):
-        raise ValueError(f"第 {line_number} 行题目或相关块 ID 无效")
-    if any(not _nonempty(item) for item in relevant) or len(relevant) != len(set(relevant)):
-        raise ValueError(f"第 {line_number} 行题目或相关块 ID 无效")
+    relevant = _validate_chunk_list(row["relevant_chunk_ids"], line_number, allow_empty=allow_empty_relevant)
 
     rich_fields = {"reference_answer", "key_points", "answerability", "category",
                    "question_type", "difficulty", "source_refs"}
@@ -39,8 +73,7 @@ def validate_evaluation_row(row: dict, line_number: int, *, allow_empty_relevant
         return {"id": str(identifier).strip(), "question": row["question"].strip(),
                 "relevant_chunk_ids": relevant}
 
-    required_rich = rich_fields
-    if not required_rich <= row.keys():
+    if not rich_fields <= row.keys():
         raise ValueError(f"第 {line_number} 行富题字段不完整")
     if not _nonempty(row["reference_answer"]) or not _nonempty(row["category"]):
         raise ValueError(f"第 {line_number} 行富题文本无效")
@@ -52,17 +85,11 @@ def validate_evaluation_row(row: dict, line_number: int, *, allow_empty_relevant
     if (not isinstance(points, list) or not points or any(not _nonempty(x) for x in points)
             or len(points) != len(set(points))):
         raise ValueError(f"第 {line_number} 行关键要点无效")
-    refs = row["source_refs"]
-    if not isinstance(refs, list) or not refs:
-        raise ValueError(f"第 {line_number} 行来源引用无效")
-    for ref in refs:
-        if not isinstance(ref, dict) or not _nonempty(ref.get("source_id")) or not _nonempty(ref.get("quote")):
-            raise ValueError(f"第 {line_number} 行来源引用无效")
-        locator = ref.get("locator")
-        if not isinstance(locator, dict) or not locator or not any(locator.values()):
-            raise ValueError(f"第 {line_number} 行来源定位无效")
-        if not _nonempty(ref.get("anchor_id")):
-            raise ValueError(f"第 {line_number} 行稳定锚点无效")
+    _validate_source_refs(row["source_refs"], row["answerability"], line_number)
+    if "chunk_grades" in row:
+        _validate_chunk_grades(row["chunk_grades"], line_number)
+    if "context_chunk_ids" in row:
+        _validate_chunk_list(row["context_chunk_ids"], line_number, allow_empty=True)
     result = dict(row)
     result["id"] = str(identifier).strip()
     result["question"] = row["question"].strip()

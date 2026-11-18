@@ -4,6 +4,7 @@ import { auditRows, type AuditRow } from "./audit";
 import { AccountMenu } from "./AccountMenu";
 import { AuditTable } from "./AuditTable";
 import { SupportCases } from "./SupportCases";
+import { StreamError, streamChat } from "./stream";
 import {
   identity,
   chatResult,
@@ -29,6 +30,14 @@ function failureStatus(error: unknown) {
     : error instanceof PatientError && error.status === 403
       ? "forbidden"
       : "unavailable";
+}
+
+/** Fixed wording for a failed stream; the code decides, never upstream text. */
+function streamMessage(code: string) {
+  return code === "PATIENT_ACCESS_DENIED" ||
+    code === "CONVERSATION_CONTEXT_CHANGED"
+    ? "会话已更新或授权已撤回，本次回答未保存。"
+    : "问答服务暂不可用，请稍后重试。";
 }
 
 /** No hash means the product landing page: the question/record interface. */
@@ -95,6 +104,10 @@ export function PatientApp() {
   const [selected, setSelected] = useState<string | null>(null),
     [content, setContent] = useState(""),
     [pendingQuestion, setPendingQuestion] = useState<string | null>(null),
+    // Provisional claims from the stream. Never persisted here: the authoritative
+    // answer replaces this as soon as `done` arrives, and any failure clears it.
+    [draft, setDraft] = useState(""),
+    [stage, setStage] = useState(""),
     [chatError, setChatError] = useState(""),
     [offset, setOffset] = useState(0),
     [turnOffset, setTurnOffset] = useState(0),
@@ -125,6 +138,8 @@ export function PatientApp() {
     setSelected(null);
     setContent("");
     setPendingQuestion(null);
+    setDraft("");
+    setStage("");
     setChatError("");
     setOffset(0);
     setTurnOffset(0);
@@ -492,23 +507,45 @@ export function PatientApp() {
       return;
     }
     const selectedId = selected;
+    const streaming = me.permissions.chat_stream === true;
     setPendingQuestion(text);
     setChatError("");
+    setDraft("");
+    setStage(streaming ? "accepted" : "");
     mutate(async (token, live) => {
       try {
         const result = chatResult(
-          await request(
-            "/chat",
-            "POST",
-            { conversation_id: selectedId, question: text },
-            token,
-          ),
+          streaming
+            ? await streamChat(
+                "/chat/stream",
+                { conversation_id: selectedId, question: text },
+                token,
+                {
+                  onStatus: (next) => {
+                    if (live()) setStage(next);
+                  },
+                  // Claims are provisional: they stay in `draft` and are replaced
+                  // by the authoritative answer below, or cleared on failure.
+                  onClaim: (claim) => {
+                    if (live()) setDraft((previous) => previous + claim);
+                  },
+                },
+              )
+            : await request(
+                "/chat",
+                "POST",
+                { conversation_id: selectedId, question: text },
+                token,
+              ),
         );
         if (!live()) return;
         const id = result.conversation.id;
         setSelected(id);
         setContent("");
         setPendingQuestion(null);
+        // Keep the finished text on screen until the reload lands, so a streamed
+        // answer never blinks away between the terminal frame and the turn list.
+        setDraft(result.answer.content ?? "");
         const [page, pageTurns] = await Promise.all([
           request("/conversations?limit=20&offset=0"),
           request(`/conversations/${id}/turns?limit=20&offset=0`),
@@ -516,11 +553,20 @@ export function PatientApp() {
         if (!live()) return;
         setList(rows(page, "title"));
         setTurns(rows(pageTurns, "content"));
+        setDraft("");
+        setStage("");
         setOffset(0);
         setTurnOffset(0);
       } catch (error) {
         if (!live()) return;
+        // Nothing partial may stay on screen: an unpersisted answer is not shown.
+        setDraft("");
+        setStage("");
         setPendingQuestion(null);
+        if (error instanceof StreamError) {
+          setChatError(streamMessage(error.code));
+          return;
+        }
         // A model/retrieval outage is a recoverable inline error, not a
         // session failure: keep the conversation and let the user retry.
         if (
@@ -787,12 +833,22 @@ export function PatientApp() {
                       )}
                       {pendingQuestion && (
                         <li className="patient-turn patient-turn-assistant">
-                          <div
-                            className="patient-bubble patient-thinking"
-                            role="status"
-                          >
-                            正在检索公开资料并生成回答…
-                          </div>
+                          {draft ? (
+                            // Provisional conclusions only: no source list yet,
+                            // because citations are authoritative only in `done`.
+                            <div className="patient-bubble">
+                              <p>{draft}</p>
+                            </div>
+                          ) : (
+                            <div
+                              className="patient-bubble patient-thinking"
+                              role="status"
+                            >
+                              {stage === "generating"
+                                ? "正在基于证据撰写回答…"
+                                : "正在检索公开资料并生成回答…"}
+                            </div>
+                          )}
                         </li>
                       )}
                     </ol>

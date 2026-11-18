@@ -1,5 +1,6 @@
 """Separate untrusted model drafting from citation validation."""
 
+from ...dialogue_models import MAX_REFERENCES
 from ...generation import ANALYSIS_EVENT
 from ..contracts import (
     CAPABILITY_WEB_SEARCH,
@@ -50,6 +51,16 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
     resolution = getattr(dialogue, "resolution", None) if dialogue is not None else None
     if resolution is not None and getattr(resolution, "original_question", ""):
         context_options["original_question"] = resolution.original_question
+    # 代词消解结果同样只做上下文：帮生成理解“它/这个”的指向与措辞分寸，
+    # 以独立键传递，绝不并进 evidence，引用校验继续只看检索块。
+    references = getattr(resolution, "references", ()) if resolution is not None else ()
+    resolved_references = [
+        {"expression": item.expression, "entity": item.entity,
+         "source_role": item.source_role or "unknown"}
+        for item in references
+    ][:MAX_REFERENCES]
+    if resolved_references:
+        context_options["resolved_references"] = resolved_references
     emit = context.emit
     if emit is not None:
         # 生成一段带证据的回答要十几到几十秒，先把检索结果数量推给前端，

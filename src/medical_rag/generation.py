@@ -96,15 +96,24 @@ BASE_SYSTEM = (
     "一块说不全就填多块，没有锚点的结论不要输出。"
     "证据条目若带 chunk_ids，表示同一父块下命中的多个子块，引用其中任意一个 ID 都有效。"
     "锚点表示这条结论的依据在这几块资料里，不要求逐字摘录原文。"
+    "撰写 claims 时直接按指南原文的适用人群与表名表述（如 <80岁、90kcal食物交换表），"
+    "不要在结论中无谓复述提问者个案年龄等背景数值，也不要自造“kcal/份”等原文未出现的单位后缀。"
     "数值、单位、范围端点、比较方向及给药周期必须与所引原文一致，不自行换算剂量或单位；"
-    "至少与高于、至多与低于不能互换。"
+    "至少与高于、至多与低于、以上与超过不能互换，原文未写“每”时不要自行把“15~30分钟监测1次”改写为“每15~30分钟”。"
     "excerpt 是可选的展示字段：只有确定是原文连续片段时才填，填了就必须逐字复制、保留标点、"
     "不改写；它不参与结论是否成立的判定，宁可不填，也不要改写、拼接或补全原文。"
     "结论的每个意思都必须在所引资料里有依据。如果问题的某一部分，或你想补充的某个推断，"
     "在资料中找不到依据，不要把它写成确定结论，也不要编造内容：把它放进顶层 gaps 数组，"
     "用一两句说明哪层意思没有资料支撑（例如「合并糖尿病患者的个体化控制目标」），"
     "界面会以「当前资料未覆盖：……」呈现。"
-    "能由现有资料回答的部分照常作答，不要因为存在未覆盖的部分就整体拒答。"
+    "能由现有资料直接回答的核心部分照常作答，不要因为存在未覆盖的部分就整体拒答；"
+    "逐一核对提问中的各子问题、适用人群与年龄段阈值（如 65 岁以上老年人）、时间阶段（如术前/术中/术后/产后），"
+    "凡证据块中已明确载明的数值条件与处理要点须完整覆盖在 claims 中，避免遗漏。"
+    "严禁把“现有资料未提及/未规定/未涉及/缺少依据”写成 claims 结论并引用无关证据块；"
+    "对于资料缺失的特定适用人群（如新生儿、重度肾衰竭）、精确给药剂量或未收录指南参数，"
+    "必须放入顶层 gaps；若提问的核心标准、具体换算公式、特定禁忌人群处方剂量或限定条件在证据中均缺失"
+    "（只剩“尚需更多研究/仅提及原则”或“应加强血糖监测”等一般性安全警示或泛化背景，且全部核心子问均落入 gaps），"
+    "严禁硬凑一条泛化背景或常规监测提示作为 claims，必须输出空 claims（[]）。"
     "同一条结论里不要混入资料没有覆盖的意思：资料能支撑的部分留下，覆盖不了的部分拆到 gaps 或删掉。"
     "允许受控的模糊表述：当资料只提供部分支持、方向一致但结论不确定时，可以用「可能」「也许」"
     "「可能有一定关系」「尚需进一步确认」这类词语标出这是有依据的猜测。"
@@ -155,6 +164,52 @@ PLAN_DIRECTIVE = (
 )
 
 
+_META_REFUSAL_CLAIM = re.compile(
+    r"(?:"
+    r"^[^：:\n]{2,16}(?:缺失|不足|未规定|未提及|未涉及|未载明|未明确|不含|无[^：:\n]{1,8}规定)[：:]"
+    r"|(?:现有[^。\n]{0,16}(?:资料|证据|文献|指南|规范|知识库)"
+    r"|当前(?:(?:所)?提供的?)?(?:医学)?(?:资料|证据|文献|指南|规范|知识库)"
+    r"|所提供(?:的)?(?:资料|证据|指南|规范)"
+    r"|上述资料|检索(?:到的)?资料|本(?:指南|规范)|该(?:指南|规范|资料)"
+    r"|《[^》]{2,40}》|(?:^|[：:]\s*)(?:临床)?(?:资料|指南|规范))"
+    r"[^。\n]{0,110}"
+    r"(?:(?:但|却|而)?(?:尚|并|均)?未(?:直接|具体|明确)?(?:提及|规定|载明|包含|涉及|提供|明确|制定|收录|说明|给出|覆盖|涵盖|列出|针对|指定|界定|颁布|确立)"
+    r"|(?:并|均)?没有(?:具体|明确)?(?:提及|规定|载明|包含|涉及|提供|说明|给出|找到|相关)"
+    r"|(?:并|均)?未涉及"
+    r"|(?:缺乏|缺少|不足以|不含|尚无|暂无)[^。\n]{0,14}(?:标准|数值|阈值|规定|方案|剂量|指标|指导|依据|数据|细节|指征|建议))"
+    r")"
+)
+
+
+def _is_meta_refusal_claim(statement: str) -> bool:
+    """Detect meta-refusal sentences masquerading as cited claims when evidence lacks an answer."""
+    return bool(_META_REFUSAL_CLAIM.search(statement))
+
+
+_TANGENTIAL_HEDGE_CLAIM = re.compile(
+    r"(?:"
+    r"(?:尚|仍)需更多[^。；\n]{0,10}(?:研究|试验|验证|证据|探索)"
+    r"|(?:尚|仍)(?:待|需)进一步[^。；\n]{0,10}(?:研究|试验|验证|探索|确认|明确|评价|评估)"
+    r"|有待进一步[^。；\n]{0,10}(?:研究|试验|验证|明确|评价|评估)"
+    r"|仅(?:提及|强调|指出|说明|要求)[^。\n]{0,36}(?:原则|一般|需通过|需要根据|遵循[^。\n]{0,14}标准|建议|验证)"
+    r"|暂(?:无|未)明确[^。；\n]{0,12}(?:标准|数值|阈值|规定|方案|适用)"
+    r"|尚(?:无|未)充分[^。；\n]{0,12}(?:研究|证据|数据)"
+    r"|不(?:适|可)替代药物治疗"
+    r"|不适用于病情复杂[^。\n]{0,20}"
+    r"|可参考但不拘泥于本指南"
+    r"|(?:应|需|请)(?:查阅|参照|依据)[^。\n]{0,20}(?:说明书|指南|细则|文档|标准)"
+    r"|^(?:建议|请)(?:咨询|参照|查阅)[^：:\n]{0,20}[：:]"
+    r"|需由[^。\n]{0,16}专业人员指导制定"
+    r"|应按照批准剂量使用"
+    r")"
+)
+
+
+def _is_tangential_hedge_claim(statement: str) -> bool:
+    """Detect single tangential background claims emitted when core targets land in gaps."""
+    return bool(_TANGENTIAL_HEDGE_CLAIM.search(statement))
+
+
 def plan_section(plan: object) -> str:
     """Render the planner's output as a system-prompt appendix; empty means no structure."""
     if not isinstance(plan, str):
@@ -175,6 +230,20 @@ ORIGINAL_QUESTION_NOTICE = (
 def original_question_notice(original_question: object) -> str:
     """System-prompt appendix for the raw user words; empty when absent."""
     return ORIGINAL_QUESTION_NOTICE if isinstance(original_question, str) and original_question else ""
+
+RESOLVED_REFERENCES_NOTICE = (
+    "\nresolved_references 是本轮代词消解结果：expression 是用户原话里的代词，"
+    "entity 是它指向的对象，source_role 标注该对象出自 user（用户原话）还是 "
+    "assistant（助手回答）。只用于理解提问指向和把握措辞分寸；assistant 提到的"
+    "对象是会话上下文，不是用户自述，不得据此把对象写成用户患病或新增用户信息。"
+    "它不是医学证据，不得作为引用来源，也不得据此新增任何医学事实；"
+    "回答仍须只锚定本轮检索证据。"
+)
+
+
+def resolved_references_notice(resolved_references: object) -> str:
+    """System-prompt appendix for the turn's pronoun resolution; empty when absent."""
+    return RESOLVED_REFERENCES_NOTICE if resolved_references else ""
 
 SEARCH_SYSTEM = ("本次自检判定检索证据不足或缺失：先调用 tavily_search 工具联网补充资料再输出最终 JSON，"
                  "需要不同侧面时可以再次调用。工具返回的网页摘录与本地证据适用相同的锚定规则："
@@ -333,12 +402,23 @@ class OpenAITransport:
             return completion
 
     def complete_with_timeout(self, provider: str, system: str, user: str,
-                              timeout_seconds: float) -> str:
+                              timeout_seconds: float, *,
+                              json_mode: bool = False,
+                              max_tokens: int | None = None) -> str:
         """Bound correction requests without changing the generation default."""
         if timeout_seconds <= 0:
             raise TimeoutError
-        response = self._request(provider, _messages(system, user),
-                                 request_timeout=min(60., timeout_seconds))
+        options: dict = {"request_timeout": min(60., timeout_seconds)}
+        if max_tokens is not None:
+            options["max_tokens"] = max_tokens
+        if json_mode and self._json_mode_available():
+            options["json_mode"] = True
+        try:
+            response = self._request(provider, _messages(system, user), **options)
+        except _JSONModeRejected:
+            self._json_mode_rejected.add(self._endpoint_key())
+            options.pop("json_mode", None)
+            response = self._request(provider, _messages(system, user), **options)
         return response.choices[0].message.content or ""
 
     def chat(self, provider: str, messages: list[dict], tools: list[dict] | None = None) -> dict:
@@ -436,25 +516,44 @@ class OpenAITransport:
             factory = OpenAI
         client = factory(api_key=api_key, base_url=self.settings.qwen_base_url,
                          timeout=timeout, max_retries=0)
-        try:
-            # timeout 上限 120 s 兜底：Qwen 端点已由 completion_options 关掉思维链，
-            # 非 Qwen 服务没有那个开关，只能靠超时守边。
-            return client.chat.completions.create(model=self.settings.qwen_model, messages=messages,
-                                                 temperature=0,
-                                                 **({"response_format": {"type": "json_object"}}
-                                                    if json_mode else {}),
-                                                 **completion_options(self.settings.qwen_model,
-                                                                      self.settings.qwen_base_url),
-                                                 **options)
-        except APIStatusError as error:
-            # 一些 OpenAI 兼容服务不认识 response_format 并直接返回 400/404/422。
-            # 这是能力探测失败而不是上游故障：去掉该参数重试，并记住该端点不支持。
-            if json_mode and error.status_code in (400, 404, 422):
-                raise _JSONModeRejected from error
-            raise _model_error(error) from error
-        except (AuthenticationError, PermissionDeniedError, RateLimitError, APITimeoutError,
-                APIConnectionError) as error:
-            raise _model_error(error) from error
+        transient_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                # timeout 上限 120 s 兜底：Qwen 端点已由 completion_options 关掉思维链，
+                # 非 Qwen 服务没有那个开关，只能靠超时守边；瞬时抖动最多原地重试 1 次。
+                return client.chat.completions.create(model=self.settings.qwen_model, messages=messages,
+                                                     temperature=0,
+                                                     **({"response_format": {"type": "json_object"}}
+                                                        if json_mode else {}),
+                                                     **completion_options(self.settings.qwen_model,
+                                                                          self.settings.qwen_base_url),
+                                                     **options)
+            except APIStatusError as error:
+                # 一些 OpenAI 兼容服务不认识 response_format 并直接返回 400/404/422。
+                # 这是能力探测失败而不是上游故障：去掉该参数重试，并记住该端点不支持。
+                if json_mode and error.status_code in (400, 404, 422):
+                    raise _JSONModeRejected from error
+                if error.status_code >= 500 and attempt == 0:
+                    transient_error = error
+                    if self.client_factory is None:
+                        from time import sleep
+
+                        sleep(0.5)
+                    continue
+                raise _model_error(error) from error
+            except (AuthenticationError, PermissionDeniedError) as error:
+                raise _model_error(error) from error
+            except (RateLimitError, APITimeoutError, APIConnectionError) as error:
+                if attempt == 0:
+                    transient_error = error
+                    if self.client_factory is None:
+                        from time import sleep
+
+                        sleep(0.5)
+                    continue
+                raise _model_error(error) from error
+        assert transient_error is not None
+        raise _model_error(transient_error) from transient_error
 
 
 def _turn(content: str, calls: list[ToolCall], finish_reason: str | None = None) -> dict:
@@ -486,7 +585,8 @@ class GroundedGenerator:
               web_search: bool = False, on_claim: Callable[[dict], None] | None = None,
               plan: str = "", memory_context: str = "",
               short_term: object | None = None, history: list[dict] | None = None,
-              original_question: str = "") -> dict:
+              original_question: str = "",
+              resolved_references: list[dict] | None = None) -> dict:
         """Workflow drafting step: stream anchored claims, then the interpretive section.
 
         Keeps the return shape this step already had. Self-check, the web-search
@@ -497,10 +597,14 @@ class GroundedGenerator:
         ``short_term`` is this conversation's bounded window plus digest: context for
         reading the question, never a source of medical facts. ``history`` is the
         subset rule 2 recalled from the turn index, kept in its own payload field.
+        ``resolved_references`` is this turn's validated pronoun resolution; like
+        the short-term window it is conversation context in its own payload key,
+        never evidence.
         """
         return self._generate(question, evidence, provider, web_search, on_claim, plan=plan,
                               memory_context=memory_context, short_term=short_term,
-                              history=history, original_question=original_question)
+                              history=history, original_question=original_question,
+                              resolved_references=resolved_references)
 
     def generate_stream(self, question: str, evidence: list[Evidence], provider: str,
                         web_search: bool = False,
@@ -508,7 +612,8 @@ class GroundedGenerator:
                         memory_context: str = "",
                         short_term: object | None = None,
                         history: list[dict] | None = None,
-                        original_question: str = "") -> dict:
+                        original_question: str = "",
+                        resolved_references: list[dict] | None = None) -> dict:
         """Stream claims without publishing the analysis event.
 
         Callers that render the analysis themselves (the workflow draft step) use
@@ -517,14 +622,16 @@ class GroundedGenerator:
         return self._generate(question, evidence, provider, web_search, on_claim,
                               publish_analysis=False, plan=plan, memory_context=memory_context,
                               short_term=short_term, history=history,
-                              original_question=original_question)
+                              original_question=original_question,
+                              resolved_references=resolved_references)
 
     def _generate(self, question: str, evidence: list[Evidence], provider: str,
                   web_search: bool, on_claim: Callable[[dict], None] | None,
                   publish_analysis: bool = True, plan: str = "", memory_context: str = "",
                   short_term: object | None = None,
                   history: list[dict] | None = None,
-                  original_question: str = "") -> dict:
+                  original_question: str = "",
+                  resolved_references: list[dict] | None = None) -> dict:
         from .memory_context import memory_boundary
 
         available = bool(web_search and self.tools)
@@ -541,11 +648,13 @@ class GroundedGenerator:
                     "truncated": False}
         user = self._user(question, merged, memory_context=memory_context,
                           short_term=short_term, history=history,
-                          original_question=original_question)
+                          original_question=original_question,
+                          resolved_references=resolved_references)
         if not available or decision.mode == "clear":
             system = (BASE_SYSTEM + plan_section(plan) + memory_boundary(memory_context)
                       + short_term_boundary(short_term) + history_boundary(history)
-                      + original_question_notice(original_question))
+                      + original_question_notice(original_question)
+                      + resolved_references_notice(resolved_references))
             if on_claim is None:
                 completion = self._complete(provider, system, user)
                 draft, truncated = completion.text, completion.truncated
@@ -558,7 +667,7 @@ class GroundedGenerator:
         draft, merged, agent_queries, truncated = self._agent(
             question, merged, provider, decision, on_claim, plan=plan,
             memory_context=memory_context, short_term=short_term, history=history,
-            original_question=original_question)
+            original_question=original_question, resolved_references=resolved_references)
         self._publish_analysis(draft, merged, on_claim, publish_analysis)
         return {"draft": draft, "evidence": merged, "mode": decision.mode,
                 "queries": queries + agent_queries, "truncated": truncated}
@@ -598,11 +707,13 @@ class GroundedGenerator:
                  web_search: bool = False, plan: str = "", memory_context: str = "",
                  short_term: object | None = None,
                  history: list[dict] | None = None,
-                 original_question: str = "") -> dict:
+                 original_question: str = "",
+                 resolved_references: list[dict] | None = None) -> dict:
         """Self-check the retrieval, search the web when it is not enough, then draft."""
         return self._generate(question, evidence, provider, web_search, None, plan=plan,
                               memory_context=memory_context, short_term=short_term,
-                              history=history, original_question=original_question)
+                              history=history, original_question=original_question,
+                              resolved_references=resolved_references)
 
     def _agent(self, question: str, evidence: list[Evidence], provider: str,
                decision: Decision,
@@ -610,7 +721,8 @@ class GroundedGenerator:
                memory_context: str = "",
                short_term: object | None = None,
                history: list[dict] | None = None,
-               original_question: str = "") -> tuple[str, list[Evidence], list[str], bool]:
+               original_question: str = "",
+               resolved_references: list[dict] | None = None) -> tuple[str, list[Evidence], list[str], bool]:
         from .memory_context import memory_boundary
 
         messages = [{"role": "system",
@@ -618,10 +730,12 @@ class GroundedGenerator:
                                  + memory_boundary(memory_context)
                                  + short_term_boundary(short_term)
                                  + history_boundary(history)
-                                 + original_question_notice(original_question))},
+                                 + original_question_notice(original_question)
+                                 + resolved_references_notice(resolved_references))},
                     {"role": "user", "content": self._user(question, evidence, decision,
                                                            memory_context, short_term, history,
-                                                           original_question)}]
+                                                           original_question,
+                                                           resolved_references)}]
         merged = list(evidence)
         queries: list[str] = []
         budget = self.max_tool_calls
@@ -671,7 +785,8 @@ class GroundedGenerator:
     def _user(self, question: str, evidence: list[Evidence], decision: Decision | None = None,
               memory_context: str = "", short_term: object | None = None,
               history: list[dict] | None = None,
-              original_question: str = "") -> str:
+              original_question: str = "",
+              resolved_references: list[dict] | None = None) -> str:
         payload: dict[str, object] = {"question": question,
                                       "evidence": self._evidence_payload(evidence)}
         if decision is not None:
@@ -688,6 +803,11 @@ class GroundedGenerator:
             # The raw words stay beside the resolved question, never in its place:
             # retrieval and grounding already used the complete question.
             payload["original_question"] = original_question
+        if resolved_references:
+            # Same contract as short_term/history: conversation context in its own
+            # key, never merged into evidence, so citation validation keeps seeing
+            # only retrieved blocks.
+            payload["resolved_references"] = [dict(item) for item in resolved_references]
         return json.dumps(payload, ensure_ascii=False)
 
     @staticmethod
@@ -750,12 +870,16 @@ class GroundedGenerator:
             citations = {}
             verified_claims = []
             numeric_rejections = {}
+            refusal_filtered = 0
             for claim in claims:
                 try:
                     statement, refs = claim["text"], claim["citations"]
                 except (TypeError, KeyError):
                     continue
                 if not isinstance(statement, str) or not statement.strip() or not isinstance(refs, list) or not refs:
+                    continue
+                if _is_meta_refusal_claim(statement):
+                    refusal_filtered += 1
                     continue
                 ids = []
                 claim_citations = {}
@@ -782,7 +906,14 @@ class GroundedGenerator:
                     ids.append(block_id)
                 if not ids:
                     continue
-                if not numbers_supported(statement, [allowed[key].chunk.context_text for key in ids]):
+                cited_sources = []
+                for key in ids:
+                    chunk = allowed[key].chunk
+                    cited_sources.append(chunk.context_text)
+                    metadata = " ".join(part for part in (chunk.filename, chunk.section) if part).strip()
+                    if metadata:
+                        cited_sources.append(metadata)
+                if not numbers_supported(statement, cited_sources):
                     numeric_rejections["claims"] = numeric_rejections.get("claims", 0) + 1
                     continue
                 citations.update(claim_citations)
@@ -794,15 +925,26 @@ class GroundedGenerator:
                                              repair=parsed.repair, truncated=truncated)
                     rejected["numeric_rejections"] = numeric_rejections
                     return rejected
+                if refusal_filtered > 0:
+                    return self._abstain(ABSTAIN_NO_EVIDENCE, repair=parsed.repair,
+                                         truncated=truncated)
                 # 写了结论但一个真实块都没锚到：这是引用校验失败，不是资料不足。
                 return self._abstain(ABSTAIN_UNANCHORED, repair=parsed.repair, truncated=truncated)
             # answer 保留已锚定结论，格式与上一版一致，评测与调用方不受影响；
             # 资料未覆盖的意思以固定前缀排在结论之后，让读者一眼看到哪部分没有依据。
-            gaps = self._gaps(result.get("gaps"))
-            safe_gaps = [gap for gap in gaps if numbers_supported(
+            raw_gaps = self._gaps(result.get("gaps"))
+            # 提问核心要点落入 gaps (>=2) 且所有已输出结论均为泛化背景/尚待研究说明时，
+            # 说明核心问题并无实质证据支撑，归入拒答以避免伪部分作答。
+            if (
+                (len(raw_gaps) >= 2 or refusal_filtered > 0)
+                and verified_claims
+                and all(_is_tangential_hedge_claim(stmt) for stmt, _ in verified_claims)
+            ):
+                return self._abstain(ABSTAIN_NO_EVIDENCE, repair=parsed.repair, truncated=truncated)
+            safe_gaps = [gap for gap in raw_gaps if numbers_supported(
                 gap, [statement for statement, _ in verified_claims])]
-            if len(safe_gaps) != len(gaps):
-                numeric_rejections["gaps"] = len(gaps) - len(safe_gaps)
+            if len(safe_gaps) != len(raw_gaps):
+                numeric_rejections["gaps"] = len(raw_gaps) - len(safe_gaps)
             gaps = safe_gaps
             published = {"answer": "\n".join(
                              lines + [f"当前资料未覆盖：{gap}" for gap in gaps]),

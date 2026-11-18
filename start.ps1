@@ -456,7 +456,7 @@ function Start-LegacyApi {
     $env:MEDICAL_RAG_ACCESS_MODE = $AccessMode
     $null = Start-BackgroundProcess -Name 'api' `
         -Description 'RAG API (uvicorn)' `
-        -Arguments @('-m', 'uvicorn', 'medical_rag.api:app', '--app-dir', 'src',
+        -Arguments @('-m', 'medical_rag.api_server',
                      '--host', '127.0.0.1', '--port', "$ApiPort")
 
     $deadline = (Get-Date).AddSeconds(120)
@@ -589,6 +589,25 @@ function Start-PatientPortal {
             return
         }
         throw "端口 $PatientPort 被其他进程占用 (PID $listener)；请先运行 .\start.ps1 -Stop"
+    }
+
+    # 患者服务刻意不读取 .env（security_config 只认操作员进程环境），连续追问的
+    # 开关必须在这里注入；取值规则与 medical_rag.dialogue_flags 相同：只认
+    # true/1/false/0，.env 缺省按 false，拼错直接失败而不是带错误状态启动。
+    $raw = ''
+    if (Test-Path (Join-Path $Root '.env')) {
+        $match = Select-String -Path (Join-Path $Root '.env') `
+            -Pattern '^\s*DIALOGUE_STATE_ENABLED\s*=\s*(.+?)\s*$' | Select-Object -First 1
+        if ($match) { $raw = $match.Matches[0].Groups[1].Value.Trim('"', "'").ToLower() }
+    }
+    if ($raw -in @('true', '1')) {
+        $env:DIALOGUE_STATE_ENABLED = 'true'
+        Write-Info '患者端连续追问：已注入 DIALOGUE_STATE_ENABLED=true'
+    } elseif ($raw -in @('', 'false', '0')) {
+        $env:DIALOGUE_STATE_ENABLED = 'false'
+        Write-Info '患者端连续追问：未启用（.env 未开启 DIALOGUE_STATE_ENABLED）'
+    } else {
+        throw "DIALOGUE_STATE_ENABLED 取值无法识别，请修正 .env 后重试"
     }
 
     $null = Start-BackgroundProcess -Name 'patient-portal' `

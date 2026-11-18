@@ -129,10 +129,16 @@ or the workers through this gateway. No Docker socket is mounted.
 ## 5. Routing, headers and bounds
 
 Only the patient application's current paths are routed: `/auth/...`, `/me`,
-`/me/consents/health`, `/conversations...`, `/audit`, `/support/...`,
-`/patient.html`, `/assets/...` and `/`. Unknown paths and the legacy `/ui`,
-`/api`, `/settings` and `/documents` paths are answered by the gateway and never
-reach the application.
+`/me/consents/health`, `/conversations...`, `/chat`, `/chat/stream`, `/audit`,
+`/support/...`, `/patient.html`, `/assets/...` and `/`. Unknown paths and the
+legacy `/ui`, `/api`, `/settings` and `/documents` paths are answered by the
+gateway and never reach the application.
+
+`/chat/stream` is Server-Sent Events from the application; the rendered
+configuration already disables proxy buffering and caching for every routed
+path, so conclusions reach the browser as they are produced. This is still
+development admission control by connection source IP, not account-level
+limiting.
 
 The application remains authoritative for authentication, sessions, roles,
 ownership, consent, MFA and audit. The gateway does not validate identity

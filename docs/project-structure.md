@@ -35,7 +35,7 @@ medical-rag-resume/
 ```text
 src/medical_rag/
 ├─ 应用入口与聊天
-│  ├─ api.py, chat_api.py, service.py, chat_runtime.py, chat_history.py
+│  ├─ api.py, api_server.py, chat_api.py, service.py, chat_runtime.py, chat_history.py
 │  ├─ short_term.py, summarize.py, conversation_index.py
 │  ├─ dialogue_models.py, dialogue_state.py, dialogue_flags.py, dialogue_evaluation.py
 │  └─ streaming.py, types.py
@@ -60,7 +60,7 @@ src/medical_rag/
 │  ├─ patient_gateway.py
 │  └─ support_service.py
 ├─ 配置与设置
-│  └─ config.py, settings_store.py
+│  └─ config.py, settings_store.py, logging_setup.py
 └─ workflow/                    工作流引擎与节点
    ├─ engine.py, definition.py, contracts.py, validator.py
    ├─ repository.py, registry.py, run_schema.py, bootstrap.py

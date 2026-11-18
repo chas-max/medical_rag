@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 import sqlite3
 import threading
@@ -13,6 +12,7 @@ from contextlib import contextmanager
 from typing import TYPE_CHECKING, Protocol
 
 from fastapi.encoders import jsonable_encoder
+from loguru import logger
 
 from .chat_history import ChatHistoryStore
 from .dialogue_models import DialogueRun, DialogueSnapshot
@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from .chat_api import ChatRunRequest, ConfirmationRequest
     from .service import RagService
 
-logger = logging.getLogger(__name__)
 LEASE_RENEW_SECONDS = 10
 
 

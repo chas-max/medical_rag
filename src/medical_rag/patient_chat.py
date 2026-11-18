@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
@@ -24,6 +25,16 @@ MAX_CITATIONS = 50
 MAX_TEXT = 512
 MAX_CONTEXT_BYTES = 64 * 1024
 ANSWER_TYPES = frozenset({"answer", "clarification"})
+
+# Streaming. The upstream may publish more event names than the patient layer is
+# willing to interpret; anything not listed here is skipped instead of failing the
+# turn, so a future generator event cannot break an installed portal. The frame
+# bound keeps an unbounded upstream payload out of this process.
+STREAM_EVENTS = frozenset({"status", "claim", "analysis", "done"})
+STREAM_ERROR = "error"
+MAX_FRAME_BYTES = 16 * 1024
+MAX_CLAIM_TEXT = 2000
+MAX_STAGE = 32
 
 
 class ChatUnavailable(Exception):
@@ -137,6 +148,60 @@ def _answer(value: object, question: str,
     return result
 
 
+def _sse_frames(lines: "Iterator[str]") -> "Iterator[tuple[str, str]]":
+    """Collapse SSE lines into bounded ``(event, data)`` pairs.
+
+    Comment lines are ignored and an incomplete trailing frame is dropped: a
+    truncated stream must not be read as a complete event.
+    """
+    name = ""
+    data: list[str] = []
+    size = 0
+    for line in lines:
+        if line == "":
+            if name and data:
+                yield name, "\n".join(data)
+            name, data, size = "", [], 0
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            name = value
+        elif field == "data":
+            size += len(value.encode("utf-8"))
+            if size > MAX_FRAME_BYTES:
+                raise ChatUnavailable()
+            data.append(value)
+
+
+def _frame_object(payload: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (ValueError, TypeError):
+        raise ChatUnavailable() from None
+    if type(value) is not dict:
+        raise ChatUnavailable()
+    return value
+
+
+def _claim_text(value: dict[str, object]) -> str | None:
+    """Return the claim body, or ``None`` for a frame this layer must not show."""
+    text = value.get("text")
+    if not isinstance(text, str) or not text.strip() or len(text) > MAX_CLAIM_TEXT:
+        return None
+    return text
+
+
+def _status_stage(value: dict[str, object]) -> str:
+    stage = value.get("stage")
+    if not isinstance(stage, str) or not 0 < len(stage) <= MAX_STAGE or not stage.isascii():
+        return "generating"
+    return stage
+
+
 @dataclass(frozen=True, slots=True)
 class ChatClient:
     """Trusted loopback caller; no cookies, proxies or redirects."""
@@ -178,23 +243,9 @@ class ChatClient:
         """
         if type(question) is not str or not question.strip() or len(question) > MAX_QUESTION:
             raise ValueError("Invalid question")
-        body: dict[str, object] = {
-            "question": question, "top_k": self.top_k, "memory": False,
-        }
-        if dialogue is not None:
-            encoded = dialogue.model_dump_json()
-            if len(encoded.encode("utf-8")) > MAX_CONTEXT_BYTES:
-                raise ValueError("Invalid dialogue context")
-            body["dialogue_context"] = json.loads(encoded)
+        body = self._body(question, dialogue)
         try:
-            with httpx.Client(
-                base_url=self.base_url,
-                headers={"Origin": self.origin, "Accept": "application/json"},
-                timeout=httpx.Timeout(self.timeout_seconds, connect=5.0),
-                trust_env=False,
-                follow_redirects=False,
-                transport=self.transport,
-            ) as client:
+            with self._client("application/json") as client:
                 response = client.post("/answers", json=body)
         except httpx.HTTPError:
             raise ChatUnavailable() from None
@@ -211,3 +262,83 @@ class ChatClient:
             return _answer(payload.get("data"), question, dialogue)
         except (ValueError, TypeError, KeyError):
             raise ChatUnavailable() from None
+
+    def stream(self, question: str, *,
+               dialogue: DialogueSnapshot | None = None
+               ) -> Iterator[dict[str, object]]:
+        """Yield this turn's frames from the local streaming endpoint.
+
+        Frames before ``done`` are provisional display material. Only the ``done``
+        payload is validated and shaped by :func:`_answer`, and it is the only
+        value a caller may persist or treat as the answer.
+
+        Args:
+            question: The patient's question, bounded by ``MAX_QUESTION``.
+            dialogue: This conversation's already-authorised bounded snapshot.
+
+        Yields:
+            ``status`` / ``claim`` / ``analysis`` frames, then exactly one ``done``
+            frame carrying the validated answer.
+
+        Raises:
+            ValueError: For an invalid question.
+            ChatUnavailable: For any upstream, transport or protocol failure,
+                including a stream that ends without a terminal frame.
+        """
+        if type(question) is not str or not question.strip() or len(question) > MAX_QUESTION:
+            raise ValueError("Invalid question")
+        body = self._body(question, dialogue)
+        try:
+            with self._client("text/event-stream") as client:
+                with client.stream("POST", "/answers/stream", json=body) as response:
+                    if response.status_code != 200:
+                        raise ChatUnavailable()
+                    media = response.headers.get("content-type", "")
+                    if media.split(";")[0].strip().lower() != "text/event-stream":
+                        raise ChatUnavailable()
+                    for name, payload in _sse_frames(response.iter_lines()):
+                        if name == STREAM_ERROR:
+                            # Upstream text is never forwarded; the patient layer
+                            # decides its own public code.
+                            raise ChatUnavailable()
+                        if name == "done":
+                            yield {"event": "done",
+                                   "data": _answer(_frame_object(payload), question, dialogue)}
+                            return
+                        if name not in STREAM_EVENTS:
+                            continue
+                        frame = _frame_object(payload)
+                        if name == "claim":
+                            text = _claim_text(frame)
+                            if text is not None:
+                                yield {"event": "claim", "data": {"text": text}}
+                        elif name == "status":
+                            yield {"event": "status", "data": {"stage": _status_stage(frame)}}
+                        else:
+                            yield {"event": name, "data": frame}
+        except httpx.HTTPError:
+            raise ChatUnavailable() from None
+        raise ChatUnavailable()
+
+    def _body(self, question: str,
+              dialogue: DialogueSnapshot | None) -> dict[str, object]:
+        """The one request body both endpoints send; keeps them from diverging."""
+        body: dict[str, object] = {
+            "question": question, "top_k": self.top_k, "memory": False,
+        }
+        if dialogue is not None:
+            encoded = dialogue.model_dump_json()
+            if len(encoded.encode("utf-8")) > MAX_CONTEXT_BYTES:
+                raise ValueError("Invalid dialogue context")
+            body["dialogue_context"] = json.loads(encoded)
+        return body
+
+    def _client(self, accept: str) -> httpx.Client:
+        return httpx.Client(
+            base_url=self.base_url,
+            headers={"Origin": self.origin, "Accept": accept},
+            timeout=httpx.Timeout(self.timeout_seconds, connect=5.0),
+            trust_env=False,
+            follow_redirects=False,
+            transport=self.transport,
+        )

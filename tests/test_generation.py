@@ -824,3 +824,291 @@ def _completion_client(requests, outcomes):
             self.chat = SimpleNamespace(completions=Completions())
 
     return Client
+
+
+
+def test_validate_filters_meta_refusal_claims_and_keeps_clinical_contractions():
+    import json as _json
+    from medical_rag.generation import ABSTAIN_NO_EVIDENCE, GroundedGenerator
+    from medical_rag.types import Chunk, Evidence
+
+    ev = Evidence(
+        Chunk("c1", "d", "guide.md", "阿司匹林不适用于未控制高血压患者。", "guide.md", "禁忌", 1, 0),
+        0.9,
+    )
+    generator = GroundedGenerator(None)
+
+    only_refusal = _json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "现有资料未提及儿童免疫相关性肺炎的精确激素减停方案。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    abstained = generator.validate(only_refusal, [ev])
+    assert abstained["abstained"] is True
+    assert abstained["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+    mixed = _json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "阿司匹林不适用于未控制高血压患者。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+                {
+                    "text": "当前资料未规定合并肾衰时的精确替代疗程。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+            ]
+        },
+        ensure_ascii=False,
+    )
+    validated = generator.validate(mixed, [ev])
+    assert validated["abstained"] is False
+    assert "阿司匹林不适用于未控制高血压患者。" in validated["answer"]
+    assert "未规定" not in validated["answer"]
+
+
+def test_validate_abstains_single_tangential_hedge_when_gaps_cover_core_question():
+    import json as _json
+    from medical_rag.generation import ABSTAIN_NO_EVIDENCE, GroundedGenerator
+    from medical_rag.types import Chunk, Evidence
+
+    ev = Evidence(
+        Chunk(
+            "c1",
+            "d",
+            "guide.md",
+            "采用脉搏波传导时间等新技术的无袖带血压测量尚需更多的科学研究，可穿戴式电子血压计需通过标准化方案进行准确性验证。",
+            "guide.md",
+            "测量",
+            1,
+            0,
+        ),
+        0.9,
+    )
+    generator = GroundedGenerator(None)
+
+    tangential = _json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "无袖带血压测量尚需更多的科学研究，指南仅提及需通过标准化方案进行准确性验证。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ],
+            "gaps": ["定量误差阈值范围", "禁忌人群标准"],
+        },
+        ensure_ascii=False,
+    )
+    abstained = generator.validate(tangential, [ev])
+    assert abstained["abstained"] is True
+    assert abstained["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+    single_gap = _json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "可穿戴式电子血压计尚需进一步验证。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ],
+            "gaps": ["禁忌人群标准"],
+        },
+        ensure_ascii=False,
+    )
+    kept_single_gap = generator.validate(single_gap, [ev])
+    assert kept_single_gap["abstained"] is False
+
+    multi_claim = _json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "可穿戴式电子血压计需通过标准化方案进行准确性验证。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+                {
+                    "text": "无袖带测量尚需更多的科学研究。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+            ],
+            "gaps": ["定量误差阈值范围", "禁忌人群标准"],
+        },
+        ensure_ascii=False,
+    )
+    kept_multi = generator.validate(multi_claim, [ev])
+    assert kept_multi["abstained"] is False
+
+    two_tangential = _json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "无袖带血压测量目前仍需更多的科学研究来确立标准。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+                {
+                    "text": "指南仅强调需要根据标准化方案进行准确性验证，但未列出具体量化指标。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+            ],
+            "gaps": ["定量误差阈值范围", "禁忌人群标准", "特定指导原则"],
+        },
+        ensure_ascii=False,
+    )
+    abstained_two = generator.validate(two_tangential, [ev])
+    assert abstained_two["abstained"] is True
+    assert abstained_two["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+
+def test_prefixed_meta_refusal_and_disclaimer_claims_abstain():
+    from medical_rag.generation import ABSTAIN_NO_EVIDENCE
+
+    ev = Evidence(
+        Chunk("c1", "d1", "guide.md", "指南一般建议合理用药与规范随访。", "guide.md", "总则", 1, 0),
+        0.85,
+    )
+    generator = GroundedGenerator(None)
+
+    prefixed = json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "剂量规定：现有医学参考资料中未规定该人群的具体起始剂量阈值。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ],
+            "gaps": [],
+        },
+        ensure_ascii=False,
+    )
+    res_pref = generator.validate(prefixed, [ev])
+    assert res_pref["abstained"] is True
+    assert res_pref["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+    disclaimer_no_gaps = json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "该方案不可替代药物治疗，临床医师应查阅正式说明书并按批准剂量使用。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ],
+            "gaps": [],
+        },
+        ensure_ascii=False,
+    )
+    assert generator.validate(disclaimer_no_gaps, [ev])["abstained"] is False
+
+    disclaimer_with_gaps = json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "该方案不可替代药物治疗，临床医师应查阅正式说明书并按批准剂量使用。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ],
+            "gaps": ["具体起始剂量", "合并症用药禁忌"],
+        },
+        ensure_ascii=False,
+    )
+    res_disc = generator.validate(disclaimer_with_gaps, [ev])
+    assert res_disc["abstained"] is True
+    assert res_disc["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+
+def test_meta_refusal_and_colon_hedge_abstain_for_provided_docs_and_unspecified_protocols():
+    from medical_rag.generation import ABSTAIN_NO_EVIDENCE
+
+    ev = Evidence(
+        Chunk("c1", "d1", "guide.md", "本指南旨在规范基层心血管危险因素管理。", "guide.md", "总则", 1, 0),
+        0.82,
+    )
+    generator = GroundedGenerator(None)
+
+    provided_doc_gap = json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "当前提供的资料仅包含总则框架，未涉及具体医保报销比例。",
+                    "citations": [{"chunk_id": "c1"}],
+                }
+            ],
+            "gaps": ["医保报销比例"],
+        },
+        ensure_ascii=False,
+    )
+    res_136 = generator.validate(provided_doc_gap, [ev])
+    assert res_136["abstained"] is True
+    assert res_136["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+    unspecified_protocol = json.dumps(
+        {
+            "claims": [
+                {
+                    "text": "该指南仅要求信息系统安全传输，但未指定具体的底层技术协议版本。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+                {
+                    "text": "建议参照相关技术文档：以系统正式接口规范为准。",
+                    "citations": [{"chunk_id": "c1"}],
+                },
+            ],
+            "gaps": ["底层技术协议版本"],
+        },
+        ensure_ascii=False,
+    )
+    res_016 = generator.validate(unspecified_protocol, [ev])
+    assert res_016["abstained"] is True
+    assert res_016["abstain_reason"] == ABSTAIN_NO_EVIDENCE
+
+
+def test_openai_transport_retries_once_on_transient_error_but_not_on_4xx():
+    request = httpx.Request("POST", "https://example.invalid/chat")
+    err_503 = APIStatusError(
+        "upstream busy", response=httpx.Response(503, request=request), body={}
+    )
+    err_400 = APIStatusError(
+        "bad request", response=httpx.Response(400, request=request), body={}
+    )
+
+    attempts_503 = []
+
+    class RetrySuccessClient:
+        def __init__(self, **kwargs):
+            def create(**kw):
+                attempts_503.append(1)
+                if len(attempts_503) == 1:
+                    raise err_503
+                return SimpleNamespace(
+                    choices=[SimpleNamespace(message=SimpleNamespace(content='{"ok":1}'))]
+                )
+
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+
+    transport_ok = OpenAITransport(
+        Settings(qwen_api_key="key"), client_factory=RetrySuccessClient
+    )
+    assert transport_ok.complete("qwen", "s", "u") == '{"ok":1}'
+    assert len(attempts_503) == 2
+
+    attempts_400 = []
+
+    class NoRetry4xxClient:
+        def __init__(self, **kwargs):
+            def create(**kw):
+                attempts_400.append(1)
+                raise err_400
+
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
+
+    transport_400 = OpenAITransport(
+        Settings(qwen_api_key="key"), client_factory=NoRetry4xxClient
+    )
+    with pytest.raises(ApiError):
+        transport_400.complete("qwen", "s", "u")
+    assert len(attempts_400) == 1

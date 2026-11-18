@@ -128,3 +128,52 @@ def test_token_chunking_is_deterministic_and_rejects_oversized_limits():
     with pytest.raises(ValueError, match="父块"):
         chunk_document(parsed, TopicEmbedder(), max_tokens=120, overlap_tokens=10,
                        parent_max_tokens=100, token_counter=COUNTER)
+
+
+def test_pdf_causal_sections_and_orphan_page_numbers_preserve_clean_text():
+    from medical_rag.pdf_sections import format_chunk_for_index, is_administrative_boilerplate
+
+    pdf = fitz.open()
+    p1 = pdf.new_page()
+    p1.insert_text((72, 72), "目 录\n一、高血压概述 ........ 2\n二、药物治疗 ........ 5\n三、随访 ........ 8\n四、附录 ........ 12\n1", fontname="china-s")
+    p2 = pdf.new_page()
+    p2.insert_text((72, 72), "2\n一、高血压概述\n（一）诊断标准\n诊室血压收缩压>=140 mmHg。\n- 2 -", fontname="china-s")
+    p3 = pdf.new_page()
+    p3.insert_text((72, 72), "参考文献\n[1] 作者A. 文章1.\n[2] 作者B. 文章2.\n[3] 作者C. 文章3.", fontname="china-s")
+    parsed = parse_document("中国高血压防治指南（2024年修订版）.pdf", pdf.tobytes())
+    _, _, chunks = chunk_document(parsed, TopicEmbedder(), token_counter=COUNTER)
+
+    p2_chunk = next(chunk for chunk in chunks if chunk.page == 2)
+    assert p2_chunk.section == "一、高血压概述 / （一）诊断标准"
+    assert not p2_chunk.text.lstrip().startswith("2\n")
+    assert "- 2 -" not in p2_chunk.text
+    assert is_administrative_boilerplate(next(c for c in chunks if c.page == 1).text, "目录") is True
+    assert is_administrative_boilerplate(p2_chunk.text, p2_chunk.section) is False
+
+    indexed = format_chunk_for_index(p2_chunk.filename, p2_chunk.section, p2_chunk.text)
+    assert indexed.startswith("《中国高血压防治指南（2024年修订版）》 (一、高血压概述 / （一）诊断标准)\n")
+    assert "诊室血压收缩压" in indexed
+
+
+def test_document_embed_adds_metadata_only_to_embedder_input():
+    from medical_rag.types import Chunk
+    from medical_rag.workflow.contracts import ExecutionContext
+    from medical_rag.workflow.nodes.documents import embed
+
+    recorded: list[list[str]] = []
+
+    class CaptureEmbedder:
+        def encode(self, texts):
+            recorded.append(list(texts))
+            return [[0.5, 0.5] for _ in texts]
+
+    chunk = Chunk("c1", "d1", "s1", "氨氯地平2.5~10 mg", "高血压指南.pdf", "常用降压药", 1, 0)
+    ctx = ExecutionContext("r1", "document-ingestion", {})
+    plain = embed({"chunks": [chunk]}, {}, ctx, CaptureEmbedder())
+    titled = embed({"chunks": [chunk]}, {"include_metadata": True}, ctx, CaptureEmbedder())
+
+    assert plain["vectors"] == [[0.5, 0.5]]
+    assert titled["vectors"] == [[0.5, 0.5]]
+    assert recorded[0] == ["氨氯地平2.5~10 mg"]
+    assert recorded[1] == ["《高血压指南》 (常用降压药)\n氨氯地平2.5~10 mg"]
+    assert chunk.text == "氨氯地平2.5~10 mg"

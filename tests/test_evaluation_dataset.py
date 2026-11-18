@@ -88,3 +88,44 @@ def test_legacy_empty_relevant_reports_actual_line_number(tmp_path):
                     '{"question":"bad","relevant_chunk_ids":[]}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="第 2 行"):
         load_dataset(path)
+
+
+def test_graded_relevance_and_insufficient_context_only_refs():
+    answerable = rich_row(
+        source_refs=[
+            {"source_id": "g1", "locator": {"page": 1}, "quote": "核心句", "anchor_id": "g1#p1#1", "relevance": 2},
+            {"source_id": "g2", "locator": {"page": 2}, "quote": "补充句", "anchor_id": "g2#p2#2", "relevance": 1},
+        ],
+        chunk_grades={"chunk-1": 2},
+    )
+    assert validate_evaluation_row(answerable, 1)["chunk_grades"] == {"chunk-1": 2}
+
+    insuff_empty = rich_row(answerability="insufficient_evidence", source_refs=[], relevant_chunk_ids=[])
+    assert validate_evaluation_row(insuff_empty, 1)["source_refs"] == []
+
+    insuff_decoy = rich_row(
+        answerability="insufficient_evidence",
+        source_refs=[{"source_id": "g1", "locator": {"page": 1}, "quote": "干扰句", "anchor_id": "g1#p1#0", "relevance": 0}],
+        relevant_chunk_ids=[],
+        context_chunk_ids=["decoy-1"],
+    )
+    assert validate_evaluation_row(insuff_decoy, 1)["context_chunk_ids"] == ["decoy-1"]
+
+
+@pytest.mark.parametrize("overrides", [
+    {"source_refs": [{"source_id": "g1", "locator": {"page": 1}, "quote": "q", "anchor_id": "a", "relevance": 3}]},
+    {"source_refs": [{"source_id": "g1", "locator": {"page": 1}, "quote": "q", "anchor_id": "a", "relevance": True}]},
+    {"source_refs": [{"source_id": "g1", "locator": {"page": 1}, "quote": "q", "anchor_id": "a", "relevance": 0}]},
+    {"source_refs": [
+        {"source_id": "g1", "locator": {"page": 1}, "quote": "q1", "anchor_id": "a1", "relevance": 1},
+        {"source_id": "g2", "locator": {"page": 2}, "quote": "q2", "anchor_id": "a2", "relevance": 1},
+    ]},
+    {"answerability": "insufficient_evidence",
+     "source_refs": [{"source_id": "g1", "locator": {"page": 1}, "quote": "q", "anchor_id": "a", "relevance": 2}]},
+    {"chunk_grades": {"chunk-1": 0}},
+    {"chunk_grades": {"": 2}},
+    {"context_chunk_ids": ["d1", "d1"]},
+])
+def test_invalid_graded_fields_are_rejected(overrides):
+    with pytest.raises(ValueError):
+        validate_evaluation_row(rich_row(**overrides), 1)

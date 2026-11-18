@@ -91,3 +91,15 @@ def test_auto_preset_runs_without_a_provider_wire():
     plan({"question": "高血压如何长期管理？"}, {}, CONTEXT, transport, "qwen")
 
     assert transport.calls[0][0] == "qwen"
+
+
+
+def test_plan_falls_back_to_standard_only_when_configured():
+    from medical_rag.workflow.nodes.planning import STANDARD_SECTIONS
+
+    class BrokenTransport:
+        def complete(self, provider, system, user):
+            raise ApiError("MODEL_RATE_LIMITED", "限流", 429)
+
+    fallback = plan(QUESTION, {"fallback_on_error": True}, CONTEXT, BrokenTransport(), "qwen")
+    assert all(section in fallback["plan"] for section in STANDARD_SECTIONS)

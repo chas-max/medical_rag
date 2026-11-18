@@ -10,6 +10,16 @@ from uuid import UUID
 from cryptography.hazmat.primitives.serialization import load_pem_public_key
 
 from .dialogue_flags import dialogue_enabled
+from .logging_setup import (
+    DEFAULT_COMPRESSION,
+    DEFAULT_LEVEL,
+    DEFAULT_RETENTION,
+    DEFAULT_ROTATION,
+    is_valid_compression,
+    is_valid_level,
+    is_valid_retention,
+    is_valid_rotation,
+)
 from .oidc_login import LoginConfiguration
 from .patient_chat import ChatClient
 from .patient_service import HealthNotice
@@ -21,6 +31,19 @@ class StartupError(Exception):
 
     def __str__(self) -> str:
         return "患者服务启动失败，请联系机构运维。"
+
+
+@dataclass(frozen=True, slots=True)
+class PatientLoggingConfig:
+    """Operator-owned portal log switches; disabled unless the TOML says otherwise."""
+
+    enabled: bool = False
+    directory: Path | None = None
+    level: str = DEFAULT_LEVEL
+    rotation: str = DEFAULT_ROTATION
+    retention: str = DEFAULT_RETENTION
+    compression: str = DEFAULT_COMPRESSION
+    json_output: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,6 +62,12 @@ class PatientConfiguration:
     # Read from the operator process environment, never from TOML or the legacy
     # demo .env file this service deliberately does not load.
     dialogue_state_enabled: bool = False
+    # Off by default: an installed portal keeps the synchronous route until an
+    # operator has verified streaming end to end.
+    chat_streaming: bool = False
+    # Portal file logging stays opt-in: the default keeps stderr and disk silent
+    # because request-level evidence belongs in PostgreSQL audit rows, not logs.
+    logging_config: PatientLoggingConfig = field(default_factory=PatientLoggingConfig)
 
 
 def _read(path: Path, limit: int) -> bytes:
@@ -67,6 +96,52 @@ def _string(value: object) -> str:
     return value
 
 
+def _bounded_text(value: object, limit: int = 32) -> str:
+    if type(value) is not str or not value.strip() or len(value) > limit or "\x00" in value:
+        raise StartupError()
+    return value.strip()
+
+
+def _logging_options(value: object, base: Path) -> PatientLoggingConfig:
+    """Reject anything that is not an explicit, bounded logging request."""
+    keys = _keys(value, "enabled", "directory level rotation retention compression json")
+    if type(keys["enabled"]) is not bool:
+        raise StartupError()
+    if not keys["enabled"]:
+        return PatientLoggingConfig()
+    if "directory" not in keys:
+        raise StartupError()
+    directory = (base / _bounded_text(keys["directory"], 4096)).resolve()
+    if directory.exists() and not directory.is_dir():
+        raise StartupError()
+    level = _bounded_text(keys.get("level", DEFAULT_LEVEL))
+    rotation = _bounded_text(keys.get("rotation", DEFAULT_ROTATION))
+    retention = _bounded_text(keys.get("retention", DEFAULT_RETENTION))
+    compression = keys.get("compression", DEFAULT_COMPRESSION)
+    if type(compression) is not str or len(compression) > 16:
+        raise StartupError()
+    if not (
+        is_valid_level(level)
+        and is_valid_rotation(rotation)
+        and is_valid_retention(retention)
+        and is_valid_compression(compression)
+    ):
+        raise StartupError()
+    json_output = keys.get("json", False)
+    if type(json_output) is not bool:
+        raise StartupError()
+    normalized_compression = compression.strip().lower()
+    return PatientLoggingConfig(
+        enabled=True,
+        directory=directory,
+        level=level.upper(),
+        rotation=rotation,
+        retention=retention,
+        compression="" if normalized_compression in {"", "none", "off"} else normalized_compression,
+        json_output=json_output,
+    )
+
+
 def load_configuration(path: Path) -> PatientConfiguration:
     """Resolve all file paths relative to this operator-owned TOML file."""
     try:
@@ -75,7 +150,7 @@ def load_configuration(path: Path) -> PatientConfiguration:
             tomllib.loads(_read(path, 65536).decode("utf-8")),
             "tenant_id database_dsn_file transaction_key_file frontend_dist listen_host listen_port "
             "tls_cert_file tls_key_file oidc health_notice",
-            "chat",
+            "chat logging",
         )
         oidc = _keys(
             data["oidc"],
@@ -88,12 +163,14 @@ def load_configuration(path: Path) -> PatientConfiguration:
         if "verification_key_files" in oidc:
             validate_key_names(oidc["verification_key_files"])
         notice = _keys(data["health_notice"], "version text_file validity_seconds")
-        chat = None
+        chat, streaming = None, False
         if "chat" in data:
-            settings = _keys(data["chat"], "base_url timeout_seconds top_k")
+            settings = _keys(data["chat"], "base_url timeout_seconds top_k", "streaming")
             timeout, top_k = settings["timeout_seconds"], settings["top_k"]
+            streaming = settings.get("streaming", False)
             if (type(timeout) is not int or not 1 <= timeout <= 300
-                    or type(top_k) is not int or not 1 <= top_k <= 20):
+                    or type(top_k) is not int or not 1 <= top_k <= 20
+                    or type(streaming) is not bool):
                 raise StartupError()
             try:
                 chat = ChatClient(_string(settings["base_url"]), timeout, top_k)
@@ -165,6 +242,10 @@ def load_configuration(path: Path) -> PatientConfiguration:
             ),
             chat,
             dialogue_enabled(),
+            streaming,
+            _logging_options(data["logging"], path.parent)
+            if "logging" in data
+            else PatientLoggingConfig(),
         )
     except Exception:  # noqa: BLE001 -- secret-bearing parser/crypto errors stay private
         raise StartupError() from None

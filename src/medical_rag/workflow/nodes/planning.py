@@ -92,7 +92,12 @@ def plan(inputs: dict, config: dict, context: ExecutionContext, transport: objec
         return {"plan": ""}
     if preset == "standard":
         return {"plan": _render(STANDARD_SECTIONS)}
-    value = _complete(transport, _provider(inputs, default_provider),
-                      inputs["question"], _topics(inputs.get("evidence") or []), context.memory_context)
+    try:
+        value = _complete(transport, _provider(inputs, default_provider),
+                          inputs["question"], _topics(inputs.get("evidence") or []), context.memory_context)
+    except Exception:
+        if config.get("fallback_on_error", False):
+            return {"plan": _render(list(STANDARD_SECTIONS))}
+        raise
     sections = _sections(value.get("sections"))
     return {"plan": _render(sections or list(STANDARD_SECTIONS))}

@@ -50,9 +50,10 @@ def parse_document(filename: str, data: bytes) -> ParsedDocument:
         raise ValueError("文件没有内容")
     if suffix == "pdf":
         try:
+            from .pdf_sections import extract_pdf_paragraphs
+
             reader = PdfReader(BytesIO(data))
-            paragraphs = [p for page_no, page in enumerate(reader.pages, start=1)
-                          for p in _paragraphs(page.extract_text() or "", page_no)]
+            paragraphs = extract_pdf_paragraphs(reader, _paragraphs)
         except Exception as exc:
             raise ValueError("无法解析 PDF 文件") from exc
         if not paragraphs:

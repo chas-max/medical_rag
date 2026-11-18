@@ -1,7 +1,6 @@
 """Settings the UI writes at runtime, applied immediately, kept apart from `.env`."""
 
 import json
-import logging
 import os
 import re
 import tempfile
@@ -9,12 +8,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from loguru import logger
 from pydantic import BaseModel, ValidationError
 
 from .config import Settings
 from .types import ApiError
-
-logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 MODEL_SECTION = "model"

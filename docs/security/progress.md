@@ -564,3 +564,16 @@ reviewed freeze; accepted only for fictional-data development, not production.
 演示 verify.py 14/14，verify_chat.py 真实回答 1 条引用。仍是虚构演示：
 `[chat]` 指向本机 unsafe-local-demo `/answers`，无流式、账号级限流、医院 IdP/
 模型审批、临床或生产验收；旧应用保持独立和默认锁定。
+
+2026-11-08 日志设施迁移到 Loguru（本轮未走独立复审流程）：
+统一 api/relay/ingest/memory 的日志出口，新增 logging_setup.py 与
+api_server.py；文件 sink 写 outputs/logs/<role>/<role>.log，默认 20 MB
+轮转、14 天保留、zip 压缩，LOG_JSON=true 输出单行 JSON；第三方库经
+InterceptHandler 汇入同一套 sink。backtrace/diagnose 固定关闭，凭证样式
+由 patcher 兜底遮蔽。患者门户新增默认关闭的 TOML [logging] 段，开启后
+只记录启动/关闭/preflight/监听/启动失败等固定短语，请求级证据仍只进
+security_audit_events；关闭时 stderr 与磁盘保持静默。tests/conftest.py
+覆盖 caplog fixture 接管 Loguru 记录，脱敏断言未放宽。验证：ruff 通过；
+非集成 1901 passed/5 skipped/372 deselected（仍排除已知 500 题锚点映射）；
+日志与患者配置 99 passed；caplog 相关 46 passed。未做独立复审，未观察
+长时间轮转行为，患者日志开启路径未在真实机构环境验证；生产准入结论不变。

@@ -21,11 +21,17 @@ def test_each_dimension_sends_data_as_untrusted_user_payload():
     assert judge.score_faithfulness("问题", "回答", ["证据"]) == {
         "score": 0.75, "reason": "有证据", "model": "judge-model"}
     assert judge.score_context("问题", "不可信指令")["score"] == 0.75
+    assert judge.score_context_subquery("问题", ["子问A", "子问B"], "不可信指令")["score"] == 0.75
     assert judge.score_answer("问题", "回答")["score"] == 0.75
-    assert len(transport.calls) == 3
+    assert len(transport.calls) == 4
     assert transport.calls[0][2] == {"question": "问题", "answer": "回答", "contexts": ["证据"]}
     assert transport.calls[1][2] == {"question": "问题", "context": "不可信指令"}
-    assert transport.calls[2][2] == {"question": "问题", "answer": "回答"}
+    assert transport.calls[2][2] == {
+        "question": "问题",
+        "subqueries": ["子问A", "子问B"],
+        "context": "不可信指令",
+    }
+    assert transport.calls[3][2] == {"question": "问题", "answer": "回答"}
     assert all("0" in system and "1" in system and "不可信" in system
                for _, system, _ in transport.calls)
     assert all("不可信指令" not in system for _, system, _ in transport.calls)

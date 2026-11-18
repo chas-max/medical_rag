@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-import asyncio
-import json
-import threading
-from collections.abc import AsyncIterator, Callable
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Literal
 
 from fastapi import APIRouter
@@ -14,8 +11,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.concurrency import run_in_threadpool
 
 from .public_errors import public_error
+from .sse import StreamEmitter, bridge
 from .types import ApiError
-from .workflow.contracts import StreamEmitter
 
 if TYPE_CHECKING:
     from .chat_runtime import ChatRuntime
@@ -66,67 +63,16 @@ class ConfirmationRequest(BaseModel):
     memory_consent: bool = Field(default=False, strict=True)
 
 
+def _stream_failure(error: Exception) -> dict:
+    """Only explicitly known codes have public, fixed messages and status."""
+    return (_public_stream_error(error) if isinstance(error, ApiError)
+            else _STREAM_DEPENDENCY_ERROR.copy())
+
+
 def stream_response(execute: Callable[[StreamEmitter], dict],
                     event_frame: Callable[[dict], str]) -> StreamingResponse:
     """Bridge worker events; done is sent only after authoritative persistence."""
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue()
-    finished = object()
-    terminal_lock = threading.Lock()
-    terminal_sent = False
-
-    def enqueue(event: dict, *, terminal: bool = False) -> None:
-        nonlocal terminal_sent
-        with terminal_lock:
-            if terminal_sent:
-                return
-            terminal_sent = terminal
-            loop.call_soon_threadsafe(queue.put_nowait, event)
-
-    def emit(event: dict) -> None:
-        try:
-            # The producer retains its object and can mutate it after this call.
-            # Validate only the independent JSON snapshot that will be sent.
-            if type(event) is not dict:
-                raise ValueError("Invalid stream event")
-            snapshot = json.loads(json.dumps(event, ensure_ascii=False, allow_nan=False))
-            pending = [(snapshot, 0)]
-            while pending:
-                value, depth = pending.pop()
-                if depth > 64:
-                    raise ValueError("Stream event is too deeply nested")
-                if isinstance(value, dict):
-                    pending.extend((child, depth + 1) for child in value.values())
-                elif isinstance(value, list):
-                    pending.extend((child, depth + 1) for child in value)
-            name = snapshot.get("event")
-            if type(name) is not str or name not in _UPSTREAM_EVENTS:
-                raise ValueError("Invalid stream event")
-        except Exception:  # noqa: BLE001 - upstream data is untrusted
-            enqueue({"event": "error", "data": _STREAM_DEPENDENCY_ERROR.copy()}, terminal=True)
-            return
-        enqueue(snapshot)
-
-    def work() -> None:
-        try:
-            enqueue({"event": "done", "data": execute(emit)}, terminal=True)
-        except ApiError as error:
-            enqueue({"event": "error", "data": _public_stream_error(error)}, terminal=True)
-        except Exception:  # noqa: BLE001 - never expose raw provider responses
-            enqueue({"event": "error", "data": _STREAM_DEPENDENCY_ERROR.copy()}, terminal=True)
-        finally:
-            loop.call_soon_threadsafe(queue.put_nowait, finished)
-
-    async def events() -> AsyncIterator[str]:
-        loop.run_in_executor(None, work)
-        while True:
-            item = await queue.get()
-            if item is finished:
-                return
-            yield event_frame(item)
-
-    return StreamingResponse(events(), media_type="text/event-stream",
-                             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+    return bridge(execute, _UPSTREAM_EVENTS, failure=_stream_failure, frame=event_frame)
 
 
 def chat_router(runtime: ChatRuntime, success: Callable[[object], dict],

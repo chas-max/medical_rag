@@ -202,6 +202,75 @@ def test_reference_must_appear_in_the_question_and_in_its_source():
         "它是什么引起的？", snapshot).status == "clarification"
 
 
+def test_reference_role_pins_the_entity_to_that_speaker():
+    snapshot = DialogueSnapshot(recent=(
+        RecentTurn(turn_id="1", user="糖尿病呢？", assistant="合成回答提到骨质疏松"),))
+
+    user_role = SequenceTransport([reply(
+        "糖尿病", "1", "etiology", "病因", "糖尿病病因？",
+        references=[{"expression": "它", "entity": "糖尿病", "source_turn_id": "1",
+                     "source_role": "user"}])])
+    assert QuestionResolver(user_role).resolve("它是什么引起的？", snapshot).status == "resolved"
+
+    # 实体出自助手文本：topic 与 reference 都必须按 assistant 标注。
+    assistant_role = SequenceTransport([reply(
+        "骨质疏松", "1", "etiology", "病因", "骨质疏松病因？", role="assistant",
+        references=[{"expression": "它", "entity": "骨质疏松", "source_turn_id": "1",
+                     "source_role": "assistant"}])])
+    assert QuestionResolver(assistant_role).resolve(
+        "它是什么引起的？", snapshot).status == "resolved"
+
+
+def test_reference_role_claims_are_validated_like_topics():
+    snapshot = DialogueSnapshot(recent=(
+        RecentTurn(turn_id="1", user="糖尿病呢？", assistant="合成回答提到骨质疏松"),))
+
+    # topic 合法（assistant 提到骨质疏松），失败必须归因于 reference：
+    # 实体只在助手文本里，却声称 user 说过——与 topic 的角色错配同样拒绝。
+    wrong_role = SequenceTransport([reply(
+        "骨质疏松", "1", "etiology", "病因", "骨质疏松病因？", role="assistant",
+        references=[{"expression": "它", "entity": "骨质疏松", "source_turn_id": "1",
+                     "source_role": "user"}])])
+    assert QuestionResolver(wrong_role).resolve(
+        "它是什么引起的？", snapshot).status == "clarification"
+
+    # 声称 assistant 说过糖尿病，但助手文本里没有：钉死检查同样拒绝。
+    wrong_speaker = SequenceTransport([reply(
+        "糖尿病", "1", "etiology", "病因", "糖尿病病因？",
+        references=[{"expression": "它", "entity": "糖尿病", "source_turn_id": "1",
+                     "source_role": "assistant"}])])
+    assert QuestionResolver(wrong_speaker).resolve(
+        "它是什么引起的？", snapshot).status == "clarification"
+
+    # 声明了快照里不存在的 (turn_id, role) 对，等同于伪造来源。
+    unknown_pair = SequenceTransport([reply(
+        "糖尿病", "1", "etiology", "病因", "糖尿病病因？",
+        references=[{"expression": "它", "entity": "糖尿病", "source_turn_id": "9",
+                     "source_role": "user"}])])
+    assert QuestionResolver(unknown_pair).resolve(
+        "它是什么引起的？", snapshot).status == "clarification"
+
+
+def test_model_emitting_reference_role_still_resolves():
+    """回归：qwen 思考模式曾把 source_role 写进 references，旧契约整条拒绝。"""
+    transport = SequenceTransport([reply(
+        "糖尿病", "2", "etiology", "由什么引起", "糖尿病是由什么引起的？", "follow_up",
+        references=[{"expression": "它", "entity": "糖尿病", "source_turn_id": "2",
+                     "source_role": "user"}])])
+    state = ConversationState(
+        revision=2, through_turn_id="2",
+        active_topic=Topic(name="糖尿病", type="disease", source_turn_id="2",
+                           source_role="user"))
+    snapshot = DialogueSnapshot(
+        state=state,
+        recent=(RecentTurn(turn_id="2", user="糖尿病呢？", assistant="合成回答"),),
+        context_version=2)
+    result = QuestionResolver(transport).resolve("那它是由什么引起的？", snapshot)
+    assert result.status == "resolved"
+    assert result.resolved_question == "糖尿病是由什么引起的？"
+    assert result.references[0].source_role == "user"
+
+
 def test_changed_numeric_constraint_is_rejected():
     transport = SequenceTransport([reply("高血压", "current", "treatment", "治疗",
                                          "高血压每天服用5mg如何治疗？")])
@@ -350,3 +419,60 @@ def test_failed_clarification_keeps_an_earlier_pending_item():
     advanced = advance_state(state, fallback, turn_id="3")
     assert advanced.pending_clarification == pending
     assert advanced.revision == 3
+
+
+
+def test_resolver_parses_fenced_json_and_folded_topic():
+    from medical_rag.question_resolver import is_self_contained_question
+
+    assert is_self_contained_question("它是什么引起的？", DialogueSnapshot()) is False
+    assert is_self_contained_question("高血压和糖尿病，它是什么引起的？", DialogueSnapshot()) is False
+    assert is_self_contained_question("CT和MRI哪个好？", DialogueSnapshot()) is False
+    assert is_self_contained_question("饮食和运动哪个更重要？", DialogueSnapshot()) is False
+    assert is_self_contained_question("糖尿病", DialogueSnapshot()) is False
+    assert is_self_contained_question(
+        "临床上诊断2型糖尿病（T2DM）的主要血糖阈值标准与糖化血红蛋白切点有哪些具体要求？",
+        DialogueSnapshot(),
+    ) is True
+
+    fenced = (
+        "```json\n"
+        + json.dumps(
+            reply(
+                "2 型糖尿病",
+                "current",
+                "medication_usage",
+                "如何使用",
+                "2型糖尿病患者如何使用胰岛素治疗？",
+            ),
+            ensure_ascii=False,
+        )
+        + "\n```"
+    )
+    class RawTransport:
+        def complete_with_timeout(self, provider, system, user, timeout):
+            return fenced
+
+    resolved = QuestionResolver(RawTransport()).resolve(
+        "2型糖尿病（患者）如何使用胰岛素治疗？", DialogueSnapshot()
+    )
+    assert resolved.status == "resolved"
+    assert resolved.topic is not None
+    assert resolved.topic.name == "2 型糖尿病"
+
+
+def test_resolver_passes_json_mode_when_supported():
+    calls = []
+
+    class JsonAwareTransport:
+        def complete_with_timeout(self, provider, system, user, timeout,
+                                  *, json_mode=False, max_tokens=None):
+            calls.append((provider, timeout, json_mode, max_tokens))
+            return json.dumps(
+                reply("高血压", "current", "etiology", "由什么引起", "高血压由什么引起？"),
+                ensure_ascii=False,
+            )
+
+    resolved = QuestionResolver(JsonAwareTransport()).resolve("高血压由什么引起？", DialogueSnapshot())
+    assert resolved.status == "resolved"
+    assert calls == [("qwen", RESOLUTION_TIMEOUT_SECONDS, True, 1024)]

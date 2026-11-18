@@ -101,3 +101,28 @@ def test_gate_still_defers_to_web_search_when_local_reranking_is_down():
     assert result["abstained"] is False
     assert result["evidence"] == []
     assert result["degraded"] is True
+
+
+
+def test_gate_prunes_steep_tail_cliff_while_respecting_min_keep():
+    from medical_rag.workflow.contracts import ExecutionContext
+    from medical_rag.workflow.nodes.evidence import gate
+
+    items = [item(s, SCORE_RERANK, f"t{i}") for i, s in enumerate((0.95, 0.90, 0.85, 0.52, 0.51))]
+    trimmed = gate({"evidence": items}, {"relative_floor_ratio": 0.58, "min_keep": 3},
+                   ExecutionContext("run", "medical-answer", {}), 0.5)
+    assert [entry.score for entry in trimmed["evidence"]] == [0.95, 0.90, 0.85]
+
+    sparse = [item(0.80, SCORE_RERANK, "a"), item(0.51, SCORE_RERANK, "b")]
+    kept_min = gate({"evidence": sparse}, {"relative_floor_ratio": 0.90, "min_keep": 3},
+                    ExecutionContext("run", "medical-answer", {}), 0.5)
+    assert [entry.score for entry in kept_min["evidence"]] == [0.80, 0.51]
+
+    low_tail = [item(0.82, SCORE_RERANK, "top"), item(0.54, SCORE_RERANK, "ok"), item(0.20, SCORE_RERANK, "weak")]
+    hard_gated = gate(
+        {"evidence": low_tail},
+        {"relative_floor_ratio": 0.62, "hard_floor": 0.25, "min_keep": 1},
+        ExecutionContext("run", "medical-answer", {}),
+        0.5,
+    )
+    assert [entry.score for entry in hard_gated["evidence"]] == [0.82, 0.54]

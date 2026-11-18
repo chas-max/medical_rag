@@ -338,6 +338,36 @@ const chatReply = (title: string, content: string) => ({
   answer: answerRow(content),
   abstained: false,
 });
+const streamingIdentity = {
+  ...identity,
+  permissions: { ...identity.permissions, chat_stream: true },
+};
+/** A stream the test drives frame by frame, so provisional state is observable. */
+function controlledStream() {
+  let push!: ReadableStreamDefaultController<Uint8Array>;
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      push = controller;
+    },
+  });
+  const frame = (text: string) => new TextEncoder().encode(text);
+  return {
+    response: new Response(body, {
+      headers: { "Content-Type": "text/event-stream" },
+    }),
+    claim: (text: string) =>
+      push.enqueue(frame(`event: claim\ndata: ${JSON.stringify({ text })}\n\n`)),
+    done: (value: unknown) =>
+      push.enqueue(frame(`event: done\ndata: ${JSON.stringify(value)}\n\n`)),
+    fail: (code: string, status: number) =>
+      push.enqueue(
+        frame(
+          `event: error\ndata: ${JSON.stringify({ code, status, message: "x" })}\n\n`,
+        ),
+      ),
+    close: () => push.close(),
+  };
+}
 it("selects a conversation, asks through the answer route and shows citations", async () => {
   const original = handler;
   let asked = false;
@@ -1134,4 +1164,104 @@ it("keeps the clarification kind after reloading the turn list", async () => {
 
   expect(await screen.findByText("请补充具体讨论对象。")).toBeInTheDocument();
   expect(screen.queryByText("证据不足")).not.toBeInTheDocument();
+});
+it("shows provisional claims, then the stored answer with mapped citations", async () => {
+  const original = handler;
+  const stream = controlledStream();
+  let asked = false;
+  handler = (url, init) => {
+    if (url === "/auth/session")
+      return { ...streamingIdentity, csrf_token: "csrf-memory" };
+    if (url === "/me") return streamingIdentity;
+    if (init.method === "POST" && url === "/chat/stream") {
+      asked = true;
+      return stream.response;
+    }
+    if (asked && url.includes("turns"))
+      return {
+        items: [
+          {
+            id: item.id,
+            content: "我的问题",
+            role: "user",
+            citations: [],
+            created_at: item.created_at,
+          },
+          answerRow("回答[c1]"),
+        ],
+        limit: 20,
+        offset: 0,
+      };
+    return original(url, init);
+  };
+  render(<PatientApp />);
+  await open("会话记录");
+  await open("私密标题");
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "我的问题" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await waitFor(() =>
+    expect(fetch).toHaveBeenCalledWith(
+      "/chat/stream",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ conversation_id: item.id, question: "我的问题" }),
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "text/event-stream",
+          "X-CSRF-Token": "csrf-memory",
+        },
+      }),
+    ),
+  );
+  await act(async () => {
+    stream.claim("结论一。");
+  });
+  expect(await screen.findByText("结论一。")).toBeInTheDocument();
+
+  await act(async () => {
+    stream.done(chatReply("私密标题", "回答[c1]"));
+    stream.close();
+  });
+
+  // The provisional text is replaced by the stored turn, whose block id renders
+  // as source number 1.
+  expect(await screen.findByText("回答[1]")).toBeInTheDocument();
+  expect(screen.queryByText("结论一。")).not.toBeInTheDocument();
+  expect(screen.getByText(/指南\.pdf/)).toBeInTheDocument();
+});
+it("clears provisional claims when the stream reports a revoked authorization", async () => {
+  const original = handler;
+  const stream = controlledStream();
+  handler = (url, init) => {
+    if (url === "/auth/session")
+      return { ...streamingIdentity, csrf_token: "csrf-memory" };
+    if (url === "/me") return streamingIdentity;
+    if (init.method === "POST" && url === "/chat/stream") return stream.response;
+    return original(url, init);
+  };
+  render(<PatientApp />);
+  await open("会话记录");
+  await open("私密标题");
+  fireEvent.change(screen.getByLabelText("输入消息"), {
+    target: { value: "我的问题" },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "发送" }));
+
+  await act(async () => {
+    stream.claim("结论一。");
+  });
+  expect(await screen.findByText("结论一。")).toBeInTheDocument();
+
+  // The reader cancels the body on a terminal error, so the test must not close it.
+  await act(async () => {
+    stream.fail("PATIENT_ACCESS_DENIED", 403);
+  });
+
+  expect(
+    await screen.findByText("会话已更新或授权已撤回，本次回答未保存。"),
+  ).toBeInTheDocument();
+  expect(screen.queryByText("结论一。")).not.toBeInTheDocument();
 });

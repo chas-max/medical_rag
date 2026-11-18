@@ -1,7 +1,6 @@
 """FastAPI entry point and consistent public response envelope."""
 
 import json
-import logging
 import threading
 from ipaddress import ip_address
 from pathlib import Path
@@ -9,6 +8,7 @@ from typing import Annotated
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, File, Form, Query, Request, UploadFile
+from loguru import logger
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
@@ -34,13 +34,16 @@ from .memory import MemoryStore
 from .memory_api import memory_router
 from .public_errors import public_error, public_http_error
 from .settings_store import ModelSettings, SettingsStore
+from .sse import StreamEmitter, bridge
 from .types import ApiError
-
-logger = logging.getLogger(__name__)
 
 # The bounded snapshot is already small by construction; this is the hard stop for
 # any caller that sends a hand-built body instead.
 MAX_DIALOGUE_CONTEXT_BYTES = 64 * 1024
+
+# Only these may be produced by a workflow node. ``done`` and ``error`` belong to
+# the transport, so an upstream node can never forge a terminal frame.
+ANSWER_STREAM_EVENTS = frozenset({"status", "claim", "analysis"})
 
 
 class _RejectWebSockets:
@@ -132,6 +135,16 @@ def _failure(code: str, message: str, status: int) -> JSONResponse:
 def _event_frame(event: dict) -> str:
     """Encode one stream event as a Server-Sent Events frame."""
     return f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+
+
+def answer_stream_failure(error: Exception) -> dict:
+    """Map a failed streaming run to a catalogue error, never to upstream text.
+
+    Only the exception code is used as a lookup key; its message and claimed
+    status are discarded, matching the non-streaming error handler.
+    """
+    safe = public_error(error.code if isinstance(error, ApiError) else None)
+    return {**safe.data(), "status": safe.status}
 
 
 def create_app(service: object | None = None, frontend_dist: Path | None = None,
@@ -355,8 +368,12 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
             raise ApiError("CHUNK_NOT_FOUND", "未找到该资料块", 404)
         return _success(found)
 
-    @app.post("/answers")
-    def answer(payload: AnswerRequest):
+    def answer_options(payload: AnswerRequest) -> dict[str, object]:
+        """Validate the request and resolve memory/dialogue before any work starts.
+
+        Shared by the plain and the streaming handler so a combination one route
+        refuses can never be accepted by the other.
+        """
         if payload.dialogue_context is not None and payload.memory:
             raise ApiError("INVALID_QUERY", "上下文参数组合无效", 422)
         run = (DialogueRun(payload.dialogue_context or DialogueSnapshot())
@@ -375,13 +392,46 @@ def create_app(service: object | None = None, frontend_dist: Path | None = None,
             _, context = memory_snapshot(payload.question)
             if context:
                 options["memory_context"] = context
-        answer = _service().answer(payload.question, payload.provider,
+        return options
+
+    def with_resolution(answer: dict, payload: AnswerRequest,
+                        options: dict[str, object]) -> dict:
+        """Attach this run's verified resolution for the internal backend only."""
+        run = options.get("dialogue")
+        if (payload.dialogue_context is not None and run is not None
+                and getattr(run, "resolution", None) is not None):
+            return {**answer, "dialogue_resolution": run.resolution.model_dump(mode="json")}
+        return answer
+
+    @app.post("/answers")
+    def answer(payload: AnswerRequest):
+        options = answer_options(payload)
+        result = _service().answer(payload.question, payload.provider,
                                    payload.top_k or settings.top_k, **options)
-        if payload.dialogue_context is not None and run is not None and run.resolution is not None:
-            # Only the internal patient backend reads this field; the public patient
-            # response is built from an explicit allowlist.
-            answer = {**answer, "dialogue_resolution": run.resolution.model_dump(mode="json")}
-        return _success(answer)
+        return _success(with_resolution(result, payload, options))
+
+    @app.post("/answers/stream")
+    async def answer_stream(payload: AnswerRequest):
+        """Same run and validation as ``/answers``, publishing intermediate events.
+
+        Request errors are raised before the response starts, so they keep the
+        normal JSON envelope and status code; only in-run failures become an
+        ``error`` frame, because the status line is already sent by then.
+
+        This handler must stay ``async``: the bridge registers callbacks on the
+        running event loop, which a sync handler (executed in a worker thread)
+        would not have.
+        """
+        options = await run_in_threadpool(answer_options, payload)
+
+        def execute(emit: StreamEmitter) -> dict:
+            return with_resolution(
+                _service().answer(payload.question, payload.provider,
+                                  payload.top_k or settings.top_k, emit=emit, **options),
+                payload, options)
+
+        return bridge(execute, ANSWER_STREAM_EVENTS, failure=answer_stream_failure,
+                      frame=_event_frame)
 
 
     @app.get("/runs/{run_id}")

@@ -2,17 +2,17 @@
 
 import argparse
 import asyncio
-import logging
 import sqlite3
+
+from loguru import logger
 
 from .config import Settings
 from .jobs import DocumentJobStore, DocumentProcessor, IngestLock
+from .logging_setup import configure_logging, flush_logging
 from .memory import MemoryStore
 from .memory_worker import MemoryWorker
 from .messaging import AMQPTransport, OutboxRelay, consume_message
 from .types import ApiError
-
-logger = logging.getLogger(__name__)
 
 
 def _require_demo_access(settings: Settings) -> None:
@@ -52,13 +52,13 @@ async def run_role(role: str, settings: Settings | None = None) -> None:
             store.heartbeat(role, broker)
         except (ApiError, OSError, sqlite3.Error):
             # Optional health telemetry must neither stop work nor kill its loop.
-            logger.warning("%s worker heartbeat unavailable; retrying later", role)
+            logger.warning(f"{role} worker heartbeat unavailable; retrying later")
 
     async def close_transport() -> None:
         try:
             await transport.close()
         except Exception:  # noqa: BLE001 - adapter close failure must not mask cancellation or prevent reconnect
-            logger.warning("%s worker transport cleanup unavailable", role)
+            logger.warning(f"{role} worker transport cleanup unavailable")
 
     async def heartbeat():
         while True:
@@ -104,7 +104,7 @@ async def run_role(role: str, settings: Settings | None = None) -> None:
                 raise
             except Exception:  # noqa: BLE001 - reconnect with sanitized operational logging
                 state["broker"] = "disconnected"
-                logger.warning("%s worker connection unavailable; retrying", role)
+                logger.warning(f"{role} worker connection unavailable; retrying")
                 await close_transport()
                 record_heartbeat("disconnected")
                 await asyncio.sleep(1)
@@ -117,9 +117,9 @@ async def run_role(role: str, settings: Settings | None = None) -> None:
 
 def main() -> None:
     role = parser().parse_args().role
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     settings = Settings()
     _require_demo_access(settings)
+    configure_logging(role, settings=settings)
     try:
         if role == "ingest":
             # asyncio.run waits for its threadpool on cancellation; OS lock stays held.
@@ -129,7 +129,9 @@ def main() -> None:
         else:
             asyncio.run(run_role(role, settings))
     except KeyboardInterrupt:
-        pass
+        logger.info(f"{role} worker stopped")
+    finally:
+        flush_logging()
 
 
 if __name__ == "__main__":

@@ -11,9 +11,10 @@ from dataclasses import dataclass
 from decimal import Decimal, DecimalException, localcontext
 
 _DIGITS = dict(zip("零〇一二两三四五六七八九", "001223456789", strict=True))
-_CHINESE = "零〇一二两三四五六七八九十百千万亿点半"
-_ARABIC = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?[百千万]?"
-_NUMBER = rf"[+-]?(?:{_ARABIC}|[{_CHINESE}]+)"
+_CHINESE = "零〇一二两三四五六七八九十百千万亿半"
+_CHINESE_NUM = rf"[{_CHINESE}]+(?:点[{_CHINESE}]+)?"
+_ARABIC = r"(?:\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)(?:e[+-]?\d+)?(?:[百万]|千(?!克|卡|帕|焦|米|瓦|伏|安))?"
+_NUMBER = rf"[+-]?(?:{_ARABIC}|{_CHINESE_NUM})"
 # Representation/resource limits, not medical plausibility thresholds.
 _MAX_NUMBER_CHARS = 256
 _MAX_ABS_EXPONENT = 1000
@@ -32,6 +33,7 @@ _UNITS = {
     "分钟": "minute", "min": "minute", "秒钟": "second", "秒": "second",
     "岁": "age", "片": "tablet", "粒": "capsule", "滴": "drop",
     "国际单位": "iu", "iu": "iu", "u": "u",
+    "千卡": "kcal", "kcal": "kcal", "大卡": "kcal",
 }
 _TIME_UNITS = {"day", "week", "month", "year", "hour", "minute", "second"}
 _UNIT = "(?:" + "|".join(
@@ -39,11 +41,24 @@ _UNIT = "(?:" + "|".join(
     for unit in sorted(_UNITS, key=len, reverse=True)) + r")(?![a-zμ])"
 _DENOMINATORS = {
     **{key: value for key, value in _UNITS.items()
-       if value in _TIME_UNITS | {"kg", "times"}},
+       if value in _TIME_UNITS | {"kg", "l", "ml", "g", "mg", "times"}},
     "d": "day",
+    "m2": "m2",
+    "㎡": "m2",
+    "平方米": "m2",
+    "米2": "m2",
+    "dl": "dl",
+    "分": "minute",
 }
 _DENOMINATOR = "(?:" + "|".join(
     re.escape(unit) for unit in sorted(_DENOMINATORS, key=len, reverse=True)) + r")(?![a-zμ])"
+_SCALED_DENOMINATOR = (
+    r"(?:(?:100|1000)\s*(?:kg|dl|ml|g|l)|(?:24|12)\s*(?:小时|h)|1\.73\s*(?:平方米|米2|m2|㎡))(?![a-zμ])"
+)
+_UNPAREN_DENOM = rf"(?:{_SCALED_DENOMINATOR}|{_DENOMINATOR})"
+# 支持医学文献常见的括号复合分母（如 /(kg·d)、/(kg.次)），按分母拆开校验，避免整段证据被误判失真。
+_PAREN_DENOMINATOR = rf"\(\s*(?:\d+(?:\.\d+)?\s*)?{_DENOMINATOR}(?:\s*[·.⋅*,]\s*(?:\d+(?:\.\d+)?\s*)?{_DENOMINATOR})*\s*\)"
+_DENOM_GROUP = rf"(?:\s*/\s*(?:{_UNPAREN_DENOM}|{_PAREN_DENOMINATOR}))*"
 _COMPARISONS = {
     "不低于": "ge", "不少于": "ge", "不小于": "ge", "至少": "ge",
     "大于等于": "ge", "大于或等于": "ge", ">=": "ge", "≥": "ge",
@@ -61,21 +76,30 @@ for _negation in ("不得", "不能", "不可", "不应", "不允许", "未"):
 _PREFIX = "|".join(re.escape(word) for word in sorted(_COMPARISONS, key=len, reverse=True))
 _SUFFIXES = {"及以上": "ge", "以上": "ge", "及以下": "le", "以下": "le", "以内": "le"}
 _SEPARATOR = r"(?:至|到|[-~～–—/])"
+_UNIT_SEPARATOR = rf"(?:至|到|[-~～–—]|/(?!\s*{_SCALED_DENOMINATOR}))"
 _QUANTITY = re.compile(
     rf"(?<![\d.+\-/{_CHINESE}])(?:(?P<prefix>{_PREFIX})\s*)?"
     rf"(?P<first>{_NUMBER})\s*(?:个\s*)?"
-    rf"(?:(?P<left_unit>{_UNIT})(?P<left_denominators>(?:\s*/\s*{_DENOMINATOR})*)"
-    rf"\s*(?P<unit_separator>{_SEPARATOR})\s*"
+    rf"(?:(?P<left_unit>{_UNIT})(?P<left_denominators>{_DENOM_GROUP})"
+    rf"\s*(?P<unit_separator>{_UNIT_SEPARATOR})\s*"
     rf"(?P<unit_second>{_NUMBER})\s*(?:个\s*)?|"
     rf"(?P<separator>{_SEPARATOR})\s*(?P<second>{_NUMBER})\s*(?:个\s*)?)?"
-    rf"(?P<unit>{_UNIT})(?P<denominators>(?:\s*/\s*{_DENOMINATOR})*)\s*"
+    rf"(?P<unit>{_UNIT})(?P<denominators>{_DENOM_GROUP})\s*"
     r"(?P<half>半)?\s*(?P<suffix>及以上|及以下|以上|以下|以内)?"
 )
 _CADENCE = re.compile(
-    rf"每\s*(?P<count>{_NUMBER})?\s*(?:个\s*)?"
+    rf"每\s*(?:(?P<count>{_NUMBER})(?:\s*[-~～–—至到]\s*(?P<count_end>{_NUMBER}))?\s*)?(?:个\s*)?"
     r"(?P<unit>小时|分钟|星期|秒钟|日|天|周|月|年|次|时|秒)"
 )
 _CLAUSE_END = re.compile(r"[。！？!?；;\n]")
+_BROKEN_CJK_UNIT = re.compile(
+    r"(?:(?<=[\d\s/])千\s+克|"
+    r"毫\s+克|微\s+克|毫\s+升|分\s+钟|小\s+时|星\s+期|秒\s+钟|分\s+升|"
+    r"平\s*方\s*米|毫\s*米\s*汞\s*柱|毫\s*摩\s*尔|国\s*际\s*单\s*位)"
+)
+_TRAILING_CMP = {"<=": "ge", "≤": "ge", "<": "gt", ">=": "le", "≥": "le", ">": "lt"}
+# 年龄与生理解剖/检验阈值属于状态或控制目标，不从同句前置“每……监测/随访”继承给药频次。
+_NON_CADENCE_UNITS = {"age", "kg/m2", "mmhg", "kpa", "mmol/l", "mg/dl"}
 
 
 @dataclass(frozen=True)
@@ -104,6 +128,121 @@ def _integer(text: str) -> int:
             total += (current or 1) * {"十": 10, "百": 100, "千": 1000}[character]
             current = 0
     return total + current
+
+
+def _is_compound_slash_separator(after_text: str, current_unit: str) -> bool:
+    """Distinguish compound drug strengths (50mg/氢氯噻嗪12.5mg, 50mg/12.5mg) from denominators."""
+    slash = re.match(r"^\s*/\s*(.+)$", after_text, re.DOTALL)
+    if not slash:
+        return False
+    rhs = slash.group(1)
+    if re.match(rf"^[\u4e00-\u9fff]{{1,14}}\s*(?:{_NUMBER})\s*(?:{_UNIT})", rhs):
+        if not re.match(rf"^(?:{_DENOMINATOR}|{_UNIT})", rhs):
+            return True
+    paired = re.match(rf"^(?:{_NUMBER})\s*(?P<u2>{_UNIT})", rhs)
+    if paired:
+        u2_key = re.sub(r"\s+", "", paired.group("u2"))
+        if _UNITS.get(u2_key) == current_unit:
+            return True
+    return False
+
+
+_COMPOUND_MASS_UNITS = {"mg", "g", "μg", "ug", "mcg", "iu", "u"}
+
+
+def _append_compound_pair_facts(text: str, facts: list[NumericFact]) -> None:
+    """Extract pair facts and unwind mass pairs (e.g. 100/12.5 mg -> 100 mg + 12.5 mg)."""
+    for existing in list(facts):
+        if existing.relation == "pair" and len(existing.values) == 2 and existing.unit in _COMPOUND_MASS_UNITS:
+            for val in existing.values:
+                facts.append(NumericFact((val,), existing.unit, "eq", existing.cadence))
+    pattern = re.compile(
+        rf"(?<![\d.+\-/])(?P<v1>{_ARABIC})\s*(?P<u1>{_UNIT})"
+        rf"(?!\s*[·⋅^]|\s*/\s*(?:{_UNPAREN_DENOM}))\s*/\s*"
+        rf"(?:[\u4e00-\u9fff]{{1,14}}\s*)?(?P<v2>{_ARABIC})\s*(?P<u2>{_UNIT})"
+    )
+    for match in pattern.finditer(text):
+        u1 = _UNITS.get(re.sub(r"\s+", "", match.group("u1")))
+        u2 = _UNITS.get(re.sub(r"\s+", "", match.group("u2")))
+        if not u1 or u1 != u2:
+            continue
+        try:
+            facts.append(NumericFact((_decimal(match.group("v1")), _decimal(match.group("v2"))), u1, "pair"))
+        except (DecimalException, ValueError):
+            continue
+
+
+_HEADER_HINT = re.compile(r"(?:半衰期|剂量|每份质量|质量|含量|体重|身高|年龄|血压|血糖|服药|次数|表\s*\d|续表)")
+_HEADER_UNIT_PAREN = re.compile(rf"\(\s*(?P<u>{_UNIT})(?P<d>{_DENOM_GROUP})\s*\)")
+_START_FULL_HEADER = re.compile(r"起始[^)）]{0,8}[~～\-]\s*足量")
+_DAILY_COUNT_HEADER = re.compile(r"每\s*[天日]\s*(?:服药\s*)?次数")
+_TABLE_CELL_NUMBER = re.compile(
+    r"(?<![\d.\[/\-a-z])(?P<a>\d+(?:\.\d+)?)(?:\s*(?P<sep>[~～\-–—/])\s*(?P<b>\d+(?:\.\d+)?))?(?![\d.\]/\-a-z%])"
+)
+_INLINE_UNIT_FOLLOW = re.compile(rf"^\s*(?:个\s*)?(?:{_UNIT}|[年月日周岁次片粒滴卷期页条项位组例])")
+_PROSE_END = re.compile(r"[。！？!?]\s*$")
+
+
+def _append_table_header_facts(text: str, facts: list[NumericFact]) -> None:
+    """Bind parenthesized table-column header units to bare numbers in subsequent rows."""
+    active_units: list[tuple[str, tuple[tuple[Decimal, str], ...], bool]] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        found_headers: list[tuple[str, tuple[tuple[Decimal, str], ...], bool]] = []
+        for match in _HEADER_UNIT_PAREN.finditer(stripped):
+            if match.start() > 0 and stripped[match.start() - 1].isdigit():
+                continue
+            try:
+                unit, bases = _unit_parts(match.group("u"), match.group("d"))
+                prefix_window = stripped[max(0, match.start() - 24):match.start()]
+                allow_endpoints = bool(_START_FULL_HEADER.search(prefix_window))
+                entry = (unit, bases, allow_endpoints)
+                if entry not in found_headers:
+                    found_headers.append(entry)
+            except (DecimalException, ValueError, KeyError):
+                continue
+        if _DAILY_COUNT_HEADER.search(stripped):
+            count_entry = ("times", ((Decimal(1), "day"),), False)
+            if count_entry not in found_headers:
+                found_headers.append(count_entry)
+        if found_headers and (_HEADER_HINT.search(stripped) or len(stripped.split()) >= 2):
+            active_units = found_headers
+            continue
+        if not active_units:
+            continue
+        if _PROSE_END.search(stripped) and len(stripped) > 40:
+            active_units = []
+            continue
+        if re.search(r"vol\.?\s*\d|第\s*\d+\s*[卷期页]", stripped):
+            continue
+        for match in _TABLE_CELL_NUMBER.finditer(stripped):
+            if _INLINE_UNIT_FOLLOW.match(stripped[match.end():]):
+                continue
+            sep = match.group("sep")
+            try:
+                v_a = _decimal(match.group("a"))
+                if match.group("b") is not None:
+                    v_b = _decimal(match.group("b"))
+                    if sep != "/" and v_a > v_b:
+                        continue
+                    values = (v_a, v_b)
+                    relation = "pair" if sep == "/" else "range"
+                else:
+                    values = (v_a,)
+                    relation = "eq"
+            except (DecimalException, ValueError):
+                continue
+            for h_unit, h_bases, allow_endpoints in active_units:
+                cadence = tuple(sorted(set(h_bases)))
+                facts.append(NumericFact(values, h_unit, relation, cadence))
+                if relation == "range" and allow_endpoints and len(values) == 2:
+                    facts.append(NumericFact((values[0],), h_unit, "eq", cadence))
+                    facts.append(NumericFact((values[1],), h_unit, "eq", cadence))
+                elif relation == "pair" and h_unit in _TIME_UNITS and len(values) == 2:
+                    facts.append(NumericFact((values[0],), h_unit, "eq", cadence))
+                    facts.append(NumericFact((values[1],), h_unit, "eq", cadence))
 
 
 def _decimal(text: str) -> Decimal:
@@ -135,39 +274,84 @@ def _unit_parts(raw: str, denominators: str) -> tuple[str, tuple[tuple[Decimal, 
     """Keep every denominator, separating time/per-dose bases from the dimension."""
     unit = _UNITS[re.sub(r"\s+", "", raw)]
     bases = []
-    for raw_denominator in re.findall(rf"/\s*({_DENOMINATOR})", denominators):
-        denominator = _DENOMINATORS[raw_denominator]
+    for raw_match in re.finditer(rf"(?:(?P<scale>\d+(?:\.\d+)?)\s*)?(?P<denom>{_DENOMINATOR})", denominators):
+        denominator = _DENOMINATORS[raw_match.group("denom")]
+        scale_raw = raw_match.group("scale")
+        scale = _decimal(scale_raw) if scale_raw else Decimal(1)
         if denominator in _TIME_UNITS | {"times"}:
-            bases.append((Decimal(1), denominator))
+            bases.append((scale, denominator))
+        elif scale_raw and scale != Decimal(1):
+            unit += f"/{scale}{denominator}"
         else:
             unit += "/" + denominator
     return unit, tuple(sorted(set(bases)))
 
 
-def numeric_facts(text: str) -> tuple[NumericFact, ...] | None:
-    """Extract supported quantities; return None for malformed recognized facts.
+def _clause_cadences(
+    text: str,
+    start: int,
+    end: int,
+    cadences: list[re.Match[str]],
+) -> list[tuple[Decimal, str]]:
+    """Collect active cadence markers in a clause, resetting prior comma cadences on new cadence."""
+    breaks = [start] + [start + m.end() for m in re.finditer(r"(?<!\d),(?!\d)", text[start:end])] + [end]
+    active: list[tuple[Decimal, str]] = []
+    for seg_start, seg_end in zip(breaks, breaks[1:]):
+        seg_markers = [
+            (_decimal(marker["count"] or "1"), _UNITS[marker["unit"]])
+            for marker in cadences
+            if seg_start <= marker.start() < seg_end
+        ]
+        if not seg_markers:
+            continue
+        if any(m_unit in _TIME_UNITS for _, m_unit in seg_markers):
+            active = list(seg_markers)
+        else:
+            active = [item for item in active if item[1] != "times"] + seg_markers
+    return active
 
-    Unrecognized dimensions and bare numbers are outside this deterministic
-    gate. None, in contrast to an empty tuple, always fails closed.
+
+def numeric_facts(text: str, *, strict: bool = True) -> tuple[NumericFact, ...] | None:
+    """Extract supported quantities; fail closed in strict mode or skip isolated malformed tokens.
+
+    strict=True 校验模型声明（单条不合法即整体拒收）；strict=False 用于检索父块证据，
+    防止表格或复方斜杠记号里某一项未知格式导致整块其它合法数值被连坐抹除。
     """
+    # 折叠 PDF 抽取造成的汉字间水平空格与跨行断开的多字中文单位（如“千\n克”“分 钟”），保留其余断句；
+    # 全角中文逗号后补空格再 NFKC，避免“kg/m²，80岁”被误判为畸形千分位。
+    text = re.sub(r"(?<=[\u4e00-\u9fff])[ \t\u3000]+(?=[\u4e00-\u9fff])", "", text)
+    if not strict:
+        text = re.sub(r"(?<=[\u4e00-\u9fff（(])\n(?=[+\-]?\d|[≤≥<>])", "", text)
+    text = _BROKEN_CJK_UNIT.sub(lambda m: re.sub(r"\s+", "", m.group(0)), text)
+    text = text.replace("，", "， ")
     text = unicodedata.normalize("NFKC", text).lower().replace("−", "-")
     text = re.sub(rf"负\s*(?=[\d.{_CHINESE}])", "-", text)
     text = re.sub(rf"百分之\s*({_NUMBER})", r"\1%", text)
     facts = []
     cadences = list(_CADENCE.finditer(text))
-    try:
-        for marker in cadences:
-            facts.append(NumericFact((_decimal(marker["count"] or "1"),),
-                                     _UNITS[marker["unit"]], "every"))
-    except (DecimalException, ValueError, KeyError):
-        return None
+    for marker in cadences:
+        try:
+            count_values = (_decimal(marker["count"] or "1"),)
+            if marker.group("count_end"):
+                count_values += (_decimal(marker["count_end"]),)
+            facts.append(NumericFact(count_values, _UNITS[marker["unit"]], "every"))
+        except (DecimalException, ValueError, KeyError):
+            if strict:
+                return None
     for match in _QUANTITY.finditer(text):
         try:
             if (match.start() >= 2 and text[match.start() - 1] == ","
-                    and text[match.start() - 2].isdigit()):
-                return None  # malformed thousands separator, not a list delimiter
+                    and text[match.start() - 2].isdigit()
+                    and not re.search(r"(?:^|[^0-9])(?:m|米)2$", text[:match.start() - 1])):
+                if strict:
+                    return None  # malformed thousands separator, not a list delimiter
+                continue
             if re.match(r"\s*(?:/|[·⋅^])", text[match.end():]):
-                return None  # never silently truncate an unrecognized denominator
+                current_canonical = _UNITS.get(re.sub(r"\s+", "", match["unit"]), "")
+                if not _is_compound_slash_separator(text[match.end():], current_canonical):
+                    if strict:
+                        return None  # never silently truncate an unrecognized denominator
+                    continue
             values = (_decimal(match["first"]),)
             second = match["second"] or match["unit_second"]
             if second:
@@ -175,7 +359,9 @@ def numeric_facts(text: str) -> tuple[NumericFact, ...] | None:
             unit, bases = _unit_parts(match["unit"], match["denominators"])
             if match["half"]:
                 if len(values) != 1 or unit not in _TIME_UNITS:
-                    return None
+                    if strict:
+                        return None
+                    continue
                 with localcontext() as context:
                     context.prec = max(28, len(values[0].as_tuple().digits)
                                        + abs(values[0].as_tuple().exponent) + 2)
@@ -184,7 +370,9 @@ def numeric_facts(text: str) -> tuple[NumericFact, ...] | None:
             suffix = _SUFFIXES.get(match["suffix"])
             if suffix:
                 if relation not in {"eq", suffix}:
-                    return None
+                    if strict:
+                        return None
+                    continue
                 relation = suffix
             if second:
                 separator = match["separator"] or match["unit_separator"]
@@ -196,48 +384,60 @@ def numeric_facts(text: str) -> tuple[NumericFact, ...] | None:
                     if (left, left_bases) != (unit, bases):
                         unit = f"{left}{left_bases!r}..{unit}{bases!r}"
                 if shape == "range" and values[0] > values[1]:
-                    return None
+                    if strict:
+                        return None
+                    continue
+            elif relation == "eq" and not match["prefix"] and not match["suffix"]:
+                # 处理“5.1 mmol/L≤空腹血糖<7.0 mmol/L”类左端链式不等式：量词在比较符左侧，实际语义为 ≥5.1 mmol/L。
+                trailing = re.match(
+                    rf"\s*(<=|>=|≤|≥|<|>)(?!\s*(?:[\d.]|[{_CHINESE}]))",
+                    text[match.end():],
+                )
+                if trailing:
+                    relation = _TRAILING_CMP[trailing.group(1)]
             cadence = []
             for marker in cadences:
                 if marker.start() <= match.start() and match.end("unit") <= marker.end():
                     relation = "every"
-            if unit not in _TIME_UNITS:
+            if unit not in _TIME_UNITS and unit not in _NON_CADENCE_UNITS:
                 # Only a preceding explicit cadence in this clause can qualify a
                 # quantity. Do not infer per-dose vs daily total from a later phrase.
                 start = max((stop.end() for stop in _CLAUSE_END.finditer(text, 0, match.start())),
                             default=0)
-                cadence = [(_decimal(marker["count"] or "1"), _UNITS[marker["unit"]])
-                           for marker in cadences if start <= marker.start() < match.start()]
+                cadence.extend(_clause_cadences(text, start, match.start(), cadences))
+            conflict = False
             for basis in bases:
                 if (basis[1] in _TIME_UNITS and any(
                         old[1] in _TIME_UNITS and old != basis for old in cadence)):
-                    return None
+                    conflict = True
+                    break
                 cadence.append(basis)
                 facts.append(NumericFact((basis[0],), basis[1], "every"))
+            if conflict:
+                if strict:
+                    return None
+                continue
             facts.append(NumericFact(values, unit, relation, tuple(sorted(set(cadence)))))
         except (DecimalException, ValueError, KeyError):
-            return None
+            if strict:
+                return None
+            continue
+    if not strict:
+        _append_compound_pair_facts(text, facts)
+        _append_table_header_facts(text, facts)
     return tuple(facts)
 
 
 def numbers_supported(text: str, sources: Sequence[str]) -> bool:
-    """Require each complete fact to occur in at least one individual source.
-
-    Args:
-        text: Untrusted statement to check before publication.
-        sources: Only the contexts actually cited by this statement.
-
-    Returns:
-        Whether all recognized numeric facts are identically supported.
-    """
-    required = numeric_facts(text)
+    """Require each complete fact to occur in at least one individual source."""
+    required = numeric_facts(text, strict=True)
     if required is None:
         return False
     if not required:
         return True
     supported = set()
     for source in sources:
-        facts = numeric_facts(source)
+        facts = numeric_facts(source, strict=False)
         if facts is not None:
             supported.update(facts)
     return all(fact in supported for fact in required)

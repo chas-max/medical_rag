@@ -84,7 +84,9 @@ npm --prefix frontend run build:patient
 
 患者入口登录成功后直接进入 ChatGPT 式界面：左侧是「新对话」、最近会话与分页，中间是消息区和底部输入框，左下角头像菜单显示本系统账户、所属机构、系统角色与核验状态，并提供退出登录；身份、健康信息授权、安全审计与账户支持从侧栏进入。配置 `[chat]` 后，发送问题会走患者鉴权的 `POST /chat`：先校验会话、角色、绑定和当前健康信息授权，再调用本机 RAG 答案服务，最后在持久化前重新校验并以 `user`/`assistant` 角色保存问答与引用；撤回期间生成的回答会被丢弃。未配置 `[chat]` 时退化为只保存文字记录。回答只基于公开医疗资料，不替代医生诊断；界面和告知都要求不要输入患者隐私。
 
-`[chat]` 是可选配置段：`base_url` 必须是回环 `http(s)` 来源，另有 `timeout_seconds`（1–300）与 `top_k`（1–20）。当前演示在 `outputs/patient-demo/config.toml` 中指向本机 8001 的 `unsafe-local-demo` `/answers`；这是**演示桥接**，不是生产部署方式。生产环境必须换成内部认证的 RAG 服务，并补齐账号级限流、流式输出和机构模型审批。
+`[chat]` 是可选配置段：`base_url` 必须是回环 `http(s)` 来源，另有 `timeout_seconds`（1–300）、`top_k`（1–20）与可选的 `streaming`（默认 false）。当前演示在 `outputs/patient-demo/config.toml` 中指向本机 8001 的 `unsafe-local-demo` `/answers`；这是**演示桥接**，不是生产部署方式。生产环境必须换成内部认证的 RAG 服务，并补齐账号级限流和机构模型审批。
+
+设置 `streaming = true` 后，患者入口改用 `POST /chat/stream`（Server-Sent Events），逐条显示已通过引用与数值校验的结论，而不是等整段答案返回。流式与非流式共用同一套校验和同一笔落库事务，因此两条路径存储的记录结构一致；区别是**终态被否定时界面会清空已经显示的文字**：证据门控拒答显示拒答文案，生成期间撤回授权或会话被改写则显示"本次回答未保存"，且不写入任何轮次。启用前提是 RAG 服务提供 `POST /answers/stream`，并且访问路径上不存在缓冲响应的代理；独立患者网关已关闭代理缓冲。患者界面通过 `permissions.chat_stream` 判断能力，不探测端点，未启用时该路由不存在。
 
 ## 旧单用户本机演示启动（PowerShell）
 
@@ -99,7 +101,7 @@ docker compose up -d
 npm --prefix frontend install
 npm --prefix frontend run build
 $env:MEDICAL_RAG_ACCESS_MODE = 'unsafe-local-demo' # 仅用于本机虚构数据演示
-uvicorn medical_rag.api:app --app-dir src --host 127.0.0.1 --port 8001
+python -m medical_rag.api_server --host 127.0.0.1 --port 8001
 ```
 
 在三个单独终端、同一项目目录及其虚拟环境中启动后台进程：
@@ -110,6 +112,16 @@ python -m medical_rag.worker relay
 python -m medical_rag.worker ingest
 python -m medical_rag.worker memory
 ```
+
+## 日志（Loguru）
+
+`api`、`relay`、`ingest`、`memory` 四个进程启动时各自建立一套 Loguru sink：控制台可读文本 + `outputs/logs/<role>/<role>.log`。文件默认按 20 MB 轮转、保留 14 天、滚动后的历史文件压缩成 zip；`LOG_JSON=true` 时文件与控制台都改成单行 JSON，便于外部采集。第三方库（uvicorn/httpx/openai/pymilvus/aio_pika 等）的标准库日志会被转发到同一套 sink。
+
+`LOG_ENABLED=false` 只保留控制台、不写文件；测试与 CI 不应在仓库落盘，`tests/conftest.py` 会把 `LOG_DIR` 指向临时目录。
+
+日志只记录固定短语与降级事件，不写问题原文、患者记录、答案正文、API Key、连接串或文件路径；`backtrace`/`diagnose` 固定关闭，避免 traceback 携带局部变量。凭证样式（`sk-…`、`Bearer …`、`scheme://user:pass@host`、`password=`/`api_key=`）会被 patcher 兜底遮蔽。
+
+患者门户默认**完全不落日志**：只有机构在 TOML 里显式配置 `[logging] enabled = true` 时才会写文件，且只记录启动/关闭/preflight 结果等运维元事件，请求级证据仍只进 PostgreSQL 审计表。
 
 ## HTTP 客户端依赖（httpx / httpx2）
 

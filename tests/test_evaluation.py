@@ -174,3 +174,75 @@ def test_insufficient_evidence_records_abstention_and_excludes_recall():
     assert report["summary"]["correct_abstention_rate"] == 1
     assert report["summary"]["recall"] is None
     assert not judge.calls
+
+
+def test_report_aggregates_graded_retrieval_and_decoy_abstention():
+    service = Service(ids=("supp", "core"), abstained=True)
+    judge = Judge()
+    cases = [
+        {"id": "1", "question": "q1", "relevant_chunk_ids": ["core", "supp"],
+         "chunk_grades": {"core": 2, "supp": 1}},
+        {"id": "2", "question": "q2", "relevant_chunk_ids": [],
+         "answerability": "insufficient_evidence", "context_chunk_ids": ["supp"]},
+    ]
+    report = evaluate_cases(cases, service, judge, 2, "qwen", "qwen")
+    assert report["summary"]["core_recall"] == pytest.approx(1.0)
+    assert 0 < report["summary"]["ndcg"] < 1.0
+    assert report["summary"]["hit_rate"] == pytest.approx(1.0)
+    assert report["cases"][1]["context_hit_count"] == 1
+    assert report["summary"]["decoy_abstention_count"] == 1
+    assert report["summary"]["decoy_abstention_rate"] == pytest.approx(1.0)
+
+
+def test_parent_window_cited_and_subquery_context_relevance_metrics():
+    p1_a = Evidence(Chunk("c1", "d", "guide.md", "高血压患者血压应小于140/90mmHg", "g", "目标", 1, 0,
+                          parent_id="p1", parent_text="高血压患者血压应小于140/90mmHg；首选ACEI"), 0.9)
+    p2_a = Evidence(Chunk("noise", "d", "guide.md", "背景介绍", "g", "前言", 1, 1,
+                          parent_id="p2", parent_text="背景介绍"), 0.6)
+
+    class CitedService:
+        class Gen:
+            @staticmethod
+            def answer(question, items, provider):
+                return {"answer": "高血压控制目标小于140/90mmHg", "citations": [{"chunk_id": "c1"}], "abstained": False}
+
+        generator = Gen()
+
+        @staticmethod
+        def search(question, k):
+            return [p1_a, p2_a]
+
+    class SubJudge(Judge):
+        def score_context_subquery(self, question, subqueries, context):
+            self.calls.append(("subquery_context", len(subqueries)))
+            return {"score": 0.9 if "140/90" in context else 0.1, "reason": "覆盖子问", "model": self.model}
+
+    judge = SubJudge()
+    cases = [
+        {
+            "id": "C1",
+            "question": "高血压患者诊室血压的控制目标是多少？首选哪些降压药物治疗？",
+            "relevant_chunk_ids": ["neighbor_in_p1"],
+            "source_refs": [{"quote": "高血压患者血压应小于140/90mmHg", "relevance": 2}],
+        },
+        {
+            "id": "C2",
+            "question": "高血压患者的血压控制目标是什么？",
+            "relevant_chunk_ids": ["neighbor_in_p1"],
+            "source_refs": [{"quote": "首选ACEI", "relevance": 2}],
+        },
+    ]
+    report = evaluate_cases(cases, CitedService(), judge, 2, "qwen", "qwen")
+    c1, c2 = report["cases"]
+    # C1 has 2 subqueries -> invokes score_context_subquery; C2 reuses context_relevance
+    assert [call for call in judge.calls if isinstance(call, tuple)] == [("subquery_context", 2), ("subquery_context", 2)]
+    assert c1["subquery_context_relevance"]["score"] == pytest.approx(0.5)
+    assert c2["subquery_context_relevance"] == c2["context_relevance"]
+    assert c1["retrieval_parent_window"]["recall"] == pytest.approx(1.0)
+    assert c1["post_rag_cited"]["precision"] == pytest.approx(1.0)
+    assert c1["context_relevance_cited"]["score"] == pytest.approx(0.5)
+    assert report["summary"]["parent_recall"] == pytest.approx(1.0)
+    assert report["summary"]["parent_r_precision"] == pytest.approx(1.0)
+    assert report["summary"]["post_rag_cited_precision"] == pytest.approx(1.0)
+    assert report["summary"]["context_relevance_cited"] == pytest.approx(0.5)
+    assert report["summary"]["subquery_context_relevance"] == pytest.approx(0.5)

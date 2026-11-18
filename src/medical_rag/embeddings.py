@@ -1,14 +1,13 @@
 """Lazy local BGE embedding and reranking adapters."""
 
-import logging
 import math
 import os
 from time import monotonic
 
+from loguru import logger
+
 from .lexical import score as lexical_score
 from .types import SCORE_LEXICAL, SCORE_RERANK
-
-logger = logging.getLogger(__name__)
 
 EMBEDDER_MODEL = "BAAI/bge-small-zh-v1.5"
 RERANKER_MODEL = "BAAI/bge-reranker-v2-m3"
@@ -84,6 +83,16 @@ class BgeEmbedder:
         return result
 
 
+def _already_sigmoid_activated(model: object) -> bool:
+    """Return True when the cross-encoder already applies Sigmoid in predict()."""
+    activation = getattr(model, "activation_fn", None)
+    if activation is None:
+        activation = getattr(model, "default_activation_function", None)
+    if activation is None:
+        return False
+    return type(activation).__name__.lower() == "sigmoid"
+
+
 class BgeReranker:
     def __init__(self, model: object | None = None) -> None:
         self._model = model
@@ -137,8 +146,13 @@ class BgeReranker:
                                                 model_kwargs={"torch_dtype": RERANKER_DTYPE},
                                                 device=device)
                 )
-            logits = self._model.predict([[question, text] for text in texts])
-            scores = [1.0 / (1.0 + math.exp(-float(value))) for value in logits]
+            predictions = self._model.predict([[question, text] for text in texts])
+            if _already_sigmoid_activated(self._model):
+                # sentence-transformers CrossEncoder 默认已在 predict() 内执行 Sigmoid，
+                # 直接保留 [0, 1] 校准概率，避免二次 Sigmoid 将分数压缩至 [0.50, 0.731]。
+                scores = [float(value) for value in predictions]
+            else:
+                scores = [1.0 / (1.0 + math.exp(-float(value))) for value in predictions]
             if len(scores) != len(texts) or not all(math.isfinite(score) for score in scores):
                 raise ValueError("重排分数无效")
             self._unavailable_until = 0.0

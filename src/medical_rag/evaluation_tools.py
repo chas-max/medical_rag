@@ -235,22 +235,41 @@ def remap_release(dataset_path: Path, chunks_path: Path, registry_path: Path, ou
         for case in cases:
             row = dict(case)
             resolved: list[str] = []
+            grades: dict[str, int] = {}
+            context_ids: list[str] = []
             for ref in case["source_refs"]:
                 if ref.get("source_id") not in source_ids:
                     raise ValueError(f"题目 {case['id']} 引用了未知来源: {ref.get('source_id')}")
                 if case.get("answerability") == "insufficient_evidence":
-                    mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
-                                           "chunk_id": None, "method": "skipped", "score": None,
-                                           "warnings": ["insufficient_evidence"]})
+                    if ref.get("relevance") == 0:
+                        result = match_anchor(ref, chunks)
+                        for chunk_id in result.get("chunk_ids", [result.get("chunk_id")]):
+                            if chunk_id not in context_ids:
+                                context_ids.append(chunk_id)
+                            mapping_report.append({
+                                "question_id": case["id"], "anchor": ref.get("anchor_id"),
+                                "chunk_id": chunk_id, "method": "context_only",
+                                "score": result["score"], "warnings": ["insufficient_evidence"],
+                            })
+                    else:
+                        mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
+                                               "chunk_id": None, "method": "skipped", "score": None,
+                                               "warnings": ["insufficient_evidence"]})
                     continue
+                grade = int(ref.get("relevance", 2))
                 result = match_anchor(ref, chunks)
                 for chunk_id in result.get("chunk_ids", [result.get("chunk_id")]):
                     if chunk_id not in resolved:
                         resolved.append(chunk_id)
+                    grades[chunk_id] = max(grades.get(chunk_id, 0), grade)
                     mapping_report.append({"question_id": case["id"], "anchor": ref.get("anchor_id"),
                                            "chunk_id": chunk_id, "method": result["method"],
                                            "score": result["score"], "warnings": []})
             row["relevant_chunk_ids"] = resolved
+            if grades:
+                row["chunk_grades"] = grades
+            if context_ids:
+                row["context_chunk_ids"] = context_ids
             runtime_rows.append(row)
     except (KeyError, TypeError, ValueError) as exc:
         # Do not leave a successful-looking runtime copy behind on failure.

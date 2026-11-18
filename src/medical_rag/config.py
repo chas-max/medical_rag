@@ -73,6 +73,15 @@ class Settings(BaseSettings):
     # patient deployment must inject the same named environment variable; enabling
     # only half the chain would persist state nobody reads.
     dialogue_state_enabled: bool = False
+    # 日志由 Loguru 统一输出：按进程分目录、按大小轮转、超期删除、历史归档压缩。
+    # 关闭文件 sink 后只保留控制台；测试与 CI 不应在仓库里落盘。
+    log_enabled: bool = True
+    log_dir: str = "outputs/logs"
+    log_level: str = "INFO"
+    log_rotation: str = "20 MB"
+    log_retention: str = "14 days"
+    log_compression: str = "zip"
+    log_json: bool = False
 
     @model_validator(mode="after")
     def _validate_chunking(self) -> "Settings":

@@ -15,7 +15,7 @@ from medical_rag.dialogue_models import (
     RecentTurn,
     Topic,
 )
-from medical_rag.generation import GroundedGenerator
+from medical_rag.generation import GroundedGenerator, resolved_references_notice
 from medical_rag.types import Chunk
 from medical_rag.workflow.bootstrap import build_registry
 from medical_rag.workflow.engine import WorkflowEngine
@@ -30,10 +30,11 @@ class DialogueTransport(RoutingTransport):
     """Answers the resolver call and delegates every other node to the v6 fake."""
 
     def __init__(self, topic="糖尿病", source="current", full=FULL, intent="etiology",
-                 intent_text="由什么引起", relation="standalone"):
+                 intent_text="由什么引起", relation="standalone", references=()):
         super().__init__()
         self.payloads = []
-        self.answer = reply(topic, source, intent, intent_text, full, relation)
+        self.answer = reply(topic, source, intent, intent_text, full, relation,
+                            references=references)
 
     def complete(self, provider, system, user):
         payload = json.loads(user)
@@ -128,6 +129,36 @@ def test_v7_uses_one_semantic_question_everywhere():
     assert dialogue.resolution.resolved_question == FULL
 
 
+def test_v7_passes_pronoun_resolution_to_generation_as_context():
+    references = [{"expression": "它", "entity": "糖尿病", "source_turn_id": "1",
+                   "source_role": "user"}]
+    system_instance = system(transport=DialogueTransport(source="1", references=references))
+    snapshot = DialogueSnapshot(recent=(
+        RecentTurn(turn_id="1", user="糖尿病呢？", assistant="合成回答"),), context_version=1)
+    result = run(system_instance, FOLLOW_UP, DialogueRun(snapshot))
+
+    assert result.status == "success"
+    payloads = system_instance["transport"].payloads
+    generated = next(value for value in payloads if "evidence" in value)
+    # 消解结果以独立键进入生成上下文，role 原样保留。
+    assert generated["resolved_references"] == [
+        {"expression": "它", "entity": "糖尿病", "source_role": "user"}]
+    # 其他模型调用（hyde/规划等）与公开输出都看不到它。
+    assert all("resolved_references" not in value
+               for value in payloads if value is not generated)
+    assert "resolved_references" not in json.dumps(result.output, ensure_ascii=False)
+    # 对话上下文永远不进证据：引用校验只看检索块。
+    assert all("resolved_references" not in item.chunk.text for item in result.evidence)
+
+
+def test_resolved_references_notice_carries_the_trust_boundary():
+    assert resolved_references_notice(None) == ""
+    assert resolved_references_notice([]) == ""
+    notice = resolved_references_notice([{"expression": "它", "entity": "糖尿病"}])
+    assert "不是医学证据" in notice
+    assert "不是用户自述" in notice
+
+
 def test_v7_keeps_internal_resolution_out_of_the_public_result():
     system_instance = system(transport=DialogueTransport(source="1"))
     snapshot = DialogueSnapshot(recent=(
@@ -204,16 +235,28 @@ def test_two_dialogue_runs_do_not_share_state():
 
 def test_v7_is_published_and_v6_remains_available():
     repository = WorkflowRepository(WORKFLOWS)
+    v9 = repository.get("medical-answer", 9)
+    v8 = repository.get("medical-answer", 8)
     v7 = repository.get("medical-answer", 7)
     v6 = repository.get("medical-answer", 6)
 
+    assert v9.status == "published"
+    assert v8.status == "published"
     assert v7.status == "published"
     # v6 stays published so a rolled-back switch can still select it explicitly.
     assert v6.status == "published"
-    assert repository.get_published("medical-answer").version == 7
+    assert repository.get_published("medical-answer").version == 9
     assert {node.id for node in v7.nodes} == {node.id for node in v6.nodes} - {
         "pre_route", "rewrite"} | {"resolve"}
     assert {node.type for node in v6.nodes} >= {"question.pre_route", "question.rewrite"}
+    assert {"question.hybrid_plan", "retrieval.multi", "merge.collect"} <= {
+        node.type for node in v8.nodes
+    }
+    v9_edges = {(edge.source, edge.source_port, edge.target, edge.target_port) for edge in v9.edges}
+    assert ("hybrid_plan", "subqueries", "subquery_merge", "items") in v9_edges
+    assert ("decompose", "queries", "subquery_merge", "items") in v9_edges
+    assert ("subquery_merge", "values", "rerank", "subqueries") in v9_edges
+    assert ("subquery_merge", "values", "corrective", "subqueries") in v9_edges
     edges = {(edge.source, edge.source_port, edge.target, edge.target_port)
              for edge in v7.edges}
     assert ("resolve", "query", "dense", "question") in edges
@@ -231,3 +274,45 @@ def test_v7_resolution_is_not_reused_across_two_turns_of_one_slot():
 
     assert again.status == "failed"
     assert dialogue.resolution is resolved_once
+
+
+
+def test_v8_runs_lightweight_hybrid_and_preserves_turn1_clarification():
+    q_ambiguous = "它是什么引起的？"
+    amb_res = run(system(), q_ambiguous, DialogueRun(DialogueSnapshot()), version=8)
+    assert amb_res.status == "success"
+    assert amb_res.output["answer_type"] == "clarification"
+    assert amb_res.trace_by_node("resolve").status == "halt"
+
+    compare_q = "比较《指南A（2024）》与《指南B（2025）》在血压达标观察时间上的具体异同？"
+    chunks = [
+        Chunk("c0", "d1", "a.md", f"{compare_q} 规律随访", "a.md", "合成章节", 1, 0),
+        Chunk("c1", "d2", "b.md", f"{compare_q} 饮食管理", "b.md", "合成章节", 1, 0),
+    ]
+    sys_v8 = system(
+        chunks=chunks,
+        transport=DialogueTransport(topic="指南A（2024）", source="current", full=compare_q, intent="comparison"),
+    )
+    comp_res = run(sys_v8, compare_q, DialogueRun(DialogueSnapshot()), version=8)
+    assert comp_res.status == "success"
+    assert comp_res.output["abstained"] is False
+    assert comp_res.trace_by_node("decompose").status == "inactive"
+    assert comp_res.trace_by_node("hyde").status == "inactive"
+    assert len(sys_v8["store"].bm25_queries) >= 2
+
+
+def test_v8_standalone_fallback_recovers_from_resolver_timeout():
+    class TimeoutDialogueTransport(DialogueTransport):
+        def complete_with_timeout(self, provider, system, user, timeout):
+            raise TimeoutError("timed out")
+
+    question = "成人初诊高血压合并2型糖尿病且无其他禁忌症时，血压控制目标及首选降压药类别是什么？"
+    chunks = [
+        Chunk("c0", "d1", "guide.md", f"{question} ACEI或ARB", "guide.md", "治疗", 1, 0),
+        Chunk("c1", "d1", "guide.md", f"{question} 130/80 mmHg", "guide.md", "目标", 1, 1),
+    ]
+    sys_v8 = system(chunks=chunks, transport=TimeoutDialogueTransport())
+    res = run(sys_v8, question, DialogueRun(DialogueSnapshot()), version=8)
+    assert res.status == "success"
+    assert res.output["abstained"] is False
+    assert res.trace_by_node("resolve").status == "success"

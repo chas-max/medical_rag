@@ -158,3 +158,49 @@ def test_cli_versioned_release_checks_runtime_mapping_before_model_calls(tmp_pat
     assert main(["--dataset", str(source), "--manifest", str(manifest),
                  "--output", str(output)], factory=factory) == 2
     assert len(calls) == 1
+
+
+def test_cli_versioned_release_accepts_derived_chunk_grades_and_context_ids(tmp_path):
+    source_file = tmp_path / "source.txt"
+    source_file.write_text("按规范测量。\n相关干扰。\n", encoding="utf-8")
+    registry = tmp_path / "source-registry.json"
+    registry.write_text(json.dumps({"sources": [{"source_id": "doc", "filename": "source.txt",
+                                                   "sha256": source_sha256(source_file)}]}), encoding="utf-8")
+    rubric = tmp_path / "rubric.md"
+    rubric.write_text("裁判规则", encoding="utf-8")
+    rows = [
+        {"id": "MHE2-0001", "question": "如何测量？", "reference_answer": "按规范测量。",
+         "key_points": ["规范测量"], "answerability": "answerable", "category": "管理",
+         "question_type": "procedure", "difficulty": "easy",
+         "source_refs": [{"source_id": "doc", "locator": {"page": 1}, "quote": "按规范测量。",
+                          "anchor_id": "doc#1", "relevance": 2}],
+         "relevant_chunk_ids": []},
+        {"id": "MHE2-0002", "question": "能否停药？", "reference_answer": "不能。",
+         "key_points": ["就医"], "answerability": "insufficient_evidence", "category": "管理",
+         "question_type": "scenario", "difficulty": "hard",
+         "source_refs": [{"source_id": "doc", "locator": {"page": 1}, "quote": "相关干扰。",
+                          "anchor_id": "doc#2", "relevance": 0}],
+         "relevant_chunk_ids": []},
+    ]
+    release = tmp_path / "questions.jsonl"
+    release.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({
+        "question_count": 2, "dataset_version": "v2.0",
+        "dataset_sha256": source_sha256(release),
+        "source_registry_sha256": source_sha256(registry),
+        "rubric_sha256": source_sha256(rubric), "rubric_version": "r2.0",
+        "quotas": {"answerability": {"answerable": 1, "insufficient_evidence": 1}},
+    }), encoding="utf-8")
+    runtime = tmp_path / "runtime.jsonl"
+    runtime_rows = [
+        {**rows[0], "relevant_chunk_ids": ["c1"], "chunk_grades": {"c1": 2}},
+        {**rows[1], "relevant_chunk_ids": [], "context_chunk_ids": ["c2"]},
+    ]
+    runtime.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in runtime_rows) + "\n", encoding="utf-8")
+    output = tmp_path / "report.json"
+    assert main(["--dataset", str(runtime), "--manifest", str(manifest), "--output", str(output)],
+                factory=lambda *_: (Service(), Judge())) == 0
+    report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["dataset_version"] == "v2.0"
+    assert report["summary"]["expected_abstention_count"] == 1

@@ -208,10 +208,20 @@ class WorkflowEngine:
                 context.trace.append(NodeTrace(
                     node_id=node_id, status="failed",
                     duration_ms=max(0, int((perf_counter() - started) * 1000)),
-                    error={"code": "TIMEOUT" if runtime is not None and monotonic() >= runtime.deadline else "CANCELLED",
-                           "message": "节点等待已停止"}))
+                    error={
+                        "code": (
+                            "TIMEOUT"
+                            if runtime is not None
+                            and (runtime.timed_out or monotonic() >= runtime.deadline)
+                            else "CANCELLED"
+                        ),
+                        "message": "节点等待已停止",
+                    },
+                ))
                 raise
             except TimeoutError:
+                if runtime is not None:
+                    runtime.timed_out = True
                 context.trace.append(NodeTrace(
                     node_id=node_id, status="failed",
                     duration_ms=max(0, int((perf_counter() - started) * 1000)),

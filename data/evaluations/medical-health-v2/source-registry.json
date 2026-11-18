@@ -1,0 +1,285 @@
+{
+  "schema_version": "2.0",
+  "sources": [
+    {
+      "source_id": "health-literacy-2024",
+      "filename": "../../中国公民健康素养——基本知识与技能（2024年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2024",
+      "sha256": "fa46725dba26d5ecf2978d3fddf721fd76e57128106e4af5144bad018395dc7e",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "dietary-guidelines-2022",
+      "filename": "../../中国居民膳食指南2022_平衡膳食八准则.md",
+      "publisher": "中国营养学会",
+      "publication_date": "2022",
+      "sha256": "a8a74dfe2f23c5e2a8e5ae4c7e9979d14ed110d5893374c9d8adae66ac3bb7cd",
+      "extraction": "UTF-8 Markdown headings"
+    },
+    {
+      "source_id": "copd-primary-2024",
+      "filename": "../../中国慢性阻塞性肺疾病基层诊疗与管理指南（2024年）.pdf",
+      "publisher": "中华医学会等",
+      "publication_date": "2024",
+      "sha256": "3614fb7b7761378d3e34a3e81e2f2269872a25074a6feaf45f13da9e6bc5fb27",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "diabetes-guideline-2024",
+      "filename": "../../中国糖尿病防治指南（2024版）.pdf",
+      "publisher": "中华医学会糖尿病学分会",
+      "publication_date": "2024",
+      "sha256": "4884c911879af5aa55a5f5cbd825fdedec0b168c34fde8781bc39d35b4b00c22",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hypertension-guideline-2024",
+      "filename": "../../中国高血压防治指南（2024年修订版）.pdf",
+      "publisher": "中国高血压防治指南修订委员会等",
+      "publication_date": "2024",
+      "sha256": "cd0db24262e75c6a1016f2dc1c16922a3c74fe59166b3fdcaaba7e9cae968860",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "breast-cancer-2022",
+      "filename": "../../乳腺癌诊疗指南（2022年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2022",
+      "sha256": "9d3b51f20abe6b80fa2f6273d371c36e14554bfecceb84a274ffe60195c8ffae",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "weight-management-2024",
+      "filename": "../../体重管理指导原则（2024年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2024",
+      "sha256": "7a801bfd1cb5a40653a99f731aeaf7c061be63d7d983ff35415d450eeef3d02c",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "pediatric-mpp-2025",
+      "filename": "../../儿童肺炎支原体肺炎诊疗指南（2025年版）.pdf",
+      "publisher": "国家卫生健康委/国家中医药局",
+      "publication_date": "2025",
+      "sha256": "452e1442cbcae7231e1bac8f23031f84085a7e75aef347fac6d9a04162575b32",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "child-growth-diet-2023",
+      "filename": "../../儿童青少年生长迟缓食养指南（2023年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "74d67776a6f130e4e7965cc91e1b49761f0c6591eae2c21c3baf9c63fcdb0d57",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "liver-cancer-2024",
+      "filename": "../../原发性肝癌诊疗指南（2024年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2024",
+      "sha256": "01f2f97a8b58d461ea5b2eb9433d40f4ea858a8317336d0ff0a408e035583395",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "lung-cancer-2022",
+      "filename": "../../原发性肺癌诊疗指南（2022年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2022",
+      "sha256": "151ee124b37a49ef2603eb0c1c8fe2b4a116cc604eb5b718a03ec61ce77f799c",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "primary-hypertension-2025",
+      "filename": "../../国家基层高血压防治管理指南（2025版）.pdf",
+      "publisher": "国家心血管病中心国家基层高血压防治管理办公室",
+      "publication_date": "2025",
+      "sha256": "22fab1133592a1f485bbfb213d6ad419b3f085dd03a17c2e9bbab8f227a172f8",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "public-health-2017",
+      "filename": "../../国家基本公共卫生服务规范（第三版）.pdf",
+      "publisher": "原国家卫生计生委",
+      "publication_date": "2017",
+      "sha256": "5e61460188040be01605e8294561f8d82f29c09720dca40ff8c1eab7703431d8",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "cervical-cancer-2022",
+      "filename": "../../宫颈癌诊疗指南（2022年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2022",
+      "sha256": "2fff6f9823da406ff6efd4ae613bf0c88ca7a5e1ce3f082f52fa287f041288e8",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "ckd-diet-2024",
+      "filename": "../../成人慢性肾脏病食养指南（2024年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2024",
+      "sha256": "35df6e62cec5f3d30fbdfe8cf52c3e9465e58ae443ba3a44378e37048196aef9",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "ckd-diet-qa-2024",
+      "filename": "../../成人慢性肾脏病食养指南（2024年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2024",
+      "sha256": "3e1ea93ca79e6b0b48fe03815647f12f35cfa729b448bd26d636262964016284",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "diabetes-diet-2023",
+      "filename": "../../成人糖尿病食养指南（2023年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "2e03cd9e06b1a1faf67298647a01c5e5d2be9cd99aacb527732c51f1ee378d87",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "diabetes-diet-qa-2023",
+      "filename": "../../成人糖尿病食养指南（2023年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "cf70b8c9d553001744a6e9a31f4aa9619332d81e48f63e078e9903330c858785",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "sarcopenia-diet-2026",
+      "filename": "../../成人肌少症食养指南（2026年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2026",
+      "sha256": "508563e8af65032d0103465de59c72f3cc64de0cdebaec5f708d1d10faba1ff2",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "sarcopenia-diet-qa-2026",
+      "filename": "../../成人肌少症食养指南（2026年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2026",
+      "sha256": "0bdf216c5af1d44a246bbcdf14080c4b97943b95f497cdeb9800e4cdd495932e",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "obesity-diet-2024",
+      "filename": "../../成人肥胖食养指南（2024年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2024",
+      "sha256": "c0c70502e1c03f2612b322e2dfa8f4a8308c262d41bb4af397dac6c64f5162c7",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "obesity-diet-qa-2024",
+      "filename": "../../成人肥胖食养指南（2024年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2024",
+      "sha256": "ce97f4cffbd94b10787f56b0b9a81362649a92e165950deef0aecd3475f12071",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "stroke-diet-2026",
+      "filename": "../../成人脑卒中食养指南（2026年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2026",
+      "sha256": "aa4c3a714ea4b88cdf588329047db3e692083344f357077a9220f5ae603100a8",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "stroke-diet-qa-2026",
+      "filename": "../../成人脑卒中食养指南（2026年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2026",
+      "sha256": "602b1ce3e47742c65440e8d91b11dccc287fb0e5bee66a49f16d9a112146c237",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "osteoporosis-diet-2026",
+      "filename": "../../成人骨质疏松症食养指南（2026年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2026",
+      "sha256": "6ecee21efa5cface2a35fa27ce9558b13a8388e5fdcb32714150c4a055c7ca0e",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "osteoporosis-diet-qa-2026",
+      "filename": "../../成人骨质疏松症食养指南（2026年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2026",
+      "sha256": "6e5a52ea03990ebca129b64f1bb6699b7c9cd0502316fc00583d825b181d60fb",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hyperuricemia-diet-2024",
+      "filename": "../../成人高尿酸血症与痛风食养指南（2024年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2024",
+      "sha256": "1557d1f7ebef8ab7185cbf67bfbd6b1890cbb5d148f56d0728d07647d18e377f",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hyperuricemia-diet-qa-2024",
+      "filename": "../../成人高尿酸血症与痛风食养指南（2024年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2024",
+      "sha256": "64c46e671674e66a7db5003433e0f9a159c0c73b599343268fc07c0ded5abaa8",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hyperlipidemia-diet-2023",
+      "filename": "../../成人高脂血症食养指南（2023年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "595f0f3358c7b96580a548ee93923010b2a2ff672f500e3bf0859344811893d0",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hyperlipidemia-diet-qa-2023",
+      "filename": "../../成人高脂血症食养指南（2023年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "56e980100c093dfc678ca31f48356bcc144b86cc62b5231d397f90516b807ef9",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hypertension-diet-2023",
+      "filename": "../../成人高血压食养指南（2023年版）.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "e6c5227d95d289a810c953d895afc740ae922fc80ed4a8f1d5f4e39a9cd6c000",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "hypertension-diet-qa-2023",
+      "filename": "../../成人高血压食养指南（2023年版）问答.pdf",
+      "publisher": "国家卫生健康委办公厅",
+      "publication_date": "2023",
+      "sha256": "fc8003c2bf44f1a7944770268604153090960eca0bfd84d9cceea50e4316d68a",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "influenza-2025",
+      "filename": "../../流行性感冒诊疗方案（2025年版）.pdf",
+      "publisher": "国家卫生健康委办公厅/国家中医药局综合司",
+      "publication_date": "2025",
+      "sha256": "d19f8cba72af08fd11fe17c0d6c3614c9aaac8d8c77fa803e7e9b999abea1125",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "mental-disorders-2020",
+      "filename": "../../精神障碍诊疗规范（2020年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2020",
+      "sha256": "a789d0b61f34d6724d383ad5ac3ffa01064f8c83e88722ebb5031b426c62a8cc",
+      "extraction": "pypdf page extraction"
+    },
+    {
+      "source_id": "obesity-guideline-2024",
+      "filename": "../../肥胖症诊疗指南（2024年版）.pdf",
+      "publisher": "国家卫生健康委",
+      "publication_date": "2024",
+      "sha256": "8d7c5c87f8e58f56231e251b1aa588b9d640e74d32dbec2a45e68dcf141274c3",
+      "extraction": "pypdf page extraction"
+    }
+  ]
+}

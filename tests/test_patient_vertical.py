@@ -626,6 +626,118 @@ def test_ask_is_static_503_when_upstream_fails(auth_system):
             assert db.execute("SELECT count(*) FROM medical_rag.conversation_turns").fetchone() == (0,)
 
 
+def read_stream(body):
+    """Parse one SSE body into (event, data) pairs."""
+    events = []
+    for frame in body.split("\n\n"):
+        if not frame.strip():
+            continue
+        fields = dict(line.split(": ", 1) for line in frame.splitlines() if ": " in line)
+        events.append((fields["event"], json.loads(fields["data"])))
+    return events
+
+
+class StreamingFakeChat(FakeChat):
+    """Answer source that publishes what the drafting node publishes."""
+
+    def __init__(self, *args, claims=("结论一",), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.claims = list(claims)
+
+    def stream(self, question, *, dialogue=None):
+        self.questions.append(question)
+        if self.before is not None:
+            self.before()
+        if self.error is not None:
+            raise self.error
+        yield {"event": "status", "data": {"stage": "generating"}}
+        for text in self.claims:
+            yield {"event": "claim", "data": {"text": text, "citations": self.citations}}
+        yield {"event": "analysis", "data": {"summary": "分析段"}}
+        yield {"event": "done", "data": {"answer": self.text, "citations": self.citations,
+                                        "abstained": False, "answer_type": "answer"}}
+
+
+@pytest.mark.integration
+def test_stream_shows_claims_then_persists_one_cited_answer(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = StreamingFakeChat(text="结论一[c1]", citations=CHAT_CITATIONS)
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat, chat_streaming=True),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+
+        response = client.post("/chat/stream", headers=headers,
+                               json={"question": "高血压如何自测？"})
+
+        assert response.status_code == 200, response.text
+        assert response.headers["content-type"].startswith("text/event-stream")
+        events = read_stream(response.text)
+        # ``analysis`` never reaches a patient: the JSON route drops it too.
+        assert [name for name, _ in events] == ["status", "status", "claim", "done"]
+        assert events[2][1] == {"text": "结论一"}
+        answer = events[-1][1]["answer"]
+        assert answer["role"] == "assistant"
+        # Same bounded citation shape the non-streaming route stores.
+        assert answer["citations"] == CHAT_CITATIONS
+        conversation = events[-1][1]["conversation"]["id"]
+        turns = client.get(f"/conversations/{conversation}/turns").json()["data"]["items"]
+        assert [item["role"] for item in turns] == ["user", "assistant"]
+        assert turns[1]["content"] == "结论一[c1]"
+
+
+@pytest.mark.integration
+def test_stream_discards_the_answer_when_consent_is_withdrawn_while_generating(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    def withdraw():
+        with psycopg.connect(**admin) as db:
+            db.execute("INSERT INTO medical_rag.patient_consent_events "
+                       "(event_id,tenant_id,patient_id,grantor_account_id,purpose,notice_version,"
+                       "granted,expires_at) "
+                       "VALUES (%s,%s,%s,%s,'health_information','fictional-v1',false,"
+                       "clock_timestamp())",
+                       (uuid4(), TENANT, PATIENT, ACCOUNT))
+
+    chat = StreamingFakeChat(text="结论一[c1]", citations=CHAT_CITATIONS, before=withdraw)
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat, chat_streaming=True),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+
+        response = client.post("/chat/stream", headers=headers, json={"question": "x"})
+
+        # The claim was already on the wire; the terminal frame is a static error
+        # and the answer is never stored.
+        events = read_stream(response.text)
+        assert [name for name, _ in events][-1] == "error"
+        assert events[-1][1]["code"] == "PATIENT_ACCESS_DENIED"
+        with psycopg.connect(**admin) as db:
+            assert db.execute("SELECT count(*) FROM medical_rag.conversation_turns").fetchone() == (0,)
+            assert db.execute("SELECT count(*) FROM medical_rag.conversations").fetchone() == (0,)
+
+
+@pytest.mark.integration
+def test_stream_route_is_absent_and_unadvertised_when_not_configured(auth_system):
+    from medical_rag.patient_api import create_patient_app
+
+    chat = FakeChat()
+    login, provider, admin, notice = provision(auth_system)
+    with TestClient(create_patient_app(login, notice, chat=chat),
+                    base_url=APP_ORIGIN, headers={}) as client:
+        headers = logged_in((client, login, provider, admin))
+        grant(client, headers)
+
+        assert client.post("/chat/stream", headers=headers,
+                           json={"question": "x"}).status_code == 404
+        assert client.get("/me").json()["data"]["permissions"]["chat_stream"] is False
+        # The synchronous route keeps working: enabling streaming is the only change.
+        assert client.post("/chat", headers=headers, json={"question": "x"}).status_code == 200
+
+
 @pytest.mark.integration
 def test_ask_is_static_503_when_not_configured(system):
     client, _, _, _ = system

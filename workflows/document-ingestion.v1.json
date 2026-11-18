@@ -4,7 +4,7 @@
     {"id":"input","type":"document.input","position":{"x":80,"y":180},"config":{}},
     {"id":"parse","type":"document.parse","position":{"x":330,"y":180},"config":{}},
     {"id":"chunk","type":"document.chunk","position":{"x":580,"y":180},"config":{}},
-    {"id":"embed","type":"document.embed","position":{"x":830,"y":80},"config":{}},
+    {"id":"embed","type":"document.embed","position":{"x":830,"y":80},"config":{"include_metadata":true}},
     {"id":"store","type":"document.store","position":{"x":1080,"y":180},"config":{}},
     {"id":"output","type":"document.output","position":{"x":1330,"y":180},"config":{}}
   ],

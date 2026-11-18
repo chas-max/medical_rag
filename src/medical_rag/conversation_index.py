@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 TURN_COLLECTION_SUFFIX = "_turns"
 MAX_TURN_TEXT_CHARS = 2000

@@ -115,7 +115,7 @@ def test_gate_and_generation_metadata_have_no_web_search_config():
     metadata = {item["type"]: item["config_schema"]
                 for item in registry_for(WebTransport(), WebSearch()).metadata()}
 
-    assert set(metadata["evidence.gate"]) == {"threshold"}
+    assert set(metadata["evidence.gate"]) == {"threshold", "relative_floor_ratio", "hard_floor", "min_keep"}
     assert metadata["generation.llm"] == {}
 
 

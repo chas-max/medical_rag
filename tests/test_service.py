@@ -233,17 +233,18 @@ DEFAULT_WORKFLOWS = Path(__file__).resolve().parents[1] / "workflows"
 
 
 @pytest.mark.parametrize("enabled,requested,expected", [
-    (False, None, 6), (False, 6, 6), (True, None, 7), (True, 6, 6), (True, 7, 7),
+    (False, None, 6), (False, 6, 6), (True, None, 9), (True, 6, 6), (True, 7, 7), (True, 8, 8), (True, 9, 9),
 ])
 def test_answer_version_selection(enabled, requested, expected):
     assert selected_answer_version(enabled, requested) == expected
 
 
-def test_disabled_flag_rejects_explicit_v7():
+@pytest.mark.parametrize("requested", [7, 8, 9])
+def test_disabled_flag_rejects_explicit_v7(requested):
     from medical_rag.types import ApiError
 
     with pytest.raises(ApiError) as caught:
-        selected_answer_version(False, 7)
+        selected_answer_version(False, requested)
     assert caught.value.code == "DIALOGUE_FEATURE_DISABLED"
 
 
@@ -299,8 +300,8 @@ def test_disabled_switch_selects_explicit_v6_not_the_latest_published():
     assert _version_service(False) == [("get", "medical-answer", 6)]
 
 
-def test_enabled_switch_selects_v7():
-    assert _version_service(True) == [("get", "medical-answer", 7)]
+def test_enabled_switch_selects_v8():
+    assert _version_service(True) == [("get", "medical-answer", 9)]
 
 
 def test_other_workflows_keep_the_repository_version_semantics():

@@ -40,11 +40,11 @@ def selected_answer_version(enabled: bool, requested: int | None) -> int:
         The version to load.
 
     Raises:
-        ApiError: ``DIALOGUE_FEATURE_DISABLED`` when v7 is requested while off.
+        ApiError: ``DIALOGUE_FEATURE_DISABLED`` when v7+ is requested while off.
     """
     if not enabled and requested is not None and requested >= 7:
         raise ApiError("DIALOGUE_FEATURE_DISABLED", "连续追问功能未启用", 409)
-    return requested if requested is not None else (7 if enabled else 6)
+    return requested if requested is not None else (9 if enabled else 6)
 
 
 def global_capabilities(generator: object) -> dict[str, bool]:
@@ -139,8 +139,9 @@ class RagService:
         return result
 
     def run(self, workflow_id: str, inputs: dict[str, object], memory_context: str = "",
-            *, dialogue: object | None = None, retain_run: bool = True) -> dict:
-        result = asyncio.run(self.run_workflow(workflow_id, inputs,
+            *, dialogue: object | None = None, retain_run: bool = True,
+            emit: StreamEmitter | None = None) -> dict:
+        result = asyncio.run(self.run_workflow(workflow_id, inputs, emit=emit,
                                                memory_context=memory_context,
                                                dialogue=dialogue, retain_run=retain_run))
         if result.status == "failed":
@@ -191,10 +192,16 @@ class RagService:
         return self.run("medical-search", {"question": question, "top_k": top_k})["evidence"]
 
     def answer(self, question: str, provider: str, top_k: int, memory_context: str = "",
-               *, dialogue: object | None = None, retain_run: bool = True) -> dict:
+               *, dialogue: object | None = None, retain_run: bool = True,
+               emit: StreamEmitter | None = None) -> dict:
+        """Answer one question; ``emit`` turns the same run into a streaming one.
+
+        The workflow and validation are identical with or without a stream: the
+        emitter only publishes intermediate events, never a different result.
+        """
         return self.run("medical-answer", {"question": question, "provider": provider,
                                            "top_k": top_k}, memory_context=memory_context,
-                        dialogue=dialogue, retain_run=retain_run)
+                        dialogue=dialogue, retain_run=retain_run, emit=emit)
 
     def health(self) -> dict:
         result: dict[str, object] = {"milvus": self.store.ping()}

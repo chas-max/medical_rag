@@ -9,13 +9,12 @@ used as generation context; they are never embedded.
 
 from __future__ import annotations
 
-import logging
 import math
 import re
 from functools import lru_cache
 from threading import Lock
 
-logger = logging.getLogger(__name__)
+from loguru import logger
 
 EMBEDDER_MODEL = "BAAI/bge-small-zh-v1.5"
 

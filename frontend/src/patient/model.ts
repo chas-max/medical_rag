@@ -12,6 +12,8 @@ export type Identity = {
     health_consent: boolean;
     conversations: boolean;
     chat: boolean;
+    /** Absent on a server that predates streaming; treat as unsupported then. */
+    chat_stream?: boolean;
     audit: boolean;
     support_self: boolean;
     support_queue: boolean;
@@ -119,6 +121,8 @@ export function identity(value: unknown): Identity {
     typeof value.permissions.health_consent !== "boolean" ||
     typeof value.permissions.conversations !== "boolean" ||
     typeof value.permissions.chat !== "boolean" ||
+    (value.permissions.chat_stream !== undefined &&
+      typeof value.permissions.chat_stream !== "boolean") ||
     typeof value.permissions.audit !== "boolean" ||
     typeof value.permissions.support_self !== "boolean" ||
     typeof value.permissions.support_queue !== "boolean"

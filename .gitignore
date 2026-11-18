@@ -21,6 +21,7 @@ frontend/coverage/
 frontend/dist.sandbox-bak/
 outputs/
 .workbuddy/
+.codebuddy/
 server-ui-test.*.log
 data/*.pdf
 data/chat-history.sqlite3*
