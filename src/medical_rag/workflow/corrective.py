@@ -128,6 +128,7 @@ class CorrectiveNode:
         "provider": PortSpec("provider", "string", optional=True),
         "top_k": PortSpec("top_k", "integer", optional=True),
         "subqueries": PortSpec("subqueries", "list<string>", optional=True),
+        "route": PortSpec("route", "selector", optional=True),
     }
     outputs: ClassVar[dict[str, str]] = {
         "evidence": "evidence_list",
@@ -146,6 +147,10 @@ class CorrectiveNode:
         "include_metadata": {"type": "boolean", "default": False},
         "subquery_blend_weight": {"type": "number", "default": 0.0, "minimum": 0, "maximum": 1},
         "subquery_quota": {"type": "integer", "default": 0, "minimum": 0},
+        "additive_gap_merge": {"type": "boolean", "default": True},
+        "max_gap_add": {"type": "integer", "default": 2, "minimum": 0, "maximum": 10},
+        "rrf_blend_weight": {"type": "number", "default": 0.0, "minimum": 0, "maximum": 1},
+        "boilerplate_factor": {"type": "number", "default": 1.0, "minimum": 0, "maximum": 1},
     }
 
     def __init__(self, registry: object, transport: object = None, default_provider: str = "qwen",
@@ -282,16 +287,69 @@ class CorrectiveNode:
             return self._finish(evidence, report)
         fused = await self._safe("retrieval.rrf", {"sources": lists}, context, report)
         candidates = fused.outputs.get("evidence") if fused is not None else None
-        pool = _dedupe([*evidence, *candidates]) if isinstance(candidates, list) else list(evidence)
+        candidate_list = list(candidates) if isinstance(candidates, list) else []
         max_per_parent = int(config.get("max_per_parent", 0))
-        rerank_config: dict[str, Any] = {
-            "rerank_k": max(30, len(pool)),
+        base_rerank_config: dict[str, Any] = {
             "include_metadata": bool(config.get("include_metadata", False)),
             "subquery_blend_weight": float(config.get("subquery_blend_weight", 0.0)),
             "subquery_quota": int(config.get("subquery_quota", 0)),
+            "rrf_blend_weight": float(config.get("rrf_blend_weight", 0.0)),
+            "boilerplate_factor": float(config.get("boilerplate_factor", 1.0)),
         }
         if max_per_parent > 0:
-            rerank_config["max_per_parent"] = max_per_parent
+            base_rerank_config["max_per_parent"] = max_per_parent
+
+        if bool(config.get("additive_gap_merge", True)):
+            from ..query_normalization import extract_guideline_titles, filename_matches_title
+
+            existing_ids = {item.chunk.id for item in evidence}
+            fresh_candidates = [item for item in candidate_list if item.chunk.id not in existing_ids]
+            max_gap_add = max(0, int(config.get("max_gap_add", 2)))
+            cap = min(20, max(top_k, len(evidence)) + max_gap_add)
+            add_budget = max(0, cap - len(evidence))
+            if not fresh_candidates or add_budget <= 0:
+                report["rounds"] = 1
+                report["stop_reason"] = "gap_retry_empty"
+                return self._finish(evidence, report)
+            spare = max(0, top_k - len(evidence))
+            rerank_top_k = min(20, max(1, spare + max_gap_add))
+            rerank_config = {**base_rerank_config, "rerank_k": max(30, len(fresh_candidates))}
+            rerank_inputs: dict[str, Any] = {
+                "question": question,
+                "evidence": fresh_candidates,
+                "top_k": rerank_top_k,
+            }
+            if subqueries:
+                rerank_inputs["subqueries"] = subqueries
+            reranked = await self._safe("retrieval.rerank", rerank_inputs, context, report, config=rerank_config)
+            added = reranked.outputs.get("evidence") if reranked is not None else None
+            report["rounds"] = 1
+            if not isinstance(added, list) or not added:
+                report["stop_reason"] = "gap_retry_empty"
+                return self._finish(evidence, report)
+            missing_titles = [
+                title for title in extract_guideline_titles(question)
+                if not any(filename_matches_title(item.chunk.filename, [title]) for item in evidence)
+            ]
+            if missing_titles:
+                prioritized = [
+                    item for item in added
+                    if any(filename_matches_title(item.chunk.filename, [title]) for title in missing_titles)
+                ]
+                prioritized_ids = {item.chunk.id for item in prioritized}
+                remaining = [item for item in added if item.chunk.id not in prioritized_ids]
+                ordered_added = [*prioritized, *remaining]
+            else:
+                ordered_added = list(added)
+            taken = ordered_added[:add_budget]
+            if not taken:
+                report["stop_reason"] = "gap_retry_empty"
+                return self._finish(evidence, report)
+            report["stop_reason"] = "gap_retried"
+            return self._finish([*evidence, *taken], report)
+
+        pool = _dedupe([*evidence, *candidate_list])
+        rerank_config = {**base_rerank_config, "rerank_k": max(30, len(pool))}
         rerank_inputs: dict[str, Any] = {"question": question, "evidence": pool, "top_k": top_k}
         if subqueries:
             rerank_inputs["subqueries"] = subqueries

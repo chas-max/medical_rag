@@ -1,5 +1,7 @@
 """Separate untrusted model drafting from citation validation."""
 
+import inspect
+
 from ...dialogue_models import MAX_REFERENCES
 from ...generation import ANALYSIS_EVENT
 from ..contracts import (
@@ -12,7 +14,27 @@ from ..contracts import (
 
 # 诊断字段只进 trace，不改变 answer/citations/abstained 的既有语义。
 DIAGNOSTIC_KEYS = ("abstain_reason", "output_repaired", "truncated", "degraded",
-                   "degraded_reason", "numeric_rejections")
+                   "degraded_reason", "numeric_rejections", "numeric_repaired")
+
+
+def _accepts_kwarg(fn: object, name: str) -> bool:
+    """Return True if callable ``fn`` accepts keyword argument ``name``."""
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(
+        param.kind == inspect.Parameter.VAR_KEYWORD or param.name == name
+        for param in params
+    )
+
+
+def _resolve_repair_mode(config: dict, inputs: dict) -> str:
+    raw = str(config.get("numeric_repair_mode", "off"))
+    if raw == "by_route":
+        route = str(inputs.get("route") or "")
+        return "all_claims" if route == "numeric_exact" else "rescue_only"
+    return raw if raw in ("off", "rescue_only", "all_claims") else "off"
 
 
 def _stream_events(payload: dict) -> list[dict]:
@@ -61,6 +83,7 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
     ][:MAX_REFERENCES]
     if resolved_references:
         context_options["resolved_references"] = resolved_references
+    route = str(inputs.get("route") or "")
     emit = context.emit
     if emit is not None:
         # 生成一段带证据的回答要十几到几十秒，先把检索结果数量推给前端，
@@ -79,11 +102,17 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
         # 于是弱证据不补充检索、检索落空也不再交给生成阶段兜底（状态帧却还写着 true）。
         # draft() 只有本仓库的生成器提供；缺失时退回旧的 generate_stream 契约，后者只推结论。
         streamer = getattr(generator, "draft", None) or generator.generate_stream
+        draft_options = dict(context_options)
+        if route and _accepts_kwarg(streamer, "route"):
+            draft_options["route"] = route
         result = streamer(inputs["question"], inputs["evidence"], provider,
-                          web_search=web_search, on_claim=publish, plan=plan, **context_options)
+                          web_search=web_search, on_claim=publish, plan=plan, **draft_options)
     else:
+        gen_options = dict(context_options)
+        if route and _accepts_kwarg(generator.generate, "route"):
+            gen_options["route"] = route
         result = generator.generate(inputs["question"], inputs["evidence"], provider,
-                                    web_search=web_search, plan=plan, **context_options)
+                                    web_search=web_search, plan=plan, **gen_options)
     # 截断是生成侧的运行状态，不是端口数据：写进 run 变量，供引用校验节点区分
     # “模型被截断”与“资料不足”，同时不改变 draft/evidence 的既有接线契约。
     if result.get("truncated"):
@@ -92,9 +121,24 @@ def draft(inputs: dict, config: dict, context: ExecutionContext, generator: obje
     return {"draft": result["draft"], "evidence": result["evidence"]}
 
 
-def validate(inputs: dict, config: dict, context: ExecutionContext, generator: object) -> dict:
+def validate(inputs: dict, config: dict, context: ExecutionContext, generator: object,
+             default_provider: str = "qwen") -> dict:
     truncated = bool(context.variables.get(MODEL_OUTPUT_TRUNCATED_VARIABLE))
-    answer = generator.validate(inputs["draft"], inputs["evidence"], truncated=truncated)
+    repair_mode = _resolve_repair_mode(config, inputs)
+    provider = str(inputs.get("provider") or default_provider)
+    kwargs: dict = {"truncated": truncated}
+    if repair_mode != "off" and _accepts_kwarg(generator.validate, "repair_mode"):
+        kwargs["repair_mode"] = repair_mode
+        if _accepts_kwarg(generator.validate, "provider"):
+            kwargs["provider"] = provider
+        emit = context.emit
+        if emit is not None and _accepts_kwarg(generator.validate, "on_repaired_claim"):
+            def publish_repaired(payload: dict) -> None:
+                for event in _stream_events(payload):
+                    emit(event)
+
+            kwargs["on_repaired_claim"] = publish_repaired
+    answer = generator.validate(inputs["draft"], inputs["evidence"], **kwargs)
     for key in DIAGNOSTIC_KEYS:
         if key in answer:
             context.node_metadata[key] = answer[key]

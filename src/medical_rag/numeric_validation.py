@@ -68,7 +68,7 @@ _COMPARISONS = {
     "低于": "lt", "小于": "lt", "少于": "lt", "不足": "lt", "未满": "lt", "<": "lt",
     "等于": "eq", "=": "eq",
 }
-for _negation in ("不得", "不能", "不可", "不应", "不允许", "未"):
+for _negation in ("不得", "不能", "不可", "不应", "不宜", "不允许", "未"):
     for _word in ("超过", "高于", "大于"):
         _COMPARISONS[_negation + _word] = "le"
     for _word in ("低于", "小于", "少于"):
@@ -100,6 +100,15 @@ _BROKEN_CJK_UNIT = re.compile(
 _TRAILING_CMP = {"<=": "ge", "≤": "ge", "<": "gt", ">=": "le", "≥": "le", ">": "lt"}
 # 年龄与生理解剖/检验阈值属于状态或控制目标，不从同句前置“每……监测/随访”继承给药频次。
 _NON_CADENCE_UNITS = {"age", "kg/m2", "mmhg", "kpa", "mmol/l", "mg/dl"}
+_TIME_RANK = {
+    "second": 0,
+    "minute": 1,
+    "hour": 2,
+    "day": 3,
+    "week": 4,
+    "month": 5,
+    "year": 6,
+}
 
 
 @dataclass(frozen=True)
@@ -327,6 +336,18 @@ def numeric_facts(text: str, *, strict: bool = True) -> tuple[NumericFact, ...] 
     text = unicodedata.normalize("NFKC", text).lower().replace("−", "-")
     text = re.sub(rf"负\s*(?=[\d.{_CHINESE}])", "-", text)
     text = re.sub(rf"百分之\s*({_NUMBER})", r"\1%", text)
+    table_text = text
+    if not strict:
+        # 表格解析需要保留原始换行；正文则在快照后折叠 PDF 中文断行及单位内部空格，
+        # 避免“每日……不超\n过 5g”丢掉频次、“1.20～39岁”被当成小数或“kg/m 2”漏识别。
+        text = re.sub(r"(?<=[\u4e00-\u9fff])[ \t]*\n[ \t]*(?=[\u4e00-\u9fff])", "", text)
+        text = re.sub(
+            r"(?:(?<=^)|(?<=[。；！？：\s]))([1-9])\.(?=\d{2,}\s*(?:[~～\-至到]\s*\d+\s*)?岁)",
+            r"\1. ",
+            text,
+        )
+        text = re.sub(r"(?<=/)\s*m\s+2(?![\d])", "m2", text)
+        text = re.sub(r"(?<=/)\s*米\s+2(?![\d])", "米2", text)
     facts = []
     cadences = list(_CADENCE.finditer(text))
     for marker in cadences:
@@ -338,6 +359,7 @@ def numeric_facts(text: str, *, strict: bool = True) -> tuple[NumericFact, ...] 
         except (DecimalException, ValueError, KeyError):
             if strict:
                 return None
+    prev_non_cadence_qty_end = 0
     for match in _QUANTITY.finditer(text):
         try:
             if (match.start() >= 2 and text[match.start() - 1] == ","
@@ -396,15 +418,45 @@ def numeric_facts(text: str, *, strict: bool = True) -> tuple[NumericFact, ...] 
                 if trailing:
                     relation = _TRAILING_CMP[trailing.group(1)]
             cadence = []
+            is_cadence_span = False
             for marker in cadences:
                 if marker.start() <= match.start() and match.end("unit") <= marker.end():
                     relation = "every"
+                    is_cadence_span = True
             if unit not in _TIME_UNITS and unit not in _NON_CADENCE_UNITS:
                 # Only a preceding explicit cadence in this clause can qualify a
                 # quantity. Do not infer per-dose vs daily total from a later phrase.
                 start = max((stop.end() for stop in _CLAUSE_END.finditer(text, 0, match.start())),
                             default=0)
-                cadence.extend(_clause_cadences(text, start, match.start(), cadences))
+                inherited = _clause_cadences(text, start, match.start(), cadences)
+                if unit == "times":
+                    inherited = [item for item in inherited if item[1] != "times"]
+                cadence.extend(inherited)
+            elif unit == "minute" and relation != "every":
+                # 让“每周至少250分钟”与“至少250分钟/周”映射到同一规范化周期，仅限同无逗号短语内紧邻的更大时间粒度。
+                seg_start = max(
+                    [stop.end() for stop in _CLAUSE_END.finditer(text, 0, match.start())]
+                    + [c.end() for c in re.finditer(r"(?<!\d),(?!\d)", text[:match.start()])],
+                    default=0,
+                )
+                seg_start = max(seg_start, prev_non_cadence_qty_end)
+                for marker in cadences:
+                    if not (seg_start <= marker.start() and marker.end() <= match.start()):
+                        continue
+                    m_unit = _UNITS.get(marker["unit"], "")
+                    if m_unit in _TIME_UNITS and _TIME_RANK[m_unit] > _TIME_RANK[unit]:
+                        cadence.append((_decimal(marker["count"] or "1"), m_unit))
+            if (
+                unit == "times"
+                and values == (Decimal(2),)
+                and relation == "eq"
+                and not bases
+                and not cadence
+                and re.match(r"[\u4e00-\u9fff]{0,6}间隔", text[match.end():])
+            ):
+                if not is_cadence_span:
+                    prev_non_cadence_qty_end = match.end()
+                continue
             conflict = False
             for basis in bases:
                 if (basis[1] in _TIME_UNITS and any(
@@ -418,13 +470,15 @@ def numeric_facts(text: str, *, strict: bool = True) -> tuple[NumericFact, ...] 
                     return None
                 continue
             facts.append(NumericFact(values, unit, relation, tuple(sorted(set(cadence)))))
+            if not is_cadence_span:
+                prev_non_cadence_qty_end = match.end()
         except (DecimalException, ValueError, KeyError):
             if strict:
                 return None
             continue
     if not strict:
         _append_compound_pair_facts(text, facts)
-        _append_table_header_facts(text, facts)
+        _append_table_header_facts(table_text, facts)
     return tuple(facts)
 
 

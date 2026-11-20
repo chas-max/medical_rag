@@ -87,6 +87,12 @@ def plan(inputs: dict, config: dict, context: ExecutionContext, transport: objec
     off 输出空规划，生成提示词随之不带任何答题结构内容。模型输出不可用（不是调用
     失败——那和其它模型节点一样向上抛）时退回标准骨架。
     """
+    skip_raw = str(config.get("skip_routes", "") or "")
+    skip_routes = {item.strip() for item in skip_raw.split(",") if item.strip()}
+    route = str(inputs.get("route") or "").strip()
+    if route and route in skip_routes:
+        context.node_metadata.update(skipped_by_route=route)
+        return {"plan": ""}
     preset = str(config.get("preset", "auto"))
     if preset == "off":
         return {"plan": ""}
