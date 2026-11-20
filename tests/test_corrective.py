@@ -339,3 +339,44 @@ def test_corrective_subquery_gap_recovers_missing_guideline_facet():
     assert res.outputs["report"]["stop_reason"] == "gap_retried"
     assert any("《慢性肾脏病管理指南》" in q for q in res.outputs["report"]["queries"])
     assert any(item.chunk.id == "c_ckd" for item in res.outputs["evidence"])
+
+
+def test_corrective_additive_gap_merge_preserves_existing_when_at_top_k():
+    from medical_rag.types import SCORE_RERANK
+
+    c1 = Chunk("c1", "d1", "高血压指南.pdf", "高血压一级预防", "高血压指南.pdf", "预防", 1, 0, parent_id="p1")
+    c2 = Chunk("c2", "d1", "高血压指南.pdf", "高血压血压阈值140/90", "高血压指南.pdf", "诊断", 2, 0, parent_id="p2")
+    c3 = Chunk("c3", "d2", "慢性肾脏病指南.pdf", "CKD推荐ACEI或ARB", "肾脏病指南.pdf", "治疗", 1, 0, parent_id="p3")
+    c4 = Chunk("c4", "d2", "慢性肾脏病指南.pdf", "CKD蛋白摄入建议", "肾脏病指南.pdf", "营养", 2, 0, parent_id="p4")
+    c5 = Chunk("c5", "d3", "其他手册.pdf", "一般随访注意事项", "其他手册.pdf", "随访", 1, 0, parent_id="p5")
+    node, _ = _node([c1, c2, c3, c4, c5], Transport(), reranker_score=0.8)
+
+    res = asyncio.run(
+        node.execute(
+            {
+                "question": "对比《高血压指南》和《慢性肾脏病指南》的处理原则",
+                "evidence": [
+                    Evidence(c1, 0.92, score_kind=SCORE_RERANK),
+                    Evidence(c2, 0.90, score_kind=SCORE_RERANK),
+                ],
+                "subqueries": ["《高血压指南》 处理原则", "《慢性肾脏病指南》 处理原则"],
+                "top_k": 2,
+            },
+            {
+                "max_rounds": 1,
+                "min_evidence": 1,
+                "check_subquery_gaps": True,
+                "additive_gap_merge": True,
+                "max_gap_add": 2,
+                "rrf_blend_weight": 0.15,
+                "boilerplate_factor": 0.65,
+            },
+            ExecutionContext("run", "medical-answer", {}),
+        )
+    )
+    ids = [item.chunk.id for item in res.outputs["evidence"]]
+    assert res.outputs["report"]["stop_reason"] == "gap_retried"
+    assert ids[:2] == ["c1", "c2"]
+    assert 2 < len(ids) <= 4
+    assert "c3" in ids or "c4" in ids
+    assert ids[2] in {"c3", "c4"}

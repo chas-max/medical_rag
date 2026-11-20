@@ -372,3 +372,32 @@ def test_pdf_line_wrap_comma_cadence_reset_table_counts_and_scaled_denominators(
         [table_16],
     ) is True
     assert numbers_supported("沙库巴曲缬沙坦钠每天服药3次。", [table_16]) is False
+
+
+def test_negation_linewrap_list_prefix_space_unit_and_time_cadence_symmetry() -> None:
+    # 1. 不宜超过否定前缀
+    assert numbers_supported("每日食盐不超过5g。", ["每日食盐不宜超过5g。"]) is True
+    assert numbers_supported("每日食盐超过5g。", ["每日食盐不宜超过5g。"]) is False
+
+    # 2. PDF 中文断行保留前置 cadence，且不破坏表格换行解析
+    wrapped_diet = "建议每日烹调油使用\n量宜控制在 25g 以内、食盐用量每日不宜超过 5g。"
+    assert numbers_supported("每日烹调油使用量宜控制在25g以内，食盐用量每日不宜超过5g。", [wrapped_diet]) is True
+    assert numbers_supported("每周烹调油25g以内。", [wrapped_diet]) is False
+
+    # 3. 列表编号不误判为小数
+    list_src = "（一）筛查策略。1.20～39岁 （1）每月1次检查。2.40～69岁 （1）每年1次。3.70岁以上"
+    assert numbers_supported("20～39岁每月1次，40～69岁每年1次，70岁以上。", [list_src]) is True
+    assert numbers_supported("20～49岁。", [list_src]) is False
+
+    # 4. 单位空格断行 kg/m 2
+    assert numbers_supported("BMI为18.5～23.9kg/m²。", ["BMI在 18.5～23.9kg/m 2。"]) is True
+    assert numbers_supported("BMI为18.5～24.9kg/m²。", ["BMI在 18.5～23.9kg/m 2。"]) is False
+
+    # 5. 「两次…间隔」不被误判为给药频次 & 时间单位周期对称性
+    blood_src = "全血每次200～400毫升，两次捐献间隔不少于6个月。"
+    assert numbers_supported("全血每次捐献200～400毫升，两次捐献间隔期不少于6个月。", [blood_src]) is True
+    assert numbers_supported("全血每次捐献200～400毫升，两次捐献间隔不少于3个月。", [blood_src]) is False
+
+    assert numbers_supported("每周至少250分钟。", ["至少250分钟/周。"]) is True
+    assert numbers_supported("至少250分钟/周。", ["每周至少250分钟。"]) is True
+    assert numbers_supported("每天250分钟。", ["每周250分钟。"]) is False

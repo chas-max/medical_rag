@@ -37,6 +37,7 @@ ABSTAIN_PARSE_ERROR = "ABSTAIN_PARSE_ERROR"
 ABSTAIN_TRUNCATED = "ABSTAIN_TRUNCATED"
 ABSTAIN_DEGRADED = "ABSTAIN_DEGRADED"
 ABSTAIN_NUMERIC_MISMATCH = "ABSTAIN_NUMERIC_MISMATCH"
+ABSTAIN_INSUFFICIENT_COVERAGE = "ABSTAIN_INSUFFICIENT_COVERAGE"
 NUMERIC_MISMATCH_ANSWER = (
     "回答中的医学数值、单位或比较方向与引用资料不一致，已停止输出。"
     "请核对原文或咨询专业医务人员。"
@@ -169,7 +170,7 @@ _META_REFUSAL_CLAIM = re.compile(
     r"^[^：:\n]{2,16}(?:缺失|不足|未规定|未提及|未涉及|未载明|未明确|不含|无[^：:\n]{1,8}规定)[：:]"
     r"|(?:现有[^。\n]{0,16}(?:资料|证据|文献|指南|规范|知识库)"
     r"|当前(?:(?:所)?提供的?)?(?:医学)?(?:资料|证据|文献|指南|规范|知识库)"
-    r"|所提供(?:的)?(?:资料|证据|指南|规范)"
+    r"|(?:所)?提供的?[^。\n]{0,24}(?:资料|证据|文献|指南|规范|知识库)"
     r"|上述资料|检索(?:到的)?资料|本(?:指南|规范)|该(?:指南|规范|资料)"
     r"|《[^》]{2,40}》|(?:^|[：:]\s*)(?:临床)?(?:资料|指南|规范))"
     r"[^。\n]{0,110}"
@@ -218,6 +219,30 @@ def plan_section(plan: object) -> str:
     if not text:
         return ""
     return PLAN_DIRECTIVE + "\n" + text
+
+
+NUMERIC_EXACT_DIRECTIVE = (
+    "\n当前属于精确数值与阈值类问题，输出 claims 时请严格核对以下数值约束：\n"
+    "- 所有数值、小数位、范围端点、比较符号（以上/超过/至少/高于/以下/低于/至多）、单位及给药周期必须逐字忠实于所引证据块。\n"
+    "- 不得自行省略或改写“每日/每周/每次”周期，也不得把“每天一次、每次X mg”与总剂量混写。\n"
+    "- 若证据同时存在文本段落与表格数据，优先核对表格行表头/列单位对应关系后撰写。"
+)
+
+NUMERIC_REPAIR_SYSTEM = (
+    "你是医疗数值严格校对助手。给定若干因数值、单位、比较符号或给药周期与引用原文"
+    "不完全一致而被拦截的中文医疗结论（claim）及其引用原文（sources）。"
+    "请仅根据提供的 sources 原文逐条改写 claim，使所有数值、小数、范围端点、"
+    "比较关系（至少/不少于/高于/超过/不超过/以下/低于等）、单位及给药周期（每日/每周/每次等）"
+    "与 sources 原文完全一致；若某个数字/分句在 sources 中完全没有依据，请删去该无依据数值或分句，"
+    "不要猜测或编造。禁止输出“现有资料未提及/未包含”等拒答话术；若 sources 无法支撑任何核心结论，"
+    "对应 id 输出空字符串 \"\"。"
+    '只输出 JSON 对象：{"repaired":[{"id":0,"text":"改写后的结论文本"}]}。'
+)
+
+
+def route_directive(route: object) -> str:
+    """Return route-specific system prompt appendix when applicable."""
+    return NUMERIC_EXACT_DIRECTIVE if route == "numeric_exact" else ""
 
 
 ORIGINAL_QUESTION_NOTICE = (
@@ -404,11 +429,15 @@ class OpenAITransport:
     def complete_with_timeout(self, provider: str, system: str, user: str,
                               timeout_seconds: float, *,
                               json_mode: bool = False,
-                              max_tokens: int | None = None) -> str:
+                              max_tokens: int | None = None,
+                              max_attempts: int = 2) -> str:
         """Bound correction requests without changing the generation default."""
         if timeout_seconds <= 0:
             raise TimeoutError
-        options: dict = {"request_timeout": min(60., timeout_seconds)}
+        options: dict = {
+            "request_timeout": min(60., timeout_seconds),
+            "max_attempts": max(1, int(max_attempts)),
+        }
         if max_tokens is not None:
             options["max_tokens"] = max_tokens
         if json_mode and self._json_mode_available():
@@ -506,6 +535,7 @@ class OpenAITransport:
     def _create(self, provider: str, messages: list[dict], **options) -> object:
         timeout = options.pop("request_timeout", 120.0)
         json_mode = options.pop("json_mode", False)
+        max_attempts = max(1, int(options.pop("max_attempts", 2)))
         api_key = self.settings.qwen_api_key
         if not api_key:
             raise ApiError("MODEL_NOT_CONFIGURED", "模型 API Key 未配置", 503)
@@ -517,7 +547,7 @@ class OpenAITransport:
         client = factory(api_key=api_key, base_url=self.settings.qwen_base_url,
                          timeout=timeout, max_retries=0)
         transient_error: Exception | None = None
-        for attempt in range(2):
+        for attempt in range(max_attempts):
             try:
                 # timeout 上限 120 s 兜底：Qwen 端点已由 completion_options 关掉思维链，
                 # 非 Qwen 服务没有那个开关，只能靠超时守边；瞬时抖动最多原地重试 1 次。
@@ -533,7 +563,7 @@ class OpenAITransport:
                 # 这是能力探测失败而不是上游故障：去掉该参数重试，并记住该端点不支持。
                 if json_mode and error.status_code in (400, 404, 422):
                     raise _JSONModeRejected from error
-                if error.status_code >= 500 and attempt == 0:
+                if error.status_code >= 500 and attempt < max_attempts - 1:
                     transient_error = error
                     if self.client_factory is None:
                         from time import sleep
@@ -544,7 +574,7 @@ class OpenAITransport:
             except (AuthenticationError, PermissionDeniedError) as error:
                 raise _model_error(error) from error
             except (RateLimitError, APITimeoutError, APIConnectionError) as error:
-                if attempt == 0:
+                if attempt < max_attempts - 1:
                     transient_error = error
                     if self.client_factory is None:
                         from time import sleep
@@ -586,7 +616,8 @@ class GroundedGenerator:
               plan: str = "", memory_context: str = "",
               short_term: object | None = None, history: list[dict] | None = None,
               original_question: str = "",
-              resolved_references: list[dict] | None = None) -> dict:
+              resolved_references: list[dict] | None = None,
+              route: str = "") -> dict:
         """Workflow drafting step: stream anchored claims, then the interpretive section.
 
         Keeps the return shape this step already had. Self-check, the web-search
@@ -604,7 +635,7 @@ class GroundedGenerator:
         return self._generate(question, evidence, provider, web_search, on_claim, plan=plan,
                               memory_context=memory_context, short_term=short_term,
                               history=history, original_question=original_question,
-                              resolved_references=resolved_references)
+                              resolved_references=resolved_references, route=route)
 
     def generate_stream(self, question: str, evidence: list[Evidence], provider: str,
                         web_search: bool = False,
@@ -613,7 +644,8 @@ class GroundedGenerator:
                         short_term: object | None = None,
                         history: list[dict] | None = None,
                         original_question: str = "",
-                        resolved_references: list[dict] | None = None) -> dict:
+                        resolved_references: list[dict] | None = None,
+                        route: str = "") -> dict:
         """Stream claims without publishing the analysis event.
 
         Callers that render the analysis themselves (the workflow draft step) use
@@ -623,7 +655,7 @@ class GroundedGenerator:
                               publish_analysis=False, plan=plan, memory_context=memory_context,
                               short_term=short_term, history=history,
                               original_question=original_question,
-                              resolved_references=resolved_references)
+                              resolved_references=resolved_references, route=route)
 
     def _generate(self, question: str, evidence: list[Evidence], provider: str,
                   web_search: bool, on_claim: Callable[[dict], None] | None,
@@ -631,7 +663,8 @@ class GroundedGenerator:
                   short_term: object | None = None,
                   history: list[dict] | None = None,
                   original_question: str = "",
-                  resolved_references: list[dict] | None = None) -> dict:
+                  resolved_references: list[dict] | None = None,
+                  route: str = "") -> dict:
         from .memory_context import memory_boundary
 
         available = bool(web_search and self.tools)
@@ -651,7 +684,8 @@ class GroundedGenerator:
                           original_question=original_question,
                           resolved_references=resolved_references)
         if not available or decision.mode == "clear":
-            system = (BASE_SYSTEM + plan_section(plan) + memory_boundary(memory_context)
+            system = (BASE_SYSTEM + route_directive(route) + plan_section(plan)
+                      + memory_boundary(memory_context)
                       + short_term_boundary(short_term) + history_boundary(history)
                       + original_question_notice(original_question)
                       + resolved_references_notice(resolved_references))
@@ -667,7 +701,8 @@ class GroundedGenerator:
         draft, merged, agent_queries, truncated = self._agent(
             question, merged, provider, decision, on_claim, plan=plan,
             memory_context=memory_context, short_term=short_term, history=history,
-            original_question=original_question, resolved_references=resolved_references)
+            original_question=original_question, resolved_references=resolved_references,
+            route=route)
         self._publish_analysis(draft, merged, on_claim, publish_analysis)
         return {"draft": draft, "evidence": merged, "mode": decision.mode,
                 "queries": queries + agent_queries, "truncated": truncated}
@@ -708,12 +743,13 @@ class GroundedGenerator:
                  short_term: object | None = None,
                  history: list[dict] | None = None,
                  original_question: str = "",
-                 resolved_references: list[dict] | None = None) -> dict:
+                 resolved_references: list[dict] | None = None,
+                 route: str = "") -> dict:
         """Self-check the retrieval, search the web when it is not enough, then draft."""
         return self._generate(question, evidence, provider, web_search, None, plan=plan,
                               memory_context=memory_context, short_term=short_term,
                               history=history, original_question=original_question,
-                              resolved_references=resolved_references)
+                              resolved_references=resolved_references, route=route)
 
     def _agent(self, question: str, evidence: list[Evidence], provider: str,
                decision: Decision,
@@ -722,11 +758,13 @@ class GroundedGenerator:
                short_term: object | None = None,
                history: list[dict] | None = None,
                original_question: str = "",
-               resolved_references: list[dict] | None = None) -> tuple[str, list[Evidence], list[str], bool]:
+               resolved_references: list[dict] | None = None,
+               route: str = "") -> tuple[str, list[Evidence], list[str], bool]:
         from .memory_context import memory_boundary
 
         messages = [{"role": "system",
-                     "content": (BASE_SYSTEM + SEARCH_SYSTEM + plan_section(plan)
+                     "content": (BASE_SYSTEM + SEARCH_SYSTEM + route_directive(route)
+                                 + plan_section(plan)
                                  + memory_boundary(memory_context)
                                  + short_term_boundary(short_term)
                                  + history_boundary(history)
@@ -838,7 +876,9 @@ class GroundedGenerator:
             by_parent[key] = entry
         return entries
 
-    def validate(self, output: str, evidence: list[Evidence], truncated: bool = False) -> dict:
+    def validate(self, output: str, evidence: list[Evidence], truncated: bool = False,
+                 repair_mode: str = "off", provider: str = "",
+                 on_repaired_claim: Callable[[dict], None] | None = None) -> dict:
         """Return only anchored claims, or an abstention that names its own reason.
 
         The prompt asks for one JSON object, but not every endpoint delivers it: a
@@ -871,6 +911,7 @@ class GroundedGenerator:
             verified_claims = []
             numeric_rejections = {}
             refusal_filtered = 0
+            rejected_numeric: list[dict] = []
             for claim in claims:
                 try:
                     statement, refs = claim["text"], claim["citations"]
@@ -915,10 +956,47 @@ class GroundedGenerator:
                         cited_sources.append(metadata)
                 if not numbers_supported(statement, cited_sources):
                     numeric_rejections["claims"] = numeric_rejections.get("claims", 0) + 1
+                    rejected_numeric.append({
+                        "index": len(rejected_numeric),
+                        "statement": statement,
+                        "ids": ids,
+                        "claim_citations": claim_citations,
+                        "cited_sources": cited_sources,
+                    })
                     continue
                 citations.update(claim_citations)
                 verified_claims.append((statement, ids))
                 lines.append(f"{statement.strip()} " + " ".join(f"[{block_id}]" for block_id in ids))
+            repaired_events: list[dict] = []
+            mode = repair_mode if repair_mode in ("off", "rescue_only", "all_claims") else "off"
+            should_repair = bool(
+                rejected_numeric
+                and (mode == "all_claims" or (mode == "rescue_only" and not lines))
+            )
+            if should_repair:
+                repaired_map = self._repair_numeric_claims(rejected_numeric, provider)
+                repaired_count = 0
+                for item in rejected_numeric:
+                    fixed = repaired_map.get(item["index"], "").strip()
+                    if not fixed or _is_meta_refusal_claim(fixed):
+                        continue
+                    if not numbers_supported(fixed, item["cited_sources"]):
+                        continue
+                    repaired_count += 1
+                    citations.update(item["claim_citations"])
+                    verified_claims.append((fixed, item["ids"]))
+                    line = f"{fixed} " + " ".join(f"[{block_id}]" for block_id in item["ids"])
+                    lines.append(line)
+                    repaired_events.append({
+                        "text": line,
+                        "citations": list(item["claim_citations"].values()),
+                    })
+                if repaired_count:
+                    remaining = len(rejected_numeric) - repaired_count
+                    if remaining > 0:
+                        numeric_rejections["claims"] = remaining
+                    else:
+                        numeric_rejections.pop("claims", None)
             if not lines:
                 if numeric_rejections:
                     rejected = self._abstain(ABSTAIN_NUMERIC_MISMATCH, NUMERIC_MISMATCH_ANSWER,
@@ -951,6 +1029,11 @@ class GroundedGenerator:
                          "citations": list(citations.values()), "abstained": False}
             if gaps:
                 published["gaps"] = gaps
+            if repaired_events:
+                published["numeric_repaired"] = len(repaired_events)
+                if on_repaired_claim is not None:
+                    for event in repaired_events:
+                        on_repaired_claim(event)
             # 修复痕迹与截断标记是诊断字段：回答仍然可用，但要能看出模型输出是否合规。
             if parsed.repair:
                 published["output_repaired"] = parsed.repair
@@ -972,6 +1055,51 @@ class GroundedGenerator:
         except (ValueError, TypeError, KeyError, AttributeError):
             # 形状意外时仍然是“解析失败”，不能冒充检索不足。
             return self._abstain(ABSTAIN_PARSE_ERROR, OUTPUT_ERROR_ANSWER)
+
+    def _repair_numeric_claims(self, rejected: list[dict], provider: str) -> dict[int, str]:
+        """Bounded single-attempt rewrite for claims rejected by numeric validation."""
+        if self.transport is None or not rejected:
+            return {}
+        payload_items = [
+            {
+                "id": item["index"],
+                "claim": item["statement"],
+                "sources": "\n---\n".join(item["cited_sources"])[:3000],
+            }
+            for item in rejected[:4]
+        ]
+        user_prompt = json.dumps({"items": payload_items}, ensure_ascii=False)
+        try:
+            complete_timeout = getattr(self.transport, "complete_with_timeout", None)
+            if complete_timeout is not None:
+                raw = complete_timeout(
+                    provider,
+                    NUMERIC_REPAIR_SYSTEM,
+                    user_prompt,
+                    timeout_seconds=5.0,
+                    json_mode=True,
+                    max_tokens=1024,
+                    max_attempts=1,
+                )
+            else:
+                raw = self.transport.complete(provider, NUMERIC_REPAIR_SYSTEM, user_prompt)
+        except Exception:  # noqa: BLE001 - best-effort repair; caller keeps strict safety
+            return {}
+        parsed = parse_model_json(raw)
+        if not isinstance(parsed.payload, dict):
+            return {}
+        entries = parsed.payload.get("repaired")
+        if not isinstance(entries, list):
+            return {}
+        repaired: dict[int, str] = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            idx = entry.get("id")
+            text = entry.get("text")
+            if isinstance(idx, int) and not isinstance(idx, bool) and isinstance(text, str) and text.strip():
+                repaired[idx] = text.strip()
+        return repaired
 
     @staticmethod
     def _abstain(reason: str, answer: str = ABSTENTION, repair: str | None = None,
