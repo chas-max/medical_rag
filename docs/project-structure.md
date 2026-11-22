@@ -27,6 +27,7 @@ medical-rag-resume/
 ├─ deploy/                      网关、身份策略、患者配置示例
 ├─ docs/                        安全需求、报告、进度与复审记录
 ├─ data/                        公开语料、评测集与本地运行数据
+├─ tools/ragas/                 可选 Ragas 独立环境依赖与说明
 └─ outputs/                     运行日志与验收证据（gitignore）
 ```
 
@@ -49,7 +50,12 @@ src/medical_rag/
 │  ├─ memory.py, memory_api.py, memory_context.py, memory_worker.py
 │  └─ profile_intent.py, profile_models.py, profile_policy.py, profile_store.py
 ├─ 评测
-│  └─ evaluate.py, evaluation*.py
+│  ├─ evaluate.py, evaluation*.py
+│  ├─ ragas_adapter.py          报告/题库 → Ragas 样本、指标适用性、报告合并
+│  ├─ ragas_llm.py              Qwen 结构化输出与 BGE embeddings 适配
+│  ├─ ragas_prompts.py          中文对齐 prompt（可选，默认开启）
+│  ├─ ragas_evaluation.py       Ragas 指标构建、并发评分、汇总
+│  └─ ragas_evaluate.py         对已保存报告做 post-hoc Ragas 评分 CLI
 ├─ 患者身份/安全
 │  ├─ security_config.py, security_server.py, security_audit.py, public_errors.py
 │  ├─ oidc_login.py, oidc_identity.py, identity_sessions.py, signing_keys.py

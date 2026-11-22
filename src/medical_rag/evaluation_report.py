@@ -51,7 +51,11 @@ def score_evidence(result: dict, evidence: list, top_k: int) -> None:
     else:
         context_ids = set(result.get("context_chunk_ids") or ())
         result["context_hit_count"] = sum(1 for item in evidence if item.chunk.id in context_ids)
-    result["evidence"] = [{"chunk_id": item.chunk.id, "text": item.chunk.context_text}
+    # parent_id lets the Ragas adapter rebuild the exact parent-window view the
+    # generator saw, while the un-deduped chunk_id list still serves ID metrics.
+    result["evidence"] = [{"chunk_id": item.chunk.id,
+                           "parent_id": item.chunk.parent_id or "",
+                           "text": item.chunk.context_text}
                           for item in evidence]
 
 

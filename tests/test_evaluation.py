@@ -80,6 +80,19 @@ def test_invalid_dataset_rejected_with_line_number(tmp_path, rows):
         load_dataset(path)
 
 
+def test_report_evidence_records_parent_id_for_ragas_parent_view():
+    class ParentService(Service):
+        def search(self, question, k):
+            return [Evidence(Chunk("c1", "doc", "guide.md", "子块", "guide.md", "", None, 0,
+                                   parent_id="p1", parent_text="父窗口"), 0.9)]
+
+    report = evaluate_cases([{"id": "1", "question": "q", "relevant_chunk_ids": ["c1"]}],
+                            ParentService(ids=()), Judge(), 1, "qwen", "qwen")
+    assert report["cases"][0]["evidence"] == [
+        {"chunk_id": "c1", "parent_id": "p1", "text": "父窗口"}
+    ]
+
+
 def test_report_reuses_evidence_and_aggregates():
     service, judge = Service(), Judge()
     report = evaluate_cases([{"id": "1", "question": "问题", "relevant_chunk_ids": ["b"]}],

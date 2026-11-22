@@ -1,0 +1,10 @@
+# Dedicated Ragas evaluation environment.
+# Ragas does not pin langchain/instructor; their current releases require
+# openai>=2, while the application deliberately pins openai<2.  These are the
+# last compatible lines used by the optional `.[ragas]` extra.
+ragas==0.4.4
+langchain==0.3.27
+langchain-core==0.3.86
+langchain-community==0.3.28
+langchain-openai==0.3.30
+instructor==1.11.3

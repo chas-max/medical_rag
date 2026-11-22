@@ -54,3 +54,26 @@ class EvaluationJudge:
 
     def score_answer(self, question: str, answer: str) -> dict:
         return self._score("answer_relevance", {"question": question, "answer": answer})
+
+
+class DisabledJudge:
+    """Placeholder used when Ragas owns the LLM-judged dimensions.
+
+    Returning ``None`` keeps the report's existing fields present but empty;
+    ``merge_ragas_report`` fills them only when a finite Ragas score exists.
+    """
+
+    model = "disabled"
+
+    def score_faithfulness(self, question: str, answer: str, contexts: list[str]) -> None:
+        return None
+
+    def score_context(self, question: str, context: str) -> None:
+        return None
+
+    def score_context_subquery(self, question: str, subqueries: list[str],
+                               context: str) -> None:
+        return None
+
+    def score_answer(self, question: str, answer: str) -> None:
+        return None
