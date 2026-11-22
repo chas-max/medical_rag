@@ -6,7 +6,7 @@
 
 ## 目录结构
 
-后端模块、前端、测试、数据库/部署、安全文档及生成物清理规则见 [项目结构说明](docs/project-structure.md)。测试临时目录、缓存、覆盖率与前端测试报告均为可再生成产物，已清理并加入 `.gitignore`。
+后端模块、前端、测试、数据库/部署、安全文档及生成物清理规则见 [项目结构说明](docs/project-structure.md)。测试临时目录、缓存、覆盖率与前端测试报告均为可再生成产物，已清理并加入 `.gitignore`。可选的本机只读观察界面（Streamlit）的目标、数据来源与只读保证、启动与排障见 [Streamlit 持久化展示界面说明](docs/streamlit-ui.md)。
 
 ## 检索与安全
 
@@ -41,6 +41,7 @@ HyDE 由模型生成一段未经验证的假设性回答，仅用于向量检索
 .\start.cmd                 # cmd 或双击入口（内部调用 pwsh/powershell）
 .\start.ps1 -NoBrowser      # 只启动，不打开浏览器
 .\start.ps1 -WithWorkers    # 额外启动 relay/ingest/memory（文档入库/记忆）
+.\start.ps1 -WithStreamlit  # 额外启动 Streamlit 展示界面（127.0.0.1:8501）
 .\start.ps1 -ResetPatient   # 强制重建患者 PostgreSQL/Keycloak
 .\start.ps1 -Stop           # 停止进程，保留容器与数据
 .\start.ps1 -StopAll        # 停止进程并删除患者容器/关闭 compose
@@ -57,6 +58,33 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 演示账号在 `outputs\patient-demo\credentials.txt`。登录后直接进入问答界面；个人信息在左下角头像菜单。首次访问浏览器会提示演示自签证书，仅在本机演示中继续。旧的 `http://127.0.0.1:8001/ui/chat` **不再是一键启动的入口**：它仍可访问，但那是无登录的单用户 `unsafe-local-demo`，只能用于本机虚构数据，不能转发或接入代理。
 
 脚本依赖 `outputs/patient-demo/` 下的演示装配脚本和自签证书；这是本机一次性演示环境，不是生产部署方式。首次启动或容器停止后需要重建（约 1–2 分钟），患者数据库使用 tmpfs，不持久。
+
+## Streamlit 持久化展示界面（可选）
+
+`src/medical_rag/ui/` 提供一个本机只读观察界面，用于查看本项目已经持久化的演示数据，并保留界面自身的视图状态。它**不是患者门户，也不替代 React 前端**：不提供登录、授权、上传或问答，不读取患者 PostgreSQL。
+
+能看到的内容：
+
+- **概览**：会话/轮次/回答数、文档任务与待处理任务数、worker 心跳、历史库大小与更新时间、本机 RAG `/health` 探测；
+- **会话历史**：已落库的会话、消息、引用与失败运行；
+- **文档入库任务**：任务状态、阶段、错误与时间；
+- **评测报告**：`UI_REPORT_DIRS`（默认 `outputs/reports`）下的报告 JSON，显示 `dataset_version`、`summary` 指标与逐题结果；
+- **持久化笔记**：按会话/评测报告记录运维笔记。
+
+最短启动方式（首次先安装可选依赖，之后直接运行）：
+
+```powershell
+uv pip install --python .venv\Scripts\python.exe -e ".[ui]"   # 首次：安装 Streamlit 可选依赖
+.\start-ui.ps1                                                # 启动并打开 127.0.0.1:8501
+```
+
+也可以直接运行 `.\.venv\Scripts\python.exe -m medical_rag.ui`，或在一键启动时追加 `-WithStreamlit`；需要容器运行时用 `docker compose -f docker-compose.streamlit.yml up -d`，停止用同文件 `down`。
+
+持久化机制：页面、上次选中的会话/报告与笔记写入独立的 `data/streamlit/ui-state.sqlite3`（`ui_state` 键值表 + `ui_notes` 笔记表），重启界面进程后恢复；容器方式使用 `restart: unless-stopped` 与命名卷，`down`/`up` 不丢状态。删除该文件即可重置界面状态，但不影响会话历史、文档任务和评测报告。
+
+已知限制：会话库不存在、报告目录为空或尚未产生数据时显示空态；评测报告只识别顶层带 `summary` 对象的 JSON；未安装 Streamlit 时启动器会给出安装提示。
+
+安全边界：界面**没有任何登录或鉴权**，只监听 `127.0.0.1:8501`，只能用于本机虚构数据；不得转发、反向代理或映射端口到非回环地址，不得处理真实患者数据，也不是生产界面。它只读打开 `chat-history.sqlite3`（SQLite `mode=ro`，不建表、不写数据），不读取患者 PostgreSQL，也不显示 API Key。启动器参数（`-Install`/`-Status`/`-Stop`/`-Foreground`/`-Port`）、环境变量、状态备份与重置、验证和排障命令见 [Streamlit 持久化展示界面说明](docs/streamlit-ui.md)。
 
 ## 患者开发入口启动（PowerShell，与旧演示隔离）
 

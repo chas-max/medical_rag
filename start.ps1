@@ -29,6 +29,11 @@
 .PARAMETER WithWorkers
     同时启动 relay / ingest / memory 后台工作进程（文档入库与记忆需要）。
 
+.PARAMETER WithStreamlit
+    同时启动只读 Streamlit 展示界面（本机 8501）。界面读取既有会话与评测
+    报告，自身状态持久化到 data\streamlit\ui-state.sqlite3。缺少 streamlit
+    依赖时本脚本不会自动联网安装，会提示安装命令并中止。
+
 .PARAMETER NoBrowser
     启动完成后不自动打开浏览器。
 
@@ -37,6 +42,9 @@
 
 .EXAMPLE
     .\start.ps1 -ResetPatient -WithWorkers
+
+.EXAMPLE
+    .\start.ps1 -WithStreamlit
 
 .EXAMPLE
     .\start.ps1 -Stop
@@ -52,6 +60,7 @@ param(
     [switch]$ResetPatient,
     [switch]$SkipFrontend,
     [switch]$WithWorkers,
+    [switch]$WithStreamlit,
     [switch]$NoBrowser,
     [int]$DockerTimeoutSeconds = 240,
     [int]$PatientTimeoutSeconds = 240
@@ -73,6 +82,9 @@ $PatientUrl = 'https://localhost:8443/'
 $ApiPort   = 8001
 $ApiUrl    = "http://127.0.0.1:$ApiPort"
 $PatientPort = 8443
+$UiPort    = 8501
+$UiUrl     = "http://127.0.0.1:$UiPort"
+$UiStateFile = Join-Path $Root 'data\streamlit\ui-state.sqlite3'
 $AccessMode = 'unsafe-local-demo'
 
 $script:Warnings = 0
@@ -112,6 +124,27 @@ function Get-ListeningProcessId {
 function Get-CommandLine {
     param([int]$ProcessId)
     return (Get-CimInstance Win32_Process -Filter "ProcessId = $ProcessId" -ErrorAction SilentlyContinue).CommandLine
+}
+
+# Streamlit 展示界面健康检查：GET http://127.0.0.1:<port>/_stcore/health 返回 ok。
+# 用 HttpWebRequest 并显式禁用代理，避免系统代理把回环请求带走。
+function Test-StreamlitHealth {
+    param([string]$Url = $UiUrl)
+    try {
+        $request = [System.Net.HttpWebRequest]::Create("$Url/_stcore/health")
+        $request.Proxy = $null
+        $request.Timeout = 3000
+        $request.ReadWriteTimeout = 3000
+        $request.Method = 'GET'
+        $response = $request.GetResponse()
+        try {
+            $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+            try { $body = $reader.ReadToEnd().Trim() } finally { $reader.Dispose() }
+            return (([int]$response.StatusCode -eq 200) -and ($body -eq 'ok'))
+        }
+        finally { $response.Close() }
+    }
+    catch { return $false }
 }
 
 function Get-DockerPath {
@@ -250,10 +283,33 @@ function Stop-LegacyApi {
     }
 }
 
+function Stop-StreamlitUi {
+    $procId = Get-SavedProcessId -Name 'streamlit-ui'
+    if ($procId) {
+        $cmd = Get-CommandLine -ProcessId $procId
+        if ($cmd -and $cmd -match 'medical_rag|streamlit') {
+            Stop-ProcessTree -ProcessId $procId -Label 'Streamlit 展示界面'
+        } else {
+            Write-Warn "PID 文件指向的进程不是 Streamlit 展示界面，忽略 (PID $procId)"
+        }
+        Remove-PidFile -Name 'streamlit-ui'
+    }
+    $listener = Get-ListeningProcessId -Port $UiPort
+    if ($listener) {
+        $cmd = Get-CommandLine -ProcessId $listener
+        if ($cmd -and $cmd -match 'medical_rag|streamlit') {
+            Stop-ProcessTree -ProcessId $listener -Label 'Streamlit 展示界面 (残留)'
+        } else {
+            Write-Warn "端口 $UiPort 被其他进程占用 (PID $listener)，未自动结束"
+        }
+    }
+}
+
 function Invoke-Stop {
     Write-Step '停止本机演示进程'
     Stop-PatientPortal
     Stop-LegacyApi
+    Stop-StreamlitUi
 
     if ($StopAll) {
         Write-Step '清理患者演示容器与 Compose 服务'
@@ -475,6 +531,54 @@ function Start-LegacyApi {
     throw 'RAG API 未在 120 秒内通过健康检查'
 }
 
+function Start-StreamlitUi {
+    if (-not $WithStreamlit) {
+        Write-Step 'Streamlit 展示界面'
+        Write-Info '默认跳过（问答不需要）；需要只读展示界面时加 -WithStreamlit'
+        return
+    }
+
+    Write-Step '启动 Streamlit 展示界面（本机 8501）'
+    $listener = Get-ListeningProcessId -Port $UiPort
+    if ($listener) {
+        $cmd = Get-CommandLine -ProcessId $listener
+        if ($cmd -match 'medical_rag|streamlit') {
+            Save-PidFile -Name 'streamlit-ui' -ProcessId $listener
+            Write-Ok "Streamlit 展示界面已在运行 (PID $listener)，复用"
+            return
+        }
+        throw "端口 $UiPort 被其他进程占用 (PID $listener)；请先运行 .\start.ps1 -Stop"
+    }
+
+    & $Python -c 'import streamlit' 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Err '缺少 Streamlit 依赖（可选依赖 [ui]）'
+        Write-Host '  请先安装（本脚本不会自动联网安装）：' -ForegroundColor Yellow
+        Write-Host '    uv pip install --python .venv\Scripts\python.exe -e ".[ui]"' -ForegroundColor Yellow
+        throw '缺少 Streamlit 依赖，未启动展示界面'
+    }
+
+    # 界面状态默认写到 data\streamlit\ui-state.sqlite3；已显式设置 UI_STATE_FILE
+    # 时尊重操作员的选择。
+    if (-not $env:UI_STATE_FILE) { $env:UI_STATE_FILE = $UiStateFile }
+    $null = Start-BackgroundProcess -Name 'streamlit-ui' `
+        -Description 'Streamlit 展示界面 (只读)' `
+        -Arguments @('-m', 'medical_rag.ui',
+                     '--host', '127.0.0.1', '--port', "$UiPort", '--no-browser')
+
+    $deadline = (Get-Date).AddSeconds(90)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 1
+        if (Test-StreamlitHealth -Url $UiUrl) {
+            Write-Ok 'Streamlit 健康检查通过'
+            return
+        }
+    }
+    $tail = Get-Content -Path (Join-Path $LogDir 'streamlit-ui.err.log') -Tail 20 -ErrorAction SilentlyContinue
+    if ($tail) { $tail | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
+    throw 'Streamlit 展示界面未在 90 秒内通过健康检查'
+}
+
 function Start-Workers {
     if (-not $WithWorkers) {
         Write-Step '后台工作进程'
@@ -631,6 +735,9 @@ function Show-Summary {
     Write-Host '  RAG 答案服务（本机，不直接打开）: ' -NoNewline
     Write-Host $ApiUrl -ForegroundColor Gray
     Write-Host '  演示账号: outputs\patient-demo\credentials.txt' -ForegroundColor Gray
+    if (Test-StreamlitHealth -Url $UiUrl) {
+        Write-Host '  Streamlit 展示界面: http://127.0.0.1:8501' -ForegroundColor White
+    }
     Write-Host '  停止进程: .\start.ps1 -Stop' -ForegroundColor Gray
     Write-Host '  完全清理: .\start.ps1 -StopAll' -ForegroundColor Gray
     Write-Host ''
@@ -657,6 +764,7 @@ try {
     Ensure-ComposeStack
     Ensure-PatientFrontend
     Start-LegacyApi
+    Start-StreamlitUi
     Ensure-PatientEnvironment
     Start-PatientPortal
     Start-Workers

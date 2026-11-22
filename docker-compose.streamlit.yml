@@ -1,0 +1,50 @@
+# 持久运行的只读 Streamlit 展示界面（medical_rag.ui）。
+#
+# 安全与持久化边界（全部只在本机演示环境使用）：
+# - 仅回环：ports 只绑定 127.0.0.1，不暴露到局域网或公网；
+# - 数据只读：./data 与 ./outputs 以 :ro 挂载，界面不能写问答库/报告；
+# - 状态持久化：用命名卷 medical_rag_ui_state 覆盖 /app/data/streamlit，
+#   界面自身状态（页面、上次选择、备注）跨容器重建仍保留；
+# - restart: unless-stopped + healthcheck 让界面在崩溃/重启后自动恢复；
+# - 根文件系统只读、tmpfs /tmp、cap_drop ALL、no-new-privileges 收窄权限。
+services:
+  medical-rag-ui:
+    build:
+      context: .
+      dockerfile: deploy/streamlit/Dockerfile
+    image: medical-rag-ui:dev
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8501:8501"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    environment:
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      STREAMLIT_SERVER_FILE_WATCHER_TYPE: "none"
+      STREAMLIT_SERVER_ADDRESS: "0.0.0.0"
+      STREAMLIT_SERVER_PORT: "8501"
+      # 界面自己的状态库（命名卷内可写）；问答会话库与报告目录只读。
+      UI_STATE_FILE: "/app/data/streamlit/ui-state.sqlite3"
+      CHAT_HISTORY_FILE: "/app/data/chat-history.sqlite3"
+      UI_REPORT_DIRS: "/app/outputs/reports"
+    volumes:
+      - ./data:/app/data:ro
+      - ./outputs:/app/outputs:ro
+      - medical_rag_ui_state:/app/data/streamlit
+    # 与 Dockerfile 中 HEALTHCHECK 保持一致：/_stcore/health 返回 ok。
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; r = urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3); sys.exit(0 if r.status == 200 and r.read().strip() == b'ok' else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  # 界面状态跨容器重建持久化：data/ 是只读挂载，状态必须落在命名卷里。
+  medical_rag_ui_state:

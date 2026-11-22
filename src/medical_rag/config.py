@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     log_retention: str = "14 days"
     log_compression: str = "zip"
     log_json: bool = False
+    # 本机只读 Streamlit 展示界面：它不改问答数据，只把界面自己的视图状态
+    # （当前页面、上次选中的会话/报告、操作员笔记）持久化到这个 SQLite 文件。
+    # 默认路径相对项目目录；重启界面后按状态文件恢复上次视图。
+    ui_state_file: str = "data/streamlit/ui-state.sqlite3"
+    # 评测报告是普通 JSON；界面只读扫描这些目录（逗号分隔），按修改时间倒序展示。
+    ui_report_dirs: str = "outputs/reports"
+    # 概览页只对本机回环的 RAG /health 做只读探测；非回环地址会被界面拒绝。
+    ui_api_base_url: str = "http://127.0.0.1:8001"
 
     @model_validator(mode="after")
     def _validate_chunking(self) -> "Settings":

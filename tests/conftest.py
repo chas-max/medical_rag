@@ -74,6 +74,10 @@ def isolated_chat_history(tmp_path, monkeypatch):
     # repository; point the rotating file sinks at the isolated tmp directory.
     monkeypatch.setenv("LOG_DIR", str(tmp_path / "logs"))
     monkeypatch.setenv("CHAT_HISTORY_FILE", str(tmp_path / "chat-history.sqlite3"))
+    # The Streamlit viewer persists its own UI state; keep that out of the repo
+    # for any test that constructs Settings or launches the app.
+    monkeypatch.setenv("UI_STATE_FILE", str(tmp_path / "ui-state.sqlite3"))
+    monkeypatch.setenv("UI_REPORT_DIRS", str(tmp_path / "reports"))
     monkeypatch.setenv("MEMORY_EPISODES_DIR", str(tmp_path / "episodes"))
     monkeypatch.setenv("DOCUMENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     # The operator's .env may turn the continuous-follow-up path on for the local

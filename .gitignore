@@ -25,6 +25,7 @@ outputs/
 server-ui-test.*.log
 data/*.pdf
 data/chat-history.sqlite3*
+data/streamlit/
 data/*.ingest.lock
 data/memory/
 data/document-uploads/

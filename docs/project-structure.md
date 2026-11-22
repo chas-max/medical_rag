@@ -16,9 +16,12 @@ medical-rag-resume/
 ├─ README.md                    项目说明、启动与安全状态
 ├─ pyproject.toml               Python 包、依赖、pytest/ruff 配置
 ├─ .env.example                 环境变量示例（不提交实际 .env）
+├─ start.cmd, start.ps1         一键启动本机演示（RAG + 患者门户）
+├─ start-ui.ps1                 Streamlit 持久化展示界面启动器（可选）
 ├─ docker-compose.yml           本地 Milvus/RabbitMQ 等依赖
 ├─ docker-compose.gateway.yml   旧明文 HTTP 网关实验（未接入患者入口）
 ├─ docker-compose.patient-gateway.yml  独立患者 HTTPS 网关（仅网关容器）
+├─ docker-compose.streamlit.yml Streamlit 展示界面容器（仅回环 8501、只读挂载）
 ├─ src/medical_rag/             后端 Python 包
 ├─ tests/                       后端单元/集成/安全测试
 ├─ frontend/                    React 前端（旧聊天界面 + 患者独立入口）
@@ -61,6 +64,13 @@ src/medical_rag/
 │  └─ support_service.py
 ├─ 配置与设置
 │  └─ config.py, settings_store.py, logging_setup.py
+├─ 展示界面（可选）
+│  └─ ui/                      Streamlit 只读展示界面
+│     ├─ __init__.py
+│     ├─ app.py                页面与视图（概览/会话/任务/报告/笔记）
+│     ├─ data.py               只读数据访问（SQLite mode=ro、报告 JSON 扫描）
+│     ├─ state.py              界面状态持久化（ui_state/ui_notes）
+│     └─ launcher.py           启动器（默认 127.0.0.1:8501，参数解析）
 └─ workflow/                    工作流引擎与节点
    ├─ engine.py, definition.py, contracts.py, validator.py
    ├─ repository.py, registry.py, run_schema.py, bootstrap.py
@@ -118,14 +128,18 @@ deploy/
 ├─ gateway/                     旧 HTTPS/明文后端实验配置
 ├─ identity/                    Keycloak MFA 策略片段与接入说明
 ├─ patient/                     患者应用 TOML/密钥配置示例
-└─ patient-gateway/             独立患者 nginx 网关配置、启动脚本、运维 README
+├─ patient-gateway/             独立患者 nginx 网关配置、启动脚本、运维 README
+└─ streamlit/                   Streamlit 展示界面容器（Dockerfile）
 
-docs/security/
-├─ progress.md                  任务进度与验收记录
-├─ production-readiness.md      生产准入清单（未批准）
-├─ *-brief.md                   各任务需求
-├─ *-report.md                  实施与独立复审报告
-└─ *-review.diff                冻结范围的审查包
+docs/
+├─ project-structure.md         本文件
+├─ streamlit-ui.md              Streamlit 只读展示界面：目标、只读保证、启动与排障
+└─ security/
+   ├─ progress.md               任务进度与验收记录
+   ├─ production-readiness.md   生产准入清单（未批准）
+   ├─ *-brief.md                各任务需求
+   ├─ *-report.md               实施与独立复审报告
+   └─ *-review.diff             冻结范围的审查包
 ```
 
 ## 运行与清理约定
@@ -139,9 +153,16 @@ npm --prefix frontend test
 npm --prefix frontend run lint
 npm --prefix frontend run build
 npm --prefix frontend run build:patient
+
+# Streamlit 展示界面（可选）：首次用 uv 安装可选依赖，然后启动
+uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
+.\start-ui.ps1                       # 或 python -m medical_rag.ui / .\start.ps1 -WithStreamlit
+.\.venv\Scripts\python.exe -m pytest tests/test_ui_state.py tests/test_ui_data.py tests/test_ui_launcher.py -q
+.\start-ui.ps1 -Status
+.\start-ui.ps1 -Stop                 # 只停进程，保留 data/streamlit/ui-state.sqlite3
 ```
 
 测试临时目录、缓存、覆盖率与前端测试报告已加入 `.gitignore`，可随时删除。
-`outputs/`、`data/*.pdf`、`data/chat-history.sqlite3*`、`frontend/dist*`、
-`.env`、虚拟环境和 `node_modules` 均有独立忽略规则；不要提交实际密钥、
-真实患者数据或生产证书。
+`outputs/`、`data/*.pdf`、`data/chat-history.sqlite3*`、`data/streamlit/`、
+`frontend/dist*`、`.env`、虚拟环境和 `node_modules` 均有独立忽略规则；不要提交实际
+密钥、真实患者数据或生产证书。
