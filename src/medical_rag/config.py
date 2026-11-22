@@ -99,6 +99,13 @@ class Settings(BaseSettings):
     # 同一用户名连续失败达到上限后锁定一段时间，避免在线爆破。
     ui_login_max_attempts: int = Field(default=5, ge=1, le=20)
     ui_login_lockout_seconds: int = Field(default=300, ge=30, le=3600)
+    # 演示用账号密码自动填入：首次进入登录页时自动创建/校验本机演示租户，并把
+    # 可用凭据填进表单，操作员点一次「登录」即可进入。仅限本机演示环境使用，
+    # 任何共享或非演示部署都应设 UI_DEMO_LOGIN_ENABLED=false。
+    ui_demo_login_enabled: bool = True
+    ui_demo_username: str = "demo"
+    # 固定演示密码（8-128 字符）；留空则在首次使用时随机生成并写入本机状态库。
+    ui_demo_password: str = ""
 
     @model_validator(mode="after")
     def _validate_chunking(self) -> "Settings":

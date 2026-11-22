@@ -28,6 +28,13 @@ from medical_rag.ui.auth import (  # noqa: E402
     generate_password,
 )
 from medical_rag.ui.chat_page import render_chat_page  # noqa: E402
+from medical_rag.ui.demo import (  # noqa: E402
+    REASON_DISABLED,
+    REASON_INVALID_CONFIG,
+    REASON_MISSING_CREDENTIALS,
+    REASON_PASSWORD_CHANGED,
+    ensure_demo_login,
+)
 from medical_rag.ui.stats import QueryMetricsStore  # noqa: E402
 from medical_rag.ui.stats_page import render_stats_page  # noqa: E402
 from medical_rag.ui.state import UiStateStore, new_conversation_id  # noqa: E402
@@ -118,7 +125,42 @@ def _current_session(settings: Settings, tenants: TenantStore) -> dict | None:
     return auth
 
 
-def _login_page(settings: Settings, tenants: TenantStore) -> None:
+def _demo_notice(account: object) -> None:
+    """Explain what the auto-fill did without exposing the password in the page."""
+    reason = getattr(account, "reason", None)
+    username = getattr(account, "username", "demo")
+    if getattr(account, "usable", False):
+        if getattr(account, "created", False):
+            st.success(
+                f"已自动创建本机演示租户 **@{username}** 并填入账号密码，"
+                "直接点击「登录」即可进入。"
+            )
+        else:
+            st.info(f"演示账号 **@{username}** 已自动填入，直接点击「登录」即可进入。")
+        return
+    if reason == REASON_PASSWORD_CHANGED:
+        st.warning(
+            f"演示账号 @{username} 已存在，但密码不再是自动填入使用的那一个；"
+            "为避免覆盖你的修改，本次不自动填入。请手动输入新密码，或用 CLI "
+            "`reset-password` 重置后刷新页面。"
+        )
+    elif reason == REASON_MISSING_CREDENTIALS:
+        st.warning(
+            f"已存在同名租户 @{username}，但本机状态库里没有可自动填入的凭据；"
+            "请手动登录，或用 CLI 重置密码（`python -m medical_rag.ui.tenants "
+            "reset-password " + username + " --generate`）后刷新页面。"
+        )
+    elif reason == REASON_DISABLED:
+        st.warning(f"演示账号 @{username} 已被停用，本次不自动填入。")
+    elif reason == REASON_INVALID_CONFIG:
+        st.warning(
+            "演示账号配置无效（UI_DEMO_USERNAME / UI_DEMO_PASSWORD），"
+            "请检查 .env 后重启控制台。"
+        )
+
+
+def _login_page(settings: Settings, tenants: TenantStore,
+                state_store: UiStateStore) -> None:
     st.markdown(LOGIN_CSS, unsafe_allow_html=True)
     left, middle, right = st.columns([1, 1.4, 1])
     with middle:
@@ -134,10 +176,6 @@ def _login_page(settings: Settings, tenants: TenantStore) -> None:
         notice = st.session_state.pop("_auth_notice", None)
         if notice:
             st.warning(str(notice))
-        created = st.session_state.pop("_created_tenant", None)
-        if created:
-            st.success(f"已创建演示租户 **{created['username']}**，请保存下面的初始密码（只显示一次）。")
-            st.code(created["password"], language=None)
 
         try:
             tenant_count = len(tenants.list_tenants())
@@ -145,8 +183,29 @@ def _login_page(settings: Settings, tenants: TenantStore) -> None:
             st.error("本地界面数据库不可用：请检查 UI_STATE_FILE 的路径与权限。")
             return
 
-        if tenant_count == 0:
-            st.info("尚未配置任何租户。可先创建本机演示租户，或用 CLI 添加正式演示账号。")
+        # Demo convenience: provision/verify a known demo account and pre-fill it.
+        demo_account = None
+        try:
+            demo_account = ensure_demo_login(
+                tenants, state_store,
+                enabled=settings.ui_demo_login_enabled,
+                username=settings.ui_demo_username,
+                password=settings.ui_demo_password or None,
+            )
+        except Exception:  # noqa: BLE001 - auto-fill must never break the login page
+            st.warning("演示账号自动填入暂不可用，请手动登录。")
+        if demo_account is not None:
+            _demo_notice(demo_account)
+
+        legacy_created = st.session_state.pop("_created_tenant", None)
+        if legacy_created:
+            st.success(f"已创建演示租户 **{legacy_created['username']}**，"
+                       "请保存下面的初始密码（只显示一次）。")
+            st.code(legacy_created["password"], language=None)
+
+        prefill = demo_account if demo_account is not None and demo_account.usable else None
+        if tenant_count == 0 and demo_account is None:
+            st.info("尚未配置任何租户。可先创建本机演示租户，或用 CLI 添加演示账号。")
             if st.button("创建演示租户（随机密码）", type="primary",
                          use_container_width=True, key="create-demo-tenant"):
                 password = generate_password()
@@ -161,10 +220,19 @@ def _login_page(settings: Settings, tenants: TenantStore) -> None:
             st.caption(
                 '也可以使用命令行：`python -m medical_rag.ui.tenants add <用户名> --generate`'
             )
-        else:
+
+        if tenant_count > 0 or prefill is not None:
             with st.form("login", border=True):
-                username = st.text_input("用户名", placeholder="tenant-username")
-                password = st.text_input("密码", type="password", placeholder="••••••••")
+                username = st.text_input(
+                    "用户名",
+                    value=prefill.username if prefill is not None else "",
+                    placeholder="tenant-username",
+                )
+                password = st.text_input(
+                    "密码", type="password",
+                    value=prefill.password if prefill is not None else "",
+                    placeholder="••••••••",
+                )
                 submitted = st.form_submit_button("登录", type="primary",
                                                   use_container_width=True)
             if submitted:
@@ -191,7 +259,19 @@ def _login_page(settings: Settings, tenants: TenantStore) -> None:
                     st.session_state.pop(PAGE_KEY, None)
                     st.session_state.pop(CONVERSATION_KEY, None)
                     st.rerun()
-            st.caption("首次使用请用 CLI 或演示按钮创建租户。连续失败会被临时锁定。")
+            if prefill is not None:
+                st.caption(
+                    f"演示账号 @{prefill.username} 的密码已自动填入（随机生成并保存在本机"
+                    " `UI_STATE_FILE` 中），直接点击「登录」即可；连续失败仍会临时锁定。"
+                )
+            else:
+                st.caption("输入账号密码登录。连续失败会被临时锁定。")
+
+        if settings.ui_demo_login_enabled:
+            st.caption(
+                "自动填入仅用于本机演示（`UI_DEMO_LOGIN_ENABLED=true`）。"
+                "共享或非演示环境请设置 `UI_DEMO_LOGIN_ENABLED=false`，并用 CLI 建号。"
+            )
 
         st.divider()
         st.caption(
@@ -329,7 +409,7 @@ def main() -> None:
 
     session = _current_session(settings, tenants)
     if session is None:
-        _login_page(settings, tenants)
+        _login_page(settings, tenants, state_store)
         return
 
     try:

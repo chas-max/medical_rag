@@ -153,6 +153,7 @@ def _login(at: AppTest, username="demo", password=PASSWORD) -> AppTest:
 
 def test_login_gate_shows_first_run_setup_when_no_tenant(tmp_path, monkeypatch):
     monkeypatch.setenv("UI_STATE_FILE", str(tmp_path / "ui-state.sqlite3"))
+    monkeypatch.setenv("UI_DEMO_LOGIN_ENABLED", "false")
     at = _app()
     at.run()
     assert not at.exception
@@ -163,6 +164,7 @@ def test_login_gate_shows_first_run_setup_when_no_tenant(tmp_path, monkeypatch):
 
 def test_first_run_button_creates_tenant_and_shows_password_once(tmp_path, monkeypatch):
     monkeypatch.setenv("UI_STATE_FILE", str(tmp_path / "ui-state.sqlite3"))
+    monkeypatch.setenv("UI_DEMO_LOGIN_ENABLED", "false")
     at = _app()
     at.run()
     at.button(key="create-demo-tenant").click().run()
@@ -178,6 +180,36 @@ def test_first_run_button_creates_tenant_and_shows_password_once(tmp_path, monke
     at.button[0].click().run()
     assert not at.exception
     assert any("租户：演示租户" in item.value for item in at.sidebar.caption)
+
+
+def test_demo_login_is_autofilled_and_one_click_works(tmp_path, monkeypatch):
+    state_file = tmp_path / "ui-state.sqlite3"
+    monkeypatch.setenv("UI_STATE_FILE", str(state_file))
+    at = _app()
+    at.run()
+    assert not at.exception
+
+    # The first visit provisions the demo tenant and pre-fills working credentials.
+    assert at.text_input[0].value == "demo"
+    assert at.text_input[1].value, "密码应已自动填入"
+    assert any("已自动创建本机演示租户" in item.value for item in at.success)
+    stored = UiStateStore(state_file).get("ui.demo.credentials")
+    assert stored and stored["username"] == "demo"
+
+    # Clicking the login button without typing anything must succeed.
+    at.button[0].click().run()
+    assert not at.exception
+    assert any("租户：演示租户" in item.value for item in at.sidebar.caption)
+
+
+def test_existing_tenant_without_demo_credentials_is_not_autofilled(tmp_path, monkeypatch):
+    _prepare(tmp_path, monkeypatch)  # demo tenant exists, but no auto-filled credential
+    at = _app()
+    at.run()
+    assert not at.exception
+    assert at.text_input[0].value == ""
+    assert at.text_input[1].value == ""
+    assert any("没有可自动填入的凭据" in item.value for item in at.warning)
 
 
 def test_login_loads_chat_page_and_sidebar_navigation(tmp_path, monkeypatch):

@@ -463,6 +463,18 @@ class TenantStore(UiSqliteStore):
             raise InvalidCredentialsError("用户名或密码错误")
         return tenant
 
+    def password_matches(self, tenant_id: str, password: str) -> bool:
+        """Check a password without recording an attempt or applying lockout.
+
+        Only the demo-login bootstrap uses this: it must verify that an existing
+        account still accepts the credential it is about to pre-fill, without
+        polluting the audit trail or counting a failed attempt.
+        """
+        if not isinstance(password, str) or not password:
+            return False
+        encoded = self._password_hash(tenant_id)
+        return bool(encoded) and verify_password(password, encoded)
+
     def _password_hash(self, tenant_id: str) -> str | None:
         """读取密码哈希供校验；该值只在 :meth:`verify_login` 内部使用。"""
         with self.connect() as connection:

@@ -16,7 +16,8 @@ RAG 后端本身没有认证；默认只监听 `127.0.0.1:8501`，只能用于�
 能力范围：
 
 - **租户登录**：账号存在本机 SQLite（`UI_STATE_FILE`），scrypt 口令哈希、连续失败锁定、
-  滑动会话超时；账号用 CLI 或登录页「创建演示租户」按钮维护。
+  滑动会话超时；默认开启**演示账号密码自动填入**（首次访问自动创建并填入本机演示租户，点一次
+  「登录」即可进入），账号也可用 CLI 维护。
 - **RAG 问答**：调用本机 RAG 后端 `POST /chat/runs/stream`（SSE），可回退
   `POST /chat/runs`；支持多轮追问、流式阶段提示、已核验结论逐条出现、最终答案、引用资料
   表与运行轨迹。
@@ -64,8 +65,13 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 .\start-ui.cmd
 ```
 
-首次登录时 `ui_tenants` 为空，登录页显示 **「创建演示租户（随机密码）」** 按钮：用户名固定
-`demo`、显示名「演示租户」，随机初始密码只显示一次。也可以预先用 CLI 建号：
+控制台默认开启**演示账号自动登录**（`UI_DEMO_LOGIN_ENABLED=true`）：第一次打开登录页时会自动
+创建本机演示租户，并把**可用的用户名与随机生成、保存在本机状态库中的密码**填入表单，直接点击
+「登录」即可进入，无需手工建号。该功能仅用于本机演示；共享/非演示部署请设置
+`UI_DEMO_LOGIN_ENABLED=false`（此时登录页回到 CLI 建号流程，未配置租户时显示「创建演示租户」
+按钮）。固定演示密码可用 `UI_DEMO_PASSWORD` 指定（8-128 字符）。
+
+也可以预先用 CLI 建号（演示自动登录关闭时更常见）：
 
 ```powershell
 # 用户名 3-32 位（小写字母/数字/下划线/点/连字符），密码 8-128 位
@@ -74,10 +80,19 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 
 ## 4. 界面功能
 ### 4.1 登录页
-- 无租户：提示尚未配置租户，提供「创建演示租户（随机密码）」按钮与 CLI 示例；创建成功后在同一
-  页面一次性展示初始密码，刷新后不再显示。
-- 有租户：用户名/密码表单。用户名不存在、密码错误、账号被禁用统一提示「用户名或密码错误」；
-  连续失败达到上限时提示「尝试次数过多，请在约 N 秒后重试」。
+- **默认演示自动登录**（`UI_DEMO_LOGIN_ENABLED=true`）：首次打开登录页会自动创建用户名
+  `demo`、显示名「演示租户」的本机账号，并把用户名和随机密码直接填入表单，操作员只需点击
+  「登录」。密码在首次创建时随机生成并保存在本机状态库（`ui.demo.credentials`），不写入仓库；
+  之后每次进入登录页都复用该凭据。
+- **固定演示密码（可选）**：设置 `UI_DEMO_PASSWORD`（8-128 字符）后，自动填入使用该固定密码；
+  若演示账号已存在但密码不匹配，**不会覆盖**，而是提示后不再自动填入。
+- **降级保护**：演示账号被 CLI 改过密码、被停用、或同名租户不是由自动登录创建时，登录页只提示
+  原因、不自动填入，也不覆盖现有密码；可用 `reset-password` 重置或手输密码。
+- **关闭自动登录**（`UI_DEMO_LOGIN_ENABLED=false`）：回到手工流程。未配置租户时显示
+  「创建演示租户（随机密码）」按钮与 CLI 示例，创建成功后一次性展示初始密码；已有租户时显示
+  用户名/密码表单。
+- 登录错误：用户名不存在、密码错误、账号被禁用统一提示「用户名或密码错误」；连续失败达到上限时
+  提示「尝试次数过多，请在约 N 秒后重试」。
 - 底部固定安全说明：仅限本机演示，界面登录不能替代后端认证。状态库不可用时提示检查
   `UI_STATE_FILE` 路径与权限；配置非法时提示检查 `.env`。
 
@@ -128,7 +143,8 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 
 ## 5. 租户与登录管理
 ### 5.1 命令行（CLI）
-账号由本机管理员用 CLI 维护，界面没有自助注册（只有空库时的演示租户按钮）。命令在**仓库根
+账号由本机管理员用 CLI 维护，界面没有自助注册（默认只在登录页自动创建/填入演示账号；关闭
+`UI_DEMO_LOGIN_ENABLED` 后，空库时显示一次性「创建演示租户」按钮）。命令在**仓库根
 目录**执行，读写 `Settings().ui_state_file` 指向的同一个 SQLite：
 
 ```powershell
@@ -147,12 +163,16 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
   `delete` 同时清掉该用户名的登录尝试记录。
 - 成功返回 0、业务失败返回 1（参数错误由 argparse 返回 2）；任何模式都不把明文密码写入日志。
 
-### 5.2 首次演示租户、锁定与超时
-- **首次演示租户**：仅在 `ui_tenants` 为空时提供，创建 `demo` 用户；删除状态库后账号全部
-  丢失，登录页会重新回到首次创建流程。
+### 5.2 演示自动登录、锁定与超时
+- **演示自动登录**：`UI_DEMO_LOGIN_ENABLED=true`（默认）时，登录页每次渲染都会校验演示账号：
+  不存在则以 `UI_DEMO_USERNAME`（默认 `demo`）创建并随机生成密码，密码保存在本机状态库的
+  `ui.demo.credentials`；存在且密码仍匹配时复用并填入。删除状态库会连同演示账号一起重建新的
+  随机密码。`UI_DEMO_PASSWORD` 可指定固定演示密码（此时不写状态库）。演示账号被改密/停用/
+  凭据缺失时只提示、不覆盖、不填入。
 - **口令存储**：stdlib `hashlib.scrypt`（n=16384、r=8、p=1、16 字节随机盐），格式
   `scrypt$16384$8$1$<salt_b64>$<hash_b64>`，用 `hmac.compare_digest` 常量时间校验；账号不
-  存在时也做一次真实 scrypt，弱化时间侧信道。
+  存在时也做一次真实 scrypt，弱化时间侧信道。演示自动填入的明文密码只存在于本机
+  `UI_STATE_FILE`（权限由本机文件系统控制，不加密、不写入仓库）。
 - **锁定**：同一用户名在 `UI_LOGIN_LOCKOUT_SECONDS`（默认 300 秒）窗口内失败达到
   `UI_LOGIN_MAX_ATTEMPTS`（默认 5 次）即临时锁定并显示剩余秒数；锁定期间不再累加失败记录；
   成功登录清除该用户名的失败记录（成功审计记录保留）。
@@ -177,7 +197,7 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 | `ui_tenants` | `tenant_id` PK、`username` UNIQUE、`display_name`、`password_hash`、`disabled`、`created_at`、`updated_at` | 租户账号与 scrypt 口令哈希 |
 | `ui_auth_attempts` | `id` PK、`username`、`attempted_at`、`success`；索引 `(username, attempted_at DESC)` | 登录尝试审计与锁定计数 |
 | `ui_chat_sessions` | `(tenant_id, conversation_id)` 主键、`title`、`created`、`updated`；索引 `(tenant_id, updated DESC)` | 租户可见会话映射与本地标题 |
-| `ui_state` | `key` PK、`value`（JSON 文本）、`updated` | 视图状态：`ui.page`、`ui.conversation.<tenant_id>`；键 ≤200 字符、值 ≤64 KiB |
+| `ui_state` | `key` PK、`value`（JSON 文本）、`updated` | 视图状态：`ui.page`、`ui.conversation.<tenant_id>`；以及演示自动填入凭据 `ui.demo.credentials`（含随机演示密码明文，仅本地演示；键 ≤200 字符、值 ≤64 KiB） |
 | `ui_query_metrics` | `id` PK、`tenant_id`、`conversation_id`、`request_id`、`created_at`、`latency_ms`、`first_event_ms`、`status`、`abstained`、`answer_chars`、`citation_count`、`stream`、`question_chars`、`error_code`、`trace_json`；索引 `(tenant_id, created_at)`、`(created_at)` | 每次问答的耗时、首事件、状态、引用数与节点 trace（只记长度，不记问题/答案正文） |
 
 写入边界：界面只写自己的状态库；`CHAT_HISTORY_FILE`（后端会话历史）与评测报告 JSON 由后端/
@@ -215,6 +235,9 @@ Docker 方式的状态在命名卷 `medical_rag_ui_state` 中，`down` 保留，
 | `UI_SESSION_TIMEOUT_MINUTES` | `480` | 登录会话空闲有效期（分钟，5-10080），每次操作滑动续期 |
 | `UI_LOGIN_MAX_ATTEMPTS` | `5` | 锁定窗口内允许的连续失败次数（1-20） |
 | `UI_LOGIN_LOCKOUT_SECONDS` | `300` | 登录锁定窗口（秒，30-3600） |
+| `UI_DEMO_LOGIN_ENABLED` | `true` | 演示账号自动创建+账号密码自动填入；仅本机演示，共享环境必须设 false |
+| `UI_DEMO_USERNAME` | `demo` | 自动填入的演示账号用户名（3-32 位，非法时登录页提示配置无效） |
+| `UI_DEMO_PASSWORD` | 空 | 固定演示密码（8-128 字符）；留空则首次随机生成并写入 `ui.demo.credentials` |
 | `CHAT_HISTORY_FILE` | `data/chat-history.sqlite3` | 兼容配置：启动日志仍打印，但当前控制台的会话历史经后端 API 读取，不直接打开该库 |
 
 主题：仓库根 `.streamlit/config.toml` 提供 DeepSeek 风格浅色主题（`primaryColor = #4d6bfe`），
@@ -317,8 +340,8 @@ loguru 等最小依赖，不含 torch 或整套 RAG 依赖）。容器以非 roo
 
 ## 10. 验证命令
 ```powershell
-# 控制台单元测试（不产生模型费用；auth/state/stats/api_client/data/launcher）
-.\.venv\Scripts\python.exe -m pytest tests/test_ui_auth.py tests/test_ui_state.py tests/test_ui_stats.py tests/test_ui_api_client.py tests/test_ui_data.py tests/test_ui_launcher.py -q
+# 控制台单元测试（不产生模型费用；auth/demo/state/stats/api_client/data/launcher）
+.\.venv\Scripts\python.exe -m pytest tests/test_ui_auth.py tests/test_ui_demo.py tests/test_ui_state.py tests/test_ui_stats.py tests/test_ui_api_client.py tests/test_ui_data.py tests/test_ui_launcher.py -q
 # 页面装配冒烟测试（需要已安装 streamlit；未安装时该文件整体跳过）
 .\.venv\Scripts\python.exe -m pytest tests/test_ui_app.py -q
 # 静态检查
@@ -339,6 +362,10 @@ Invoke-RestMethod http://127.0.0.1:8001/health
 ## 11. 故障排查
 | 现象 | 排查 |
 |---|---|
+| 登录页没有自动填入账号密码 | 默认应自动填入 `demo`。若提示「没有可自动填入的凭据」，说明同名租户不是自动登录创建的、或旧状态库缺少凭据：用 CLI `reset-password demo --generate` 重置，或删除 `UI_STATE_FILE` 让演示账号重建；若配置了 `UI_DEMO_LOGIN_ENABLED=false` 则属于预期行为 |
+| 提示演示账号密码已变更、不再自动填入 | 有人用 CLI 改过演示账号密码。自动填入**不会覆盖**现有密码；手输新密码，或 `reset-password demo --generate` 后刷新页面 |
+| 演示账号总被锁定 | 自动填入后若有人用错误密码反复点登录，仍会触发失败锁定；等待 `UI_LOGIN_LOCKOUT_SECONDS`（默认 300 秒）后重试，或用 CLI 重置密码 |
+| 想关闭演示自动登录 / 公开演示环境 | 设置 `UI_DEMO_LOGIN_ENABLED=false` 并重启控制台；共享或非演示环境必须关闭，改用 CLI 建号，登录页会回到手工表单 |
 | 执行 `.\start-ui.ps1` 却用记事本打开了文件 | Windows `.ps1` 文件关联问题。改用 `.\start-ui.cmd`，或执行 `pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-ui.ps1` |
 | 提示缺少 Streamlit / `No module named 'streamlit'` | 未安装 `.[ui]`。执行 `uv pip install --python .venv\Scripts\python.exe -e ".[ui]"`，或 `.\start-ui.ps1 -Install`（需有 uv） |
 | 问答页提示「无法连接 RAG 服务」 | 后端未启动或未以 `unsafe-local-demo` 运行。先在仓库根运行 `.\start.ps1`；确认 `http://127.0.0.1:8001/health` 可用；`.\start-ui.ps1 -Status` 会显示后端可达性 |
@@ -371,6 +398,9 @@ Invoke-RestMethod http://127.0.0.1:8001/health
   确认不含敏感信息，且不得外泄 API Key。
 - **指标不是生产监控**：`ui_query_metrics` 是本地轻量遥测，不包含问题/答案正文，没有采样、聚合、
   告警与保留策略；只反映本界面产生的请求，不能用于容量规划或审计。
+- **演示自动登录是便利功能，不是认证**：默认开启时任何人打开本机登录页都能一键进入演示租户；生成
+  的演示密码以明文保存在本机状态库。共享、多人或非演示环境必须设置 `UI_DEMO_LOGIN_ENABLED=false`，
+  并按机构流程建号与保管凭据。
 - **已知限制**：真实回答依赖后端、Milvus 与模型 Key；后端 `locked` 时业务接口 503；容器方式无法
   访问宿主机回环后端，问答不可用；侧边栏任务进程当前只在页面重跑时刷新，没有定时轮询；同一状态库
   多标签页共享，不保证跨进程高并发写入性能。生产环境应使用机构批准的部署方式、独立认证与安全评审；

@@ -66,7 +66,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 主要功能：
 
 - **智能问答**：DeepSeek 风格居中窄栏、流式阶段提示、已核验结论逐条出现、最终答案、引用资料表与运行轨迹；支持多轮追问与会话删除；
-- **租户登录**：账号存本地 SQLite（scrypt 口令哈希、连续失败锁定、滑动会话超时）；无租户时登录页可一键创建演示租户，或用 CLI `python -m medical_rag.ui.tenants add <用户名> --generate` 建号；
+- **租户登录**：账号存本地 SQLite（scrypt 口令哈希、连续失败锁定、滑动会话超时）；默认开启**演示账号密码自动填入**——首次打开登录页自动创建并填入本机演示租户，点一次「登录」即可进入；可用 `UI_DEMO_LOGIN_ENABLED=false` 关闭后改用 CLI `python -m medical_rag.ui.tenants add <用户名> --generate` 建号；
 - **数据统计**：多版本检索指标（扫描 `UI_REPORT_DIRS` 报告 JSON）、问答延迟与吞吐（本界面真实请求、按租户）、任务与入库；
 - **侧边栏任务进程**：显示后端 `/document-jobs` 的排队/执行/重试/成功/失败状态与阶段。
 
@@ -79,6 +79,11 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 uv pip install --python .venv\Scripts\python.exe -e ".[ui]"   # 首次：安装 Streamlit 可选依赖
 .\start-ui.cmd                                                # 终端 2：启动并打开 127.0.0.1:8501
 ```
+
+进入登录页后会自动创建本机演示租户并把**可用的用户名与密码填入表单**（随机密码保存在本地
+`data/streamlit/ui-state.sqlite3`，不写入仓库），直接点击「登录」即可，无需手工建号。该演示自动登录
+仅用于本机演示：共享或非演示环境请设置 `UI_DEMO_LOGIN_ENABLED=false`，再用
+`python -m medical_rag.ui.tenants add <用户名> --generate` 建号。
 
 Windows 的 `.ps1` 没有默认文件关联，在 **cmd**（或双击）里直接执行 `.\start-ui.ps1` 可能会用记事本打开文件而不运行。请用 `.\start-ui.cmd`，或在 PowerShell 中显式执行 `pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-ui.ps1`；`start-ui.cmd` 会把 `-Status`、`-Stop`、`-NoBrowser` 等参数原样传给脚本。也可以直接运行 `.\.venv\Scripts\python.exe -m medical_rag.ui`，或在一键启动时追加 `-WithStreamlit`。
 

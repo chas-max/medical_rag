@@ -313,6 +313,7 @@ function Show-StreamlitInfo {
     Write-Host $UiUrl -ForegroundColor White
     Write-Host '  界面状态（持久化）: ' -NoNewline
     Write-Host $stateFile -ForegroundColor Gray
+    Write-Host '  登录页已自动填入本机演示账号密码，直接点击「登录」即可。' -ForegroundColor Cyan
     Write-Host '  日志: outputs\logs\streamlit-ui.log (错误: streamlit-ui.err.log)' -ForegroundColor Gray
     if (Test-RagBackend) {
         Write-Ok 'RAG 后端 (127.0.0.1:8001) 可访问'

@@ -74,6 +74,7 @@ src/medical_rag/
 │     ├─ stats_page.py         数据统计页：多版本指标、延迟/吞吐、任务与入库
 │     ├─ api_client.py         后端 HTTP/SSE 客户端（回环校验、错误码映射）
 │     ├─ auth.py               租户账号、scrypt 口令哈希、登录锁定
+│     ├─ demo.py               演示账号自动创建与登录页凭据自动填入
 │     ├─ tenants.py            租户账号管理 CLI
 │     ├─ stats.py              问答指标存储与聚合、评测报告多版本对比
 │     ├─ state.py              视图状态与租户会话映射
@@ -166,9 +167,9 @@ npm --prefix frontend run build:patient
 # Streamlit 问答与指标控制台（可选）：先启动 RAG 后端，再装可选依赖并启动
 .\start.ps1                          # 终端 1：本机 RAG 后端（127.0.0.1:8001，unsafe-local-demo），否则问答不可用
 uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
-.\start-ui.cmd                       # 终端 2：cmd/双击入口；也可 python -m medical_rag.ui 或 .\start.ps1 -WithStreamlit
-.\.venv\Scripts\python.exe -m medical_rag.ui.tenants add alice --generate   # 新建租户（或登录页创建演示租户）
-.\.venv\Scripts\python.exe -m pytest tests/test_ui_auth.py tests/test_ui_state.py tests/test_ui_stats.py tests/test_ui_api_client.py tests/test_ui_data.py tests/test_ui_launcher.py -q
+.\start-ui.cmd                       # 终端 2：cmd/双击入口；登录页默认自动填入演示账号密码，点「登录」即可
+.\.venv\Scripts\python.exe -m medical_rag.ui.tenants add alice --generate   # 可选：关闭自动登录时手工建号
+.\.venv\Scripts\python.exe -m pytest tests/test_ui_auth.py tests/test_ui_demo.py tests/test_ui_state.py tests/test_ui_stats.py tests/test_ui_api_client.py tests/test_ui_data.py tests/test_ui_launcher.py -q
 .\.venv\Scripts\python.exe -m pytest tests/test_ui_app.py -q   # 需已装 streamlit，未装时跳过
 .\start-ui.cmd -Status               # 运行状态、健康检查与 RAG 后端可达性
 .\start-ui.cmd -Stop                 # 只停进程，保留 data/streamlit/ui-state.sqlite3（删除该文件才重置账号/指标/视图）
