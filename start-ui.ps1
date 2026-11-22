@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     启动/停止 medical-rag-resume 的 Streamlit 问答与指标控制台（本机 8501）。
 

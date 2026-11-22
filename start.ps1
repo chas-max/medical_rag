@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     一键启动 medical-rag-resume 的本机演示：RAG 后端 + 患者问答门户。
 
