@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     启动/停止 medical-rag-resume 的只读 Streamlit 展示界面（本机 8501）。
 
@@ -50,6 +50,12 @@
 
 .EXAMPLE
     .\start-ui.ps1 -Foreground
+
+.NOTES
+    Windows 的 .ps1 没有默认文件关联：在 cmd 里输入 .\start-ui.ps1 可能用记事本
+    打开文件而不执行。请改用 .\start-ui.cmd，或在 PowerShell 中显式运行：
+      pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-ui.ps1
+    cmd 入口 start-ui.cmd 会把参数（如 -Status、-Stop、-NoBrowser）原样传给本脚本。
 #>
 #Requires -Version 5.1
 [CmdletBinding()]

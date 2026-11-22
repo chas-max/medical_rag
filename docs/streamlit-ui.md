@@ -139,6 +139,18 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 
 ### 5.3 使用启动器 `start-ui.ps1`
 
+Windows 的 `.ps1` 没有默认文件关联：在 **cmd**（或双击）里执行 `.\start-ui.ps1`
+可能只是用记事本打开文件，而不是运行脚本。这种情况请用 `start-ui.cmd`，或在
+PowerShell 中显式调用解释器：
+
+```powershell
+.\start-ui.cmd                # cmd / 双击入口，参数原样转发给 start-ui.ps1
+.\start-ui.cmd -NoBrowser     # 其余参数同样可传给 .cmd
+pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-ui.ps1 -NoBrowser
+```
+
+也可以直接在 PowerShell 会话里运行 `.\start-ui.ps1`（PowerShell 会按脚本执行）：
+
 ```powershell
 .\start-ui.ps1                # 后台启动（默认 127.0.0.1:8501），就绪后打开浏览器
 .\start-ui.ps1 -Install       # 缺少 Streamlit 时允许用 uv 自动安装 .[ui] 依赖
@@ -152,6 +164,9 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 
 说明：
 
+- `start-ui.cmd` 只是 cmd/双击包装：它优先调用 `pwsh`，没有时回退到 Windows
+  PowerShell，并把 `-Install`、`-Status`、`-Stop`、`-NoBrowser`、`-Port` 等参数原样
+  传给 `start-ui.ps1`；
 - 启动器只接受本机回环绑定；端口已被**其他程序**占用时会直接报错并建议用 `-Port`
   换端口，不会结束来路不明的进程；
 - 后台启动后轮询 `/_stcore/health`，通过后打印地址、状态文件与日志路径；失败时输出
@@ -164,6 +179,7 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
 
 ```powershell
 .\start.ps1 -WithStreamlit
+.\start.cmd -WithStreamlit   # cmd / 双击入口（.ps1 关联问题见 5.3）
 ```
 
 在启动 RAG 答案服务之后，额外启动 `127.0.0.1:8501` 的展示界面（不自动打开该页面；
@@ -270,6 +286,7 @@ python -m ruff check src/medical_rag/ui tests/test_ui_state.py tests/test_ui_dat
 
 | 现象 | 排查 |
 |---|---|
+| 执行 `.\start-ui.ps1` 却用记事本/编辑器打开了文件，没有启动界面 | Windows 的 `.ps1` 文件关联问题，不是脚本错误。改用 `.\start-ui.cmd`，或在 PowerShell 里执行 `pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-ui.ps1`（参数同样可用）；`start.ps1` 也有同样的限制，用 `.\start.cmd` |
 | 启动时提示缺少 Streamlit（或 `ModuleNotFoundError: No module named 'streamlit'`） | 未安装可选依赖。按第 5.1 节手动安装，或用 `.\start-ui.ps1 -Install`（需要有 uv）；启动器会打印同样的安装提示 |
 | 端口 8501 被占用 | `Get-NetTCPConnection -LocalPort 8501 -State Listen` 或 `netstat -ano \| findstr :8501` 找到占用进程；换端口用 `--port` / `-Port`，不要结束来路不明的进程；`start-ui.ps1` 只会在确认是本项目界面进程时停止它 |
 | 页面能打开但会话/任务为空 | 确认 `data/chat-history.sqlite3` 存在且由 RAG 服务或 worker 产生过数据；确认 `CHAT_HISTORY_FILE` 指向正确文件；空库会显示空态而不是报错 |

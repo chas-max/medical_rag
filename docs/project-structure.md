@@ -17,7 +17,7 @@ medical-rag-resume/
 ├─ pyproject.toml               Python 包、依赖、pytest/ruff 配置
 ├─ .env.example                 环境变量示例（不提交实际 .env）
 ├─ start.cmd, start.ps1         一键启动本机演示（RAG + 患者门户）
-├─ start-ui.ps1                 Streamlit 持久化展示界面启动器（可选）
+├─ start-ui.cmd, start-ui.ps1   Streamlit 持久化展示界面启动器（可选；.cmd 为 cmd/双击入口）
 ├─ docker-compose.yml           本地 Milvus/RabbitMQ 等依赖
 ├─ docker-compose.gateway.yml   旧明文 HTTP 网关实验（未接入患者入口）
 ├─ docker-compose.patient-gateway.yml  独立患者 HTTPS 网关（仅网关容器）
@@ -156,10 +156,10 @@ npm --prefix frontend run build:patient
 
 # Streamlit 展示界面（可选）：首次用 uv 安装可选依赖，然后启动
 uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
-.\start-ui.ps1                       # 或 python -m medical_rag.ui / .\start.ps1 -WithStreamlit
+.\start-ui.cmd                       # cmd/双击入口；也可 python -m medical_rag.ui 或 .\start.ps1 -WithStreamlit
 .\.venv\Scripts\python.exe -m pytest tests/test_ui_state.py tests/test_ui_data.py tests/test_ui_launcher.py -q
-.\start-ui.ps1 -Status
-.\start-ui.ps1 -Stop                 # 只停进程，保留 data/streamlit/ui-state.sqlite3
+.\start-ui.cmd -Status
+.\start-ui.cmd -Stop                 # 只停进程，保留 data/streamlit/ui-state.sqlite3
 ```
 
 测试临时目录、缓存、覆盖率与前端测试报告已加入 `.gitignore`，可随时删除。

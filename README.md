@@ -75,8 +75,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\start.ps1
 
 ```powershell
 uv pip install --python .venv\Scripts\python.exe -e ".[ui]"   # 首次：安装 Streamlit 可选依赖
-.\start-ui.ps1                                                # 启动并打开 127.0.0.1:8501
+.\start-ui.cmd                                                # 启动并打开 127.0.0.1:8501
 ```
+
+Windows 的 `.ps1` 没有默认文件关联，在 **cmd**（或双击）里直接执行 `.\start-ui.ps1` 可能会用记事本打开文件而不运行。请用 `.\start-ui.cmd`，或在 PowerShell 中显式执行 `pwsh -NoProfile -ExecutionPolicy Bypass -File .\start-ui.ps1`；`start-ui.cmd` 会把 `-Status`、`-Stop`、`-NoBrowser` 等参数原样传给脚本。
 
 也可以直接运行 `.\.venv\Scripts\python.exe -m medical_rag.ui`，或在一键启动时追加 `-WithStreamlit`；需要容器运行时用 `docker compose -f docker-compose.streamlit.yml up -d`，停止用同文件 `down`。
 
