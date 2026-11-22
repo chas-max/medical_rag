@@ -216,6 +216,41 @@ npm --prefix frontend run build
 
 普通自动化测试应使用替身依赖，不应产生真实模型费用。真实模型、Milvus 和 RabbitMQ 的端到端测试需要单独准备环境，且可能产生费用。对比 HyDE 前后，应使用相同语料、索引、题集、模型和其他参数，分别记录 Recall@k、MRR、答案质量、证据不足时的拒答率、延迟及模型成本；尚未进行同口径比较，不能宣称 HyDE 已带来特定提升。
 
+### Ragas 评测（可选）
+
+主流语义指标可迁移到 [Ragas 0.4.4](https://github.com/vibrantlabsai/ragas/tree/v0.4.4)，本项目保留检索/生成编排与本地确定性指标。Ragas 与项目共用 `.env` 中的 `QWEN_API_KEY`、`QWEN_BASE_URL`、`QWEN_MODEL`（`qwen3.8-flash`），不需要第二个 Key。
+
+```powershell
+# 安装可选评测依赖；Ragas 依赖较重，普通运行/CI 不需要安装
+uv pip install -e ".[dev,ragas]"
+
+# 一次完成本地检索/生成 + Ragas；先写本地报告，Ragas 失败不会丢失本地结果
+python -m medical_rag.evaluate --dataset .\medical-health-v2-runtime.jsonl `
+  --manifest data/evaluations/medical-health-v2/manifest.json `
+  --output .\rag-report-v2.json --top-k 5 --ragas --ragas-limit 2 `
+  --ragas-metrics faithfulness,context_precision,context_recall,context_relevance,precision,recall
+
+# 只对已保存报告重跑 Ragas，不重新检索/生成；必须显式确认费用
+python -m medical_rag.ragas_evaluate `
+  --dataset outputs\evaluations\medical-health-v2\questions-runtime.jsonl `
+  --report outputs\evaluations\v10-eval\report-medical-answer-v10.json `
+  --output outputs\evaluations\v10-eval\report-ragas.json `
+  --allow-paid-model --limit 2 `
+  --metrics faithfulness,context_relevance,precision,recall
+```
+
+指标口径：
+
+- Ragas 计算 `id_based_context_precision` / `id_based_context_recall`（全部命中子块 ID 的精确集合指标）、`context_precision` / `context_recall`（带参考答案的语义指标）、`faithfulness`、`context_relevance`、`answer_relevancy`。
+- 语义指标使用与生成模型实际看到的 **父窗口去重上下文**；ID 指标使用 **全部命中子块 ID**。报告每个 Ragas 用例记录 `retrieval_hit_count` 与 `semantic_context_count`，可核对两套口径。
+- `MRR`、`MAP`、`NDCG@k`、`Core-Recall@k`、`Hit@k`、parent-window、post-RAG cited、拒答/干扰拒答与对话指标继续由本地平台计算；Ragas 0.4.4 没有内置 MRR/NDCG。
+- 统一结果在 `summary.headline`，来源在 `summary.metric_sources`；Ragas 明细在 `report["ragas"]`，单指标失败为 `null` 与固定错误码，不会写成 0。
+- 默认使用**中文对齐 prompt**（`ragas_prompts.py`，只替换 instruction，不动 JSON Schema 与评分代码）。上游英文 prompt 会让裁判模型对中文答案生成英文问题，而本地 BGE 是中文模型，跨语言相似度只有约 0.41，导致 `answer_relevancy` 系统性偏低。实测切换后 `answer_relevancy` 由 0.6678 升至 0.8090（配对 t=10.07，题级标准差降 61%），且好/中/差回答的排序仍正确。需要 A/B 时加 `--no-chinese-prompts` 回退上游 prompt。
+- 默认**重复采样 3 次取中位数**（`--ragas-repeats`，`1` 关闭）。裁判端点不接受有效 seed，同一输入单次打分会在 0.17–0.25 间跳动；取中位数后数据集均值的运行间波动从 0.0424 降到 0.0004。只对 LLM 判分指标重复，ID 精确指标恒定单次。代价是模型调用量 ×3、全量耗时约 50 分钟。
+- 瞬时网络错误会先在单轮采样内重试 3 次（认证/配置类错误不重试），避免并发下的断连被记成指标失败。
+- 默认 `faithfulness`、`context_relevance`、`answer_relevance` 由 Ragas 负责，本地 LLM judge 关闭以避免重复费用；需要同口径对比时加 `--keep-local-judge`。
+- `insufficient_evidence` 题不进入 Ragas 语义指标，拒答质量仍由本地指标评估。Ragas 模式会设置 `RAGAS_DO_NOT_TRACK=True`，并抑制 Ragas logger 向项目日志传播。
+
 **当前验证状态：** 2026-11-03，客服阶段广范围后端回归 1526 项通过、5 项跳过、344 项按条件排除、2 条既有依赖警告；后续测试诊断修正另有专项验证。已知的 500 题原文锚点映射失败仍明确排除，不能称为完整套件全通过。客服阶段实际 PostgreSQL 及受影响回归 256 项、实际 MFA 启动场景 1 项通过；控制端另复核 31 项支持与隐私测试。客服服务覆盖率 98%，新前端覆盖率 98.97%；导航加载竞态经测试先失败、修复后前端 210 项及 lint、两个构建通过，独立复审通过。虚构数据浏览器预览不是真实认证或全链路验收。此前双因素阶段实际 PostgreSQL 389 项、提供方等组合 90 项通过。参考密码＋动态验证码策略不是机构生产 MFA 认证。旧提供方登出测试的时钟边界误差已通过测试专用固定时钟修正，14 项纯测试及 85 项 PostgreSQL 测试通过，独立审查通过；生产鉴权规则未修改。患者网关阶段：专用严格 TOML/固定 nginx 渲染器与实际 nginx HTTPS→实际隔离应用/临时 PostgreSQL 套件 48 项通过（45 纯配置与 3 集成），纯模块覆盖率 97%，聚焦启动/Host/CSRF 73 项通过，scoped Ruff 通过；旧明文网关与患者应用未改动，该阶段仍只提供连接来源 IP 的开发准入，不是账号级限流或生产部署；独立复审结论为规范符合、质量通过，无 Critical/Important，7 项非阻断 Minor 已记录在实施进度。完整仓库仍有 41 项既有 Ruff 问题，两条依赖弃用警告未隐藏。详细命令、冻结范围与审查记录见 [实施进度](docs/security/progress.md) 及同目录报告；真实医院、临床、法律和生产准入尚未完成。
 
 复现实际 Keycloak 协议测试需 Docker 和报告指定的已缓存镜像，只创建并清理独立虚构数据环境；选中后缺少基础设施会失败，不会替换成模拟身份。测试环境的 `start-dev`/H2 不是生产部署方案。

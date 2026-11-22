@@ -30,3 +30,15 @@ python -m medical_rag.evaluate --dataset .\medical-health-v2-runtime.jsonl --man
 python data/evaluations/medical-health-v2/tools/export_for_judge.py --report .\rag-report-v2.json --dataset data/evaluations/medical-health-v2/questions.jsonl --output .\judge-input-v2.jsonl
 python data/evaluations/medical-health-v2/tools/aggregate_judges.py --dataset data/evaluations/medical-health-v2/questions.jsonl --judge-input .\judge-input-v2.jsonl --chatgpt .\chatgpt-judged.jsonl --claude .\claude-judged.jsonl --qoder .\qoder-judged.jsonl --output .\judge-summary-v2.json
 ```
+
+## Ragas 指标（可选）
+
+安装 `uv pip install -e ".[dev,ragas]"` 后，可在同一次运行中追加 Ragas，或只对已保存报告重跑：
+
+```powershell
+python -m medical_rag.evaluate --dataset .\medical-health-v2-runtime.jsonl --manifest data/evaluations/medical-health-v2/manifest.json --output .\rag-report-v2.json --top-k 5 --ragas --ragas-limit 2
+
+python -m medical_rag.ragas_evaluate --dataset .\medical-health-v2-runtime.jsonl --report .\rag-report-v2.json --output .\rag-report-v2-ragas.json --allow-paid-model --limit 2
+```
+
+Ragas 复用 `.env` 的 `QWEN_*`（`qwen3.8-flash`）。语义指标使用生成模型实际看到的父窗口去重上下文，ID 精确指标使用全部命中子块 ID；MRR、NDCG、MAP、Hit@k、Core-Recall、parent-window、post-RAG cited 与拒答指标仍由本地平台计算。30 道 `insufficient_evidence` 题不进入 Ragas 语义指标，仍由本地拒答指标评估。

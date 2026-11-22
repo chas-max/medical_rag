@@ -33,10 +33,21 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "pytest-cov>=5", "pytest-asyncio>=1.0", "pymupdf>=1.25", "ruff>=0.9"]
-# Optional local, read-only Streamlit viewer for persisted demo artifacts. It is
-# deliberately not part of the default install: CI and the serving processes do
-# not need pyarrow/altair, and the viewer must never be exposed as a service.
+# Optional local Streamlit console (tenant login, RAG Q&A, metrics). Deliberately
+# not part of the default install: CI and the serving processes do not need
+# pyarrow/altair, and the console must never be exposed as a service.
 ui = ["streamlit>=1.40,<2"]
+# Optional offline evaluation backend. Ragas does not pin langchain/instructor;
+# their current releases require openai>=2, while this project deliberately
+# pins openai<2. These are the last compatible 0.3.x/1.x lines.
+ragas = [
+    "ragas==0.4.4",
+    "langchain==0.3.27",
+    "langchain-core==0.3.86",
+    "langchain-community==0.3.28",
+    "langchain-openai==0.3.30",
+    "instructor==1.11.3",
+]
 
 [project.scripts]
 medical-rag-ui = "medical_rag.ui.launcher:main"
