@@ -1,7 +1,9 @@
-# 只读 Streamlit 展示界面的最小运行镜像。
+# Streamlit 问答/指标控制台的最小运行镜像。
 #
-# 刻意不安装 torch / sentence-transformers / 项目其余依赖：界面只读取既有
-# data/ 与 outputs/ 产物做展示，不参与检索、推理或写库。-slim 基础镜像 +
+# 刻意不安装 torch / sentence-transformers / 项目其余依赖：界面只调用 RAG 后端
+# 的 HTTP API 并读取既有 data/ 与 outputs/ 产物做展示，不参与检索或推理。
+# 注意：容器内 127.0.0.1 指向容器自身，而 RAG 后端只接受回环来源，因此容器版
+# 无法完成真实问答；它适合离线查看已持久化的指标与评测报告。-slim 基础镜像 +
 # 纯 wheel 依赖已经够用，无需 build-essential/gcc。
 FROM python:3.11-slim
 
@@ -18,9 +20,11 @@ ENV PYTHONPATH=/app/src \
 
 WORKDIR /app
 
-# 仅最小运行依赖（streamlit 及其必需运行时），全部有官方 wheel。
+# 仅最小运行依赖：Streamlit 自带 pandas，应用另需 httpx（后端调用）与
+# pydantic-settings/loguru（项目配置/日志）。
 RUN pip install --no-cache-dir \
         "streamlit>=1.40,<2" \
+        "httpx>=0.27,<0.29" \
         "pydantic-settings>=2" \
         "loguru>=0.7"
 

@@ -1,18 +1,19 @@
 <#
 .SYNOPSIS
-    启动/停止 medical-rag-resume 的只读 Streamlit 展示界面（本机 8501）。
+    启动/停止 medical-rag-resume 的 Streamlit 问答与指标控制台（本机 8501）。
 
 .DESCRIPTION
-    单一入口：只启动只读的 Streamlit 展示界面，读取既有演示产物
-    （data\chat-history.sqlite3 里的会话、outputs\reports 里的评测报告），
-    不写问答库，也不连接患者 PostgreSQL。
+    单一入口：启动租户登录的 Streamlit 控制台，包含 RAG 问答页（连接本机
+    RAG 后端 http://127.0.0.1:8001）和数据统计页（多版本检索指标、延迟、
+    吞吐、任务进程）。问答需要后端与检索依赖已就绪：请先运行 .\start.ps1；
+    后端未启动时界面仍可登录并查看本地已持久化的指标与评测报告。
 
-    界面自身状态（页面、上次选择、操作员备注）持久化到
-    data\streamlit\ui-state.sqlite3（可通过环境变量 UI_STATE_FILE 覆盖），
-    因此重启后仍停在原位置。
+    租户账号、会话映射、问答指标与界面视图状态持久化到
+    data\streamlit\ui-state.sqlite3（可通过环境变量 UI_STATE_FILE 覆盖）。
+    该登录只隔离界面层数据，不是 RAG 后端的身份认证。
 
     安全边界：只绑定 127.0.0.1，不得转发、不得接入反向代理、不得处理真实
-    患者数据。界面只读，不会写会话库或评测报告。
+    患者数据；RAG 后端必须是本机 unsafe-local-demo，界面不写问答库。
 
 .PARAMETER Stop
     停止本脚本启动的 Streamlit 进程（校验命令行匹配 medical_rag|streamlit）。
@@ -83,6 +84,7 @@ $StdOutLog  = Join-Path $LogDir 'streamlit-ui.log'
 $StdErrLog  = Join-Path $LogDir 'streamlit-ui.err.log'
 $UiUrl      = "http://127.0.0.1:$Port"
 $HealthUrl  = "$UiUrl/_stcore/health"
+$BackendHealthUrl = 'http://127.0.0.1:8001/health'
 $DefaultStateFile = Join-Path $Root 'data\streamlit\ui-state.sqlite3'
 $InstallCommand = 'uv pip install --python .venv\Scripts\python.exe -e ".[ui]"'
 
@@ -198,6 +200,21 @@ function Wait-StreamlitHealth {
     return (Test-StreamlitHealth -Url $HealthUrl)
 }
 
+# RAG 后端（默认本机 8001）是问答页的数据源；没有它界面仍可登录并查看历史指标，
+# 但无法完成问答。这里只做只读探测，不影响启动结果。
+function Test-RagBackend {
+    try {
+        $request = [System.Net.HttpWebRequest]::Create($BackendHealthUrl)
+        $request.Proxy = $null
+        $request.Timeout = 2000
+        $request.ReadWriteTimeout = 2000
+        $request.Method = 'GET'
+        $response = $request.GetResponse()
+        try { return ([int]$response.StatusCode -eq 200) } finally { $response.Close() }
+    }
+    catch { return $false }
+}
+
 function Resolve-StateFile {
     $fromEnv = [string]$env:UI_STATE_FILE
     if ($fromEnv -and $fromEnv.Trim()) {
@@ -220,7 +237,7 @@ function Assert-Python {
 }
 
 function Assert-Streamlit {
-    & $Python -c 'import streamlit' 2>$null
+    & $Python -c 'import streamlit, httpx, pandas' 2>$null
     if ($LASTEXITCODE -eq 0) {
         Write-Ok 'Streamlit 依赖可导入'
         return
@@ -291,19 +308,24 @@ function Show-StreamlitInfo {
     param([int]$ProcessId)
     $stateFile = Resolve-StateFile
     Write-Host ''
-    Write-Ok "Streamlit 展示界面已就绪 (PID $ProcessId)"
+    Write-Ok "Streamlit 问答/指标控制台已就绪 (PID $ProcessId)"
     Write-Host '  地址: ' -NoNewline
     Write-Host $UiUrl -ForegroundColor White
     Write-Host '  界面状态（持久化）: ' -NoNewline
     Write-Host $stateFile -ForegroundColor Gray
     Write-Host '  日志: outputs\logs\streamlit-ui.log (错误: streamlit-ui.err.log)' -ForegroundColor Gray
+    if (Test-RagBackend) {
+        Write-Ok 'RAG 后端 (127.0.0.1:8001) 可访问'
+    } else {
+        Write-Warn '未检测到 RAG 后端 (127.0.0.1:8001)：问答页会提示后端不可用；请先运行 .\start.ps1'
+    }
     Write-Host '  停止: .\start-ui.ps1 -Stop' -ForegroundColor Gray
     Write-Host ''
-    Write-Host '  仅限本机只读展示，禁止转发或处理真实患者数据。' -ForegroundColor Yellow
+    Write-Host '  仅限本机演示，禁止转发或处理真实患者数据。' -ForegroundColor Yellow
 }
 
 function Show-StreamlitStatus {
-    Write-Step 'Streamlit 展示界面状态'
+    Write-Step 'Streamlit 控制台状态'
     $stateFile = Resolve-StateFile
     $running = $null
 
@@ -341,11 +363,16 @@ function Show-StreamlitStatus {
         Write-Host '  健康检查: 未通过（进程可能仍在启动）' -ForegroundColor Yellow
     }
     Write-Host "  界面状态: $stateFile" -ForegroundColor Gray
+    if (Test-RagBackend) {
+        Write-Host '  RAG 后端 (127.0.0.1:8001): 可访问' -ForegroundColor Green
+    } else {
+        Write-Host '  RAG 后端 (127.0.0.1:8001): 不可访问（问答不可用，先运行 .\start.ps1）' -ForegroundColor Yellow
+    }
     Write-Host '  停止命令: .\start-ui.ps1 -Stop' -ForegroundColor Gray
 }
 
 function Stop-StreamlitUi {
-    Write-Step '停止 Streamlit 展示界面'
+    Write-Step '停止 Streamlit 控制台'
     $stopped = 0
 
     $saved = Get-SavedProcessId
@@ -355,11 +382,11 @@ function Stop-StreamlitUi {
             Write-Info "PID 文件指向的进程已不在运行 (PID $saved)"
         }
         elseif (Test-StreamlitProcess -CommandLine (Get-CommandLine -ProcessId $saved)) {
-            Stop-ProcessTree -ProcessId $saved -Label 'Streamlit 展示界面'
+            Stop-ProcessTree -ProcessId $saved -Label 'Streamlit 控制台'
             $stopped++
         }
         else {
-            Write-Warn "PID 文件指向的进程不是 Streamlit 展示界面，忽略 (PID $saved)"
+            Write-Warn "PID 文件指向的进程不是 Streamlit 控制台，忽略 (PID $saved)"
         }
         Remove-PidFile
     }
@@ -368,15 +395,15 @@ function Stop-StreamlitUi {
     if ($listener) {
         $cmd = Get-CommandLine -ProcessId $listener
         if (Test-StreamlitProcess -CommandLine $cmd) {
-            Stop-ProcessTree -ProcessId $listener -Label 'Streamlit 展示界面 (端口残留)'
+            Stop-ProcessTree -ProcessId $listener -Label 'Streamlit 控制台 (端口残留)'
             $stopped++
         } else {
             Write-Warn "端口 $Port 被其他进程占用 (PID $listener)，未自动结束"
         }
     }
 
-    if ($stopped -eq 0) { Write-Info '没有发现正在运行的 Streamlit 展示界面' }
-    else { Write-Ok 'Streamlit 展示界面已停止' }
+    if ($stopped -eq 0) { Write-Info '没有发现正在运行的 Streamlit 控制台' }
+    else { Write-Ok 'Streamlit 控制台已停止' }
 }
 
 # ---------- 主流程 ----------
@@ -390,7 +417,7 @@ if ($Status) {
 }
 
 try {
-    Write-Host '医疗资料 RAG 问答 — Streamlit 只读展示界面' -ForegroundColor White
+    Write-Host '医疗资料 RAG 问答 — Streamlit 问答/指标控制台' -ForegroundColor White
     Write-Host "项目目录: $Root" -ForegroundColor DarkGray
     Write-Host "监听地址: $UiUrl （仅本机）" -ForegroundColor DarkGray
 
@@ -408,7 +435,7 @@ try {
             exit 0
         }
         Write-Warn '现有进程未通过健康检查，清理后重新启动'
-        Stop-ProcessTree -ProcessId $running -Label 'Streamlit 展示界面 (无响应)'
+        Stop-ProcessTree -ProcessId $running -Label 'Streamlit 控制台 (无响应)'
         Remove-PidFile
     }
 
@@ -429,7 +456,7 @@ try {
                    '--host', '127.0.0.1', '--port', "$Port", '--no-browser')
 
     if ($Foreground) {
-        Write-Step '前台运行 Streamlit 展示界面'
+        Write-Step '前台运行 Streamlit 控制台'
         Write-Info 'Ctrl+C 停止；前台模式不会自动打开浏览器'
         Write-Host "  地址: $UiUrl" -ForegroundColor White
         Write-Host "  界面状态: $stateFile" -ForegroundColor Gray
@@ -437,7 +464,7 @@ try {
         exit $LASTEXITCODE
     }
 
-    Write-Step '启动 Streamlit 展示界面'
+    Write-Step '启动 Streamlit 控制台'
     Write-Info '后台运行，日志: outputs\logs\streamlit-ui.log'
     $proc = Start-Process -FilePath $Python `
                           -ArgumentList $arguments `
@@ -446,7 +473,7 @@ try {
                           -RedirectStandardError $StdErrLog `
                           -WindowStyle Hidden `
                           -PassThru
-    if (-not $proc) { throw '无法启动 Streamlit 展示界面进程' }
+    if (-not $proc) { throw '无法启动 Streamlit 控制台进程' }
     Save-PidFile -ProcessId $proc.Id
     Write-Info "PID $($proc.Id)，等待健康检查 /_stcore/health（最多 $TimeoutSeconds 秒）"
 
@@ -458,7 +485,7 @@ try {
         $tail += Get-Content -Path $StdOutLog -Tail 25 -ErrorAction SilentlyContinue
         if ($tail) { $tail | ForEach-Object { Write-Host "      $_" -ForegroundColor DarkGray } }
         Write-Info '完整日志: outputs\logs\streamlit-ui.log / streamlit-ui.err.log'
-        Stop-ProcessTree -ProcessId $proc.Id -Label 'Streamlit 展示界面 (启动失败)'
+        Stop-ProcessTree -ProcessId $proc.Id -Label 'Streamlit 控制台 (启动失败)'
         Remove-PidFile
         exit 1
     }

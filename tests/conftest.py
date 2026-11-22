@@ -78,6 +78,10 @@ def isolated_chat_history(tmp_path, monkeypatch):
     # for any test that constructs Settings or launches the app.
     monkeypatch.setenv("UI_STATE_FILE", str(tmp_path / "ui-state.sqlite3"))
     monkeypatch.setenv("UI_REPORT_DIRS", str(tmp_path / "reports"))
+    # Keep the Streamlit console tests deterministic: a real backend must not be
+    # reachable unless the test explicitly provides a fake loopback server.
+    monkeypatch.setenv("UI_API_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("UI_REQUEST_TIMEOUT_SECONDS", "2")
     monkeypatch.setenv("MEMORY_EPISODES_DIR", str(tmp_path / "episodes"))
     monkeypatch.setenv("DOCUMENT_UPLOADS_DIR", str(tmp_path / "uploads"))
     # The operator's .env may turn the continuous-follow-up path on for the local

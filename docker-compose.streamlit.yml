@@ -1,12 +1,17 @@
-# 持久运行的只读 Streamlit 展示界面（medical_rag.ui）。
+# 持久运行的 Streamlit 问答/指标控制台（medical_rag.ui）。
 #
 # 安全与持久化边界（全部只在本机演示环境使用）：
 # - 仅回环：ports 只绑定 127.0.0.1，不暴露到局域网或公网；
 # - 数据只读：./data 与 ./outputs 以 :ro 挂载，界面不能写问答库/报告；
 # - 状态持久化：用命名卷 medical_rag_ui_state 覆盖 /app/data/streamlit，
-#   界面自身状态（页面、上次选择、备注）跨容器重建仍保留；
+#   界面自身状态（租户账号、会话映射、问答指标、视图状态）跨容器重建仍保留；
 # - restart: unless-stopped + healthcheck 让界面在崩溃/重启后自动恢复；
 # - 根文件系统只读、tmpfs /tmp、cap_drop ALL、no-new-privileges 收窄权限。
+#
+# 注意（问答限制）：RAG 后端只接受回环来源，容器内的 127.0.0.1 指向容器自身，
+# 因此容器方式下“智能问答”连不到宿主机后端（健康探测与聊天都会提示不可用）；
+# 容器版适合离线查看已持久化的指标与评测报告。需要真实问答请在宿主机运行
+# .\start-ui.cmd 或 python -m medical_rag.ui。
 services:
   medical-rag-ui:
     build:

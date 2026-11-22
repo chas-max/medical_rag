@@ -82,14 +82,23 @@ class Settings(BaseSettings):
     log_retention: str = "14 days"
     log_compression: str = "zip"
     log_json: bool = False
-    # 本机只读 Streamlit 展示界面：它不改问答数据，只把界面自己的视图状态
-    # （当前页面、上次选中的会话/报告、操作员笔记）持久化到这个 SQLite 文件。
-    # 默认路径相对项目目录；重启界面后按状态文件恢复上次视图。
+    # 本机 Streamlit 问答/指标控制台：它不改问答数据，只把租户账号、界面视图、
+    # 租户会话映射与每次问答的耗时指标持久化到这个 SQLite 文件（见 ui 文档）。
     ui_state_file: str = "data/streamlit/ui-state.sqlite3"
     # 评测报告是普通 JSON；界面只读扫描这些目录（逗号分隔），按修改时间倒序展示。
     ui_report_dirs: str = "outputs/reports"
     # 概览页只对本机回环的 RAG /health 做只读探测；非回环地址会被界面拒绝。
     ui_api_base_url: str = "http://127.0.0.1:8001"
+    # Streamlit 问答界面通过 HTTP 调用本机 RAG 服务；超时覆盖完整的检索/生成。
+    ui_request_timeout_seconds: float = Field(default=120.0, gt=0, le=600)
+    # 默认走 /chat/runs/stream（SSE 流式）；后端不支持流式时可在界面关闭。
+    ui_stream_enabled: bool = True
+    ui_top_k: int = Field(default=5, ge=1, le=20)
+    # 界面登录会话的空闲有效期（每次操作滑动续期）；超时后需重新登录。
+    ui_session_timeout_minutes: int = Field(default=480, ge=5, le=10080)
+    # 同一用户名连续失败达到上限后锁定一段时间，避免在线爆破。
+    ui_login_max_attempts: int = Field(default=5, ge=1, le=20)
+    ui_login_lockout_seconds: int = Field(default=300, ge=30, le=3600)
 
     @model_validator(mode="after")
     def _validate_chunking(self) -> "Settings":

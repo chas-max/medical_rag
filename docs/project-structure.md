@@ -16,18 +16,19 @@ medical-rag-resume/
 ├─ README.md                    项目说明、启动与安全状态
 ├─ pyproject.toml               Python 包、依赖、pytest/ruff 配置
 ├─ .env.example                 环境变量示例（不提交实际 .env）
+├─ .streamlit/config.toml       Streamlit 控制台本地主题（DeepSeek 风格浅色）
 ├─ start.cmd, start.ps1         一键启动本机演示（RAG + 患者门户）
-├─ start-ui.cmd, start-ui.ps1   Streamlit 持久化展示界面启动器（可选；.cmd 为 cmd/双击入口）
+├─ start-ui.cmd, start-ui.ps1   Streamlit 问答与指标控制台启动器（可选；.cmd 为 cmd/双击入口）
 ├─ docker-compose.yml           本地 Milvus/RabbitMQ 等依赖
 ├─ docker-compose.gateway.yml   旧明文 HTTP 网关实验（未接入患者入口）
 ├─ docker-compose.patient-gateway.yml  独立患者 HTTPS 网关（仅网关容器）
-├─ docker-compose.streamlit.yml Streamlit 展示界面容器（仅回环 8501、只读挂载）
+├─ docker-compose.streamlit.yml Streamlit 控制台容器（仅回环 8501；容器内问答不可用）
 ├─ src/medical_rag/             后端 Python 包
 ├─ tests/                       后端单元/集成/安全测试
 ├─ frontend/                    React 前端（旧聊天界面 + 患者独立入口）
 ├─ workflows/                   可编排工作流 JSON 定义
 ├─ database/                    患者隔离 PostgreSQL 迁移与授权脚本
-├─ deploy/                      网关、身份策略、患者配置示例
+├─ deploy/                      网关、身份策略、患者配置与 Streamlit 容器示例
 ├─ docs/                        安全需求、报告、进度与复审记录
 ├─ data/                        公开语料、评测集与本地运行数据
 └─ outputs/                     运行日志与验收证据（gitignore）
@@ -65,12 +66,20 @@ src/medical_rag/
 ├─ 配置与设置
 │  └─ config.py, settings_store.py, logging_setup.py
 ├─ 展示界面（可选）
-│  └─ ui/                      Streamlit 只读展示界面
+│  └─ ui/                      Streamlit 租户问答与指标控制台
 │     ├─ __init__.py
-│     ├─ app.py                页面与视图（概览/会话/任务/报告/笔记）
-│     ├─ data.py               只读数据访问（SQLite mode=ro、报告 JSON 扫描）
-│     ├─ state.py              界面状态持久化（ui_state/ui_notes）
-│     └─ launcher.py           启动器（默认 127.0.0.1:8501，参数解析）
+│     ├─ __main__.py            `python -m medical_rag.ui` 入口
+│     ├─ app.py                登录门、侧边栏、页面路由与租户会话校验
+│     ├─ chat_page.py          问答页：SSE 流式、引用资料、运行轨迹、会话删除
+│     ├─ stats_page.py         数据统计页：多版本指标、延迟/吞吐、任务与入库
+│     ├─ api_client.py         后端 HTTP/SSE 客户端（回环校验、错误码映射）
+│     ├─ auth.py               租户账号、scrypt 口令哈希、登录锁定
+│     ├─ tenants.py            租户账号管理 CLI
+│     ├─ stats.py              问答指标存储与聚合、评测报告多版本对比
+│     ├─ state.py              视图状态与租户会话映射
+│     ├─ storage.py            界面状态库 SQLite 基类
+│     ├─ data.py               评测报告 JSON 扫描与只读数据辅助
+│     └─ launcher.py           启动器（仅回环、参数解析、拉起 Streamlit）
 └─ workflow/                    工作流引擎与节点
    ├─ engine.py, definition.py, contracts.py, validator.py
    ├─ repository.py, registry.py, run_schema.py, bootstrap.py
@@ -86,7 +95,7 @@ src/medical_rag/
 
 ```text
 tests/
-├─ test_*.py                    单元测试与安全/患者/网关测试（99 个测试文件）
+├─ test_*.py                    单元测试与安全/患者/网关测试（数量以目录实际文件为准）
 ├─ conftest.py                  共享 fixture
 ├─ document_helpers.py          文档构造辅助
 ├─ keycloak_*.py                实际 Keycloak 运行时/表单/MFA/运维辅助
@@ -129,11 +138,11 @@ deploy/
 ├─ identity/                    Keycloak MFA 策略片段与接入说明
 ├─ patient/                     患者应用 TOML/密钥配置示例
 ├─ patient-gateway/             独立患者 nginx 网关配置、启动脚本、运维 README
-└─ streamlit/                   Streamlit 展示界面容器（Dockerfile）
+└─ streamlit/                   Streamlit 控制台容器（Dockerfile；容器内问答不可用）
 
 docs/
 ├─ project-structure.md         本文件
-├─ streamlit-ui.md              Streamlit 只读展示界面：目标、只读保证、启动与排障
+├─ streamlit-ui.md              Streamlit 租户问答与指标控制台：架构、租户/CLI、启动与排障
 └─ security/
    ├─ progress.md               任务进度与验收记录
    ├─ production-readiness.md   生产准入清单（未批准）
@@ -154,12 +163,15 @@ npm --prefix frontend run lint
 npm --prefix frontend run build
 npm --prefix frontend run build:patient
 
-# Streamlit 展示界面（可选）：首次用 uv 安装可选依赖，然后启动
+# Streamlit 问答与指标控制台（可选）：先启动 RAG 后端，再装可选依赖并启动
+.\start.ps1                          # 终端 1：本机 RAG 后端（127.0.0.1:8001，unsafe-local-demo），否则问答不可用
 uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
-.\start-ui.cmd                       # cmd/双击入口；也可 python -m medical_rag.ui 或 .\start.ps1 -WithStreamlit
-.\.venv\Scripts\python.exe -m pytest tests/test_ui_state.py tests/test_ui_data.py tests/test_ui_launcher.py -q
-.\start-ui.cmd -Status
-.\start-ui.cmd -Stop                 # 只停进程，保留 data/streamlit/ui-state.sqlite3
+.\start-ui.cmd                       # 终端 2：cmd/双击入口；也可 python -m medical_rag.ui 或 .\start.ps1 -WithStreamlit
+.\.venv\Scripts\python.exe -m medical_rag.ui.tenants add alice --generate   # 新建租户（或登录页创建演示租户）
+.\.venv\Scripts\python.exe -m pytest tests/test_ui_auth.py tests/test_ui_state.py tests/test_ui_stats.py tests/test_ui_api_client.py tests/test_ui_data.py tests/test_ui_launcher.py -q
+.\.venv\Scripts\python.exe -m pytest tests/test_ui_app.py -q   # 需已装 streamlit，未装时跳过
+.\start-ui.cmd -Status               # 运行状态、健康检查与 RAG 后端可达性
+.\start-ui.cmd -Stop                 # 只停进程，保留 data/streamlit/ui-state.sqlite3（删除该文件才重置账号/指标/视图）
 ```
 
 测试临时目录、缓存、覆盖率与前端测试报告已加入 `.gitignore`，可随时删除。

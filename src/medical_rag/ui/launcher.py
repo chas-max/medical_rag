@@ -1,9 +1,9 @@
-"""Launcher for the persistent Streamlit viewer: ``python -m medical_rag.ui``.
+"""Launcher for the Streamlit console: ``python -m medical_rag.ui``.
 
-Streamlit's CLI is invoked in-process so the viewer inherits this project's
+Streamlit's CLI is invoked in-process so the console inherits this project's
 environment resolution (``.env`` relative paths, ``UI_*`` settings) and so a
 mistyped option fails with one clear message instead of a stack trace. The
-viewer is a local operations page: non-loopback hosts are rejected on purpose.
+console is a local operations page: non-loopback hosts are rejected on purpose.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ def parser() -> argparse.ArgumentParser:
     """Command line options; every path override is only an environment override."""
     result = argparse.ArgumentParser(
         prog="python -m medical_rag.ui",
-        description="本机只读的 Streamlit 持久化展示界面（会话历史、文档任务、评测报告）",
+        description="本机 Streamlit RAG 问答与指标控制台（租户登录、任务进程、多版本指标）",
     )
     result.add_argument("--host", default="127.0.0.1",
                         help="监听地址，仅允许回环地址（默认 127.0.0.1）")
@@ -57,7 +57,7 @@ def parser() -> argparse.ArgumentParser:
 def validate_options(args: argparse.Namespace) -> None:
     """Reject combinations the viewer must never run, before importing Streamlit."""
     if args.host not in LOOPBACK_HOSTS:
-        raise ValueError("展示界面只允许绑定本机回环地址（127.0.0.1 / localhost / ::1）")
+        raise ValueError("控制台只允许绑定本机回环地址（127.0.0.1 / localhost / ::1）")
     if not 1 <= args.port <= 65535:
         raise ValueError("端口必须在 1 到 65535 之间")
     for name, value in (("--state-file", args.state_file),
@@ -128,7 +128,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         os.environ[name] = value
 
     url = f"http://{args.host}:{args.port}"
-    print("medical-rag Streamlit 展示界面")
+    print("medical-rag Streamlit 问答与指标控制台")
     print(f"  地址: {url}")
     print(f"  状态文件: {args.state_file or os.environ.get('UI_STATE_FILE') or DEFAULT_STATE_FILE}")
     print(f"  会话数据库(只读): {args.history_file or os.environ.get('CHAT_HISTORY_FILE') or DEFAULT_HISTORY_FILE}")

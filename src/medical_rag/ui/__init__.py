@@ -1,8 +1,9 @@
-"""Persistent, read-only Streamlit viewer for local demonstration artifacts.
+"""Tenant-gated Streamlit console for the local medical RAG project.
 
-The viewer never writes to the chat database. It persists only its own UI state
-(page, last selection, notes) so a restarted process reopens where the operator
-left off; see :mod:`medical_rag.ui.state`.
+The console calls the loopback RAG backend for grounded answers, keeps tenant
+accounts/session mappings and per-turn telemetry in a local SQLite database, and
+renders multi-version evaluation metrics plus latency/throughput charts. The
+login gate is an application-level feature, not backend authentication.
 """
 
-__all__ = ["app", "data", "launcher", "state"]
+__all__ = ["api_client", "app", "auth", "data", "launcher", "state", "stats", "storage"]
