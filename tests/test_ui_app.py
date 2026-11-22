@@ -20,9 +20,11 @@ PASSWORD = "demo-pass-123"
 class _FakeBackend:
     """Minimal loopback RAG API: /health, conversations and SSE chat."""
 
-    def __init__(self) -> None:
+    def __init__(self, health: dict | None = None) -> None:
         self.conversations: dict[str, dict] = {}
         self.requests: list[tuple[str, str]] = []
+        self.health = health or {"status": "ok", "milvus": True,
+                                 "messaging": {"status": "ok"}}
         outer = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -43,9 +45,7 @@ class _FakeBackend:
                 outer.requests.append(("GET", self.path))
                 path = self.path.split("?")[0]
                 if path == "/health":
-                    self._json(200, {"success": True, "data": {
-                        "status": "ok", "milvus": True, "messaging": {"status": "ok"}},
-                        "error": None})
+                    self._json(200, {"success": True, "data": outer.health, "error": None})
                 elif path == "/conversations":
                     self._json(200, {"success": True, "data": list(outer.conversations.values()),
                                      "error": None})
@@ -222,6 +222,34 @@ def test_login_loads_chat_page_and_sidebar_navigation(tmp_path, monkeypatch):
     # Backend is not running in this test: chat page must warn, not crash.
     assert any("无法读取会话历史" in item.value for item in at.warning)
     assert not at.exception
+
+
+def test_sidebar_explains_uninitialized_backend(tmp_path, monkeypatch):
+    """Lazy backend warm-up must not be presented as "Milvus unavailable"."""
+    _prepare(tmp_path, monkeypatch)
+    backend = _FakeBackend(health={"status": "uninitialized", "milvus": False})
+    monkeypatch.setenv("UI_API_BASE_URL", backend.base_url)
+    try:
+        at = _login(_app())
+        assert not at.exception
+        assert any("待首个请求初始化" in item.value for item in at.sidebar.caption)
+        assert not any("Milvus 不可用" in item.value for item in at.sidebar.caption)
+    finally:
+        backend.close()
+
+
+def test_sidebar_explains_reranker_degradation(tmp_path, monkeypatch):
+    _prepare(tmp_path, monkeypatch)
+    backend = _FakeBackend(health={"status": "ok", "milvus": True,
+                                   "reranker_available": False,
+                                   "reranker_retry_in_seconds": 30})
+    monkeypatch.setenv("UI_API_BASE_URL", backend.base_url)
+    try:
+        at = _login(_app())
+        assert not at.exception
+        assert any("重排模型降级" in item.value for item in at.sidebar.caption)
+    finally:
+        backend.close()
 
 
 def test_buttons_switch_to_stats_page(tmp_path, monkeypatch):

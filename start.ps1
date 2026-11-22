@@ -511,6 +511,14 @@ function Start-LegacyApi {
     }
 
     $env:MEDICAL_RAG_ACCESS_MODE = $AccessMode
+    # 本机显存/内存紧张时 bge-reranker-v2-m3 可能在 PyTorch 分配阶段 OOM，降级成词面
+    # 分数后证据门控会直接拒答（ABSTAIN_DEGRADED）。限制 BLAS/OpenMP 线程并开启
+    # CUDA 可扩展段，降低重排模型的峰值内存与碎片。
+    $env:OMP_NUM_THREADS = '2'
+    $env:MKL_NUM_THREADS = '2'
+    $env:OPENBLAS_NUM_THREADS = '2'
+    $env:TOKENIZERS_PARALLELISM = 'false'
+    $env:PYTORCH_CUDA_ALLOC_CONF = 'expandable_segments:True'
     $null = Start-BackgroundProcess -Name 'api' `
         -Description 'RAG API (uvicorn)' `
         -Arguments @('-m', 'medical_rag.api_server',

@@ -90,6 +90,29 @@ def _stores(settings: Settings) -> tuple[TenantStore, UiStateStore, QueryMetrics
             QueryMetricsStore(settings.ui_state_file))
 
 
+def _health_caption(health: dict) -> str:
+    """Explain backend health without misreading lazy initialization as Milvus down.
+
+    The RAG API deliberately does not load Milvus or the local models at startup, so
+    ``/health`` reports ``status=uninitialized`` and ``milvus=false`` until the first
+    retrieval. That is a normal warm-up state and must not be presented as an outage.
+    """
+    if not health.get("ok"):
+        return "🔴 后端不可用（问答需先启动 start.ps1）"
+    status = health.get("status") if isinstance(health.get("status"), dict) else {}
+    if status.get("status") == "uninitialized":
+        return "🟢 后端在线 · 服务待首个请求初始化（Milvus/重排状态随后建立）"
+    if not status.get("milvus"):
+        return "🟡 后端在线 · Milvus 不可用（检查 docker compose 与 MILVUS_URI）"
+    if status.get("reranker_available") is False:
+        retry = status.get("reranker_retry_in_seconds")
+        suffix = (f"，约 {int(retry)} 秒后自动重试"
+                  if isinstance(retry, (int, float)) and retry else "")
+        return ("🟢 后端在线 · Milvus 可用 · 重排模型降级（显存/内存压力，"
+                f"回答可能被证据门控拒答{suffix}）")
+    return "🟢 后端在线 · Milvus/重排可用"
+
+
 # -- authentication ---------------------------------------------------------
 def _session_timeout(settings: Settings) -> float:
     return float(settings.ui_session_timeout_minutes) * 60.0
@@ -308,11 +331,7 @@ def _sidebar(settings: Settings, tenant: dict, client: RagApiClient,
         st.caption(f"租户：{tenant['display_name']} · @{tenant['username']}")
         health = _backend_health(settings.ui_api_base_url,
                                  settings.ui_request_timeout_seconds, settings.ui_top_k)
-        if health.get("ok"):
-            st.caption("🟢 后端在线 · Milvus " + ("可用" if health.get("status", {}).get("milvus")
-                                                else "不可用"))
-        else:
-            st.caption("🔴 后端不可用（问答需先启动 start.ps1）")
+        st.caption(_health_caption(health))
         st.divider()
 
         if st.button("＋ 新对话", type="primary", use_container_width=True, key="new-chat"):

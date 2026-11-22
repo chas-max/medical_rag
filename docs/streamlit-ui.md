@@ -97,8 +97,12 @@ uv pip install --python .venv\Scripts\python.exe -e ".[ui]"
   `UI_STATE_FILE` 路径与权限；配置非法时提示检查 `.env`。
 
 ### 4.2 侧边栏
-- 顶部显示当前租户（显示名 · @用户名）与后端健康状态（`GET /health`，缓存 10 秒）：在线时进一步
-  显示 Milvus 是否可用，离线时提示「问答需先启动 start.ps1」。
+- 顶部显示当前租户（显示名 · @用户名）与后端健康状态（`GET /health`，缓存 10 秒）。状态文案区分
+  四种情况：后端不可用（提示「问答需先启动 start.ps1」）；**服务待首个请求初始化**（后端刻意懒加载
+  Milvus 与本地模型，尚未处理过检索时 `/health` 返回 `status=uninitialized` 且 `milvus=false`，这是
+  正常的预热状态，不代表 Milvus 故障）；Milvus 不可用（需检查 `docker compose` 与 `MILVUS_URI`）；
+  重排模型降级（`reranker_available=false`，通常由显存/内存压力触发，回答可能被证据门控拒答，
+  会显示自动重试秒数）。
 - **「＋ 新对话」**：创建会话 ID、写入 `ui_chat_sessions`、记录上次会话，并切到智能问答。
 - **「💬 智能问答 / 📊 数据统计」**：按钮切换页面、当前页高亮，选择写入 `ui_state`（`ui.page`），
   进程重启后恢复。
@@ -371,6 +375,8 @@ Invoke-RestMethod http://127.0.0.1:8001/health
 | 问答页提示「无法连接 RAG 服务」 | 后端未启动或未以 `unsafe-local-demo` 运行。先在仓库根运行 `.\start.ps1`；确认 `http://127.0.0.1:8001/health` 可用；`.\start-ui.ps1 -Status` 会显示后端可达性 |
 | 后端返回 503 / `SECURITY_NOT_READY` | 后端处于 `locked` 模式，业务接口全部关闭；用 `start.ps1` 以 `unsafe-local-demo` 启动，仅限本机虚构数据 |
 | 能登录但提问报依赖错误 | Milvus 未就绪或 `.env` 未配置模型 Key；检查 `docker compose up -d` 与 `QWEN_*`/`DEEPSEEK_*` 配置 |
+| 侧栏刚启动显示「服务待首个请求初始化」，或 `GET /health` 里 `milvus:false` | 后端是懒加载：启动时不连 Milvus、不加载 BGE 模型，第一次检索/问答才会初始化，因此启动后短时间内显示未初始化属于正常。先提一个问题（或调用 `POST /search`）预热；若之后仍为 false，再检查 `docker compose ps`、`MILVUS_URI` 与后端日志 `outputs/logs/api.err.log` |
+| 问答总是拒答且侧栏显示「重排模型降级」/`ABSTAIN_DEGRADED` | 重排模型（bge-reranker-v2-m3）在显存或系统内存不足时 PyTorch 分配失败，会自动降级为词面分数，证据门控按 fail-closed 拒答。释放显存/内存（关闭占显存的程序）、重启后端即可恢复；`start.ps1` 启动 API 时已限制 BLAS 线程并设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 降低峰值。日志中可搜 `CUDACachingAllocator`/`重排模型不可用` |
 | 登录提示「尝试次数过多」 | 触发连续失败锁定。等待提示秒数（默认窗口 300 秒）后重试；忘记密码用 CLI `reset-password` 重置 |
 | 登录后很快需要重新登录 | 登录态在 `session_state` 中：进程重启、换浏览器会话或超过 `UI_SESSION_TIMEOUT_MINUTES` 空闲都会要求重登；账号被禁用/删除也会使会话失效 |
 | 登录页提示「本地界面数据库不可用」/「读取配置失败」 | 检查 `UI_STATE_FILE` 路径、目录权限与磁盘空间；容器方式确认命名卷可写、只读挂载目录不能作为状态目录；`.env` 中 `UI_API_BASE_URL` 必须为回环地址 |
